@@ -14,8 +14,10 @@ empty-rebuild guard.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import typer
 
@@ -157,17 +159,80 @@ def reindex(
     _print_report(report)
 
 
-def status() -> None:
-    """Print document/chunk counts and the last recorded error count."""
+def _daemon_status() -> tuple[bool, Path]:
+    from .daemon import _socket_is_active, socket_path
+
+    sock = socket_path()
+    try:
+        return _socket_is_active(sock), sock
+    except OSError:
+        return False, sock
+
+
+def _db_size_bytes(db_path: Path) -> int:
+    total = 0
+    for candidate in (
+        db_path,
+        db_path.with_name(db_path.name + "-wal"),
+        db_path.with_name(db_path.name + "-shm"),
+    ):
+        try:
+            total += candidate.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def status(
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit index and daemon status as JSON.",
+    ),
+) -> None:
+    """Print index counts, model metadata, disk size and daemon status."""
+    json_flag = as_json if isinstance(as_json, bool) else False
     try:
         cfg = _load_config()
+        db_path = Path(cfg.db_path)
         with lifecycle_lock(cfg.db_path, shared=True):
             dim = _stored_dim(cfg)
             if dim is None:
-                if not Path(cfg.db_path).exists():
+                if not db_path.exists():
+                    daemon_running, sock = _daemon_status()
+                    if json_flag:
+                        typer.echo(
+                            json.dumps(
+                                {
+                                    "exists": False,
+                                    "database": str(db_path),
+                                    "size_bytes": 0,
+                                    "documents": 0,
+                                    "chunks": 0,
+                                    "last_error_count": 0,
+                                    "kinds": {},
+                                    "embed_model": cfg.embed_model,
+                                    "dim": None,
+                                    "vector_quant": cfg.vector_quant,
+                                    "schema_version": None,
+                                    "daemon": {
+                                        "running": daemon_running,
+                                        "socket": str(sock),
+                                    },
+                                },
+                                ensure_ascii=False,
+                                indent=2,
+                            )
+                        )
+                        return
                     typer.echo("documents: 0")
                     typer.echo("chunks: 0")
                     typer.echo("last error count: 0")
+                    typer.echo(f"database: {db_path} (not initialized)")
+                    typer.echo(f"model: {cfg.embed_model} (quant={cfg.vector_quant})")
+                    typer.echo(
+                        f"daemon: {'running' if daemon_running else 'stopped'} ({sock})"
+                    )
                     return
                 dim = _build_embedder(cfg).dim
 
@@ -175,6 +240,8 @@ def status() -> None:
             try:
                 stats = store.stats()
                 last_errors = store.get_last_error_count()
+                detailed_fn = getattr(store, "detailed_stats", None)
+                details: dict[str, Any] = dict(detailed_fn()) if callable(detailed_fn) else {}
             finally:
                 store.close()
     except typer.Exit:
@@ -182,9 +249,50 @@ def status() -> None:
     except Exception as exc:  # noqa: BLE001 - CLI boundary
         _fatal(str(exc))
 
+    size_bytes = _db_size_bytes(db_path)
+    daemon_running, sock = _daemon_status()
+    if json_flag:
+        typer.echo(
+            json.dumps(
+                {
+                    "exists": True,
+                    "database": str(db_path),
+                    "size_bytes": size_bytes,
+                    "size_mib": round(size_bytes / (1024 * 1024), 2),
+                    "documents": stats["documents"],
+                    "chunks": stats["chunks"],
+                    "last_error_count": last_errors,
+                    "kinds": details.get("kinds", {}),
+                    "embed_model": details.get("embed_model", cfg.embed_model),
+                    "dim": details.get("dim", dim),
+                    "vector_quant": details.get("vector_quant", cfg.vector_quant),
+                    "schema_version": details.get("schema_version"),
+                    "daemon": {
+                        "running": daemon_running,
+                        "socket": str(sock),
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
     typer.echo(f"documents: {stats['documents']}")
     typer.echo(f"chunks: {stats['chunks']}")
     typer.echo(f"last error count: {last_errors}")
+    typer.echo(f"database: {db_path} ({size_bytes / (1024 * 1024):.2f} MiB)")
+    if "embed_model" in details:
+        typer.echo(
+            f"model: {details['embed_model']} "
+            f"(dim={details['dim']}, quant={details['vector_quant']}, "
+            f"schema=v{details['schema_version']})"
+        )
+    kinds = details.get("kinds")
+    if isinstance(kinds, dict) and kinds:
+        summary = ", ".join(f"{name}={count}" for name, count in kinds.items())
+        typer.echo(f"by kind: {summary}")
+    typer.echo(f"daemon: {'running' if daemon_running else 'stopped'} ({sock})")
 
 
 def register(app: typer.Typer) -> None:

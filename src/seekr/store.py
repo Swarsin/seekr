@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .logging_config import log_event
 from .models import ChunkSpec
@@ -1032,6 +1032,25 @@ class Store:
             documents = int(conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
             chunks = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
         return {"documents": documents, "chunks": chunks}
+
+    def detailed_stats(self) -> dict[str, Any]:
+        """Return document/chunk counts, per-kind counts and store metadata."""
+        with self._lock:
+            conn = self._connection()
+            documents = int(conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+            chunks = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+            kind_rows = conn.execute(
+                "SELECT kind, COUNT(*) FROM documents GROUP BY kind ORDER BY kind"
+            ).fetchall()
+        return {
+            "documents": documents,
+            "chunks": chunks,
+            "kinds": {str(row[0]): int(row[1]) for row in kind_rows},
+            "embed_model": self._embed_model,
+            "dim": self._dim,
+            "vector_quant": self._vector_quant,
+            "schema_version": self._schema_version,
+        }
 
     def set_last_error_count(self, n: int) -> None:
         """Persist the number of errors from the most recent indexing run."""

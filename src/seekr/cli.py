@@ -46,6 +46,9 @@ def main(
     configure_logging(verbose=verbose)
 
 
+_SUPPORTED_SHELLS = frozenset({"bash", "zsh", "fish"})
+
+
 @app.command()
 def doctor() -> None:
     """Check that SQLite, FTS5 and sqlite-vec are available."""
@@ -55,6 +58,35 @@ def doctor() -> None:
     typer.echo(report.render())
     if not report.ok:
         raise typer.Exit(code=1)
+
+
+@app.command()
+def completion(
+    shell: str = typer.Argument(
+        ...,
+        metavar="SHELL",
+        help="Target shell: bash, zsh or fish.",
+    ),
+) -> None:
+    """Print a shell completion script for bash, zsh or fish."""
+    import click.shell_completion as sc
+
+    target = shell.strip().lower()
+    if target not in _SUPPORTED_SHELLS:
+        choices = ", ".join(sorted(_SUPPORTED_SHELLS))
+        typer.echo(
+            f"seekr completion: unsupported shell {shell!r}; choose one of: {choices}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    cls = sc.get_completion_class(target)
+    if cls is None:  # pragma: no cover - standard Click shells always resolve
+        typer.echo(f"seekr completion: no completion generator for {target!r}", err=True)
+        raise typer.Exit(code=1)
+    click_app = typer.main.get_command(app)
+    script = cls(click_app, {}, "seekr", "_SEEKR_COMPLETE").source()
+    typer.echo(script.rstrip("\n"))
 
 
 # Registered explicitly so the root app owns every command while the command
