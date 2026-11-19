@@ -23,7 +23,13 @@ from seekr import cli_search
 from seekr.config import Config
 from seekr.models import ChunkSpec, Hit, text_sha
 from seekr.search import Searcher, fts_query, rrf
-from seekr.store import ChunkRow, ModelMismatchError, Store, StoredChunk
+from seekr.store import (
+    ChunkRow,
+    ModelMismatchError,
+    SchemaVersionError,
+    Store,
+    StoredChunk,
+)
 
 try:  # pragma: no cover - pytest is an optional development dependency
     import pytest
@@ -799,6 +805,39 @@ class CliEntryPointTests(unittest.TestCase):
                 )
 
         self.assertIn("seekr reindex", str(raised.exception))
+
+    def test_future_schema_version_is_rejected_without_building_a_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "index.db"
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                conn.execute("CREATE TABLE documents(id INTEGER PRIMARY KEY)")
+                conn.execute("CREATE TABLE chunks(id INTEGER PRIMARY KEY)")
+                conn.executemany(
+                    "INSERT INTO meta VALUES (?, ?)",
+                    (
+                        ("embed_model", Config().embed_model),
+                        ("dim", "384"),
+                        ("schema_version", "99"),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with (
+                mock.patch("seekr.cli_search.build_embedder") as build_embedder,
+                self.assertRaises(SchemaVersionError) as raised,
+            ):
+                cli_search.get_hits(
+                    "anything", mode="hybrid", cfg=Config(db_path=db_path)
+                )
+
+        build_embedder.assert_not_called()
+        self.assertIn("schema version 99", str(raised.exception))
 
     def test_injected_searcher_is_used_without_owning_or_closing_it(self) -> None:
         expected = [

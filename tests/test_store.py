@@ -25,9 +25,12 @@ from unittest import mock
 from seekr.config import Config
 from seekr.models import ChunkSpec, text_sha
 from seekr.store import (
+    _MIGRATIONS,
+    SCHEMA_VERSION,
     ChunkRow,
     DocRow,
     ModelMismatchError,
+    SchemaVersionError,
     Store,
     StoredChunk,
     _load_vector_extension,
@@ -422,6 +425,119 @@ class StoreMetadataTests(_FakeBackendTestCase):
         self.assertEqual(reopened.get_last_error_count(), 3)
         reopened.set_last_error_count(0)
         self.assertEqual(reopened.get_last_error_count(), 0)
+
+    def test_fresh_store_records_schema_version_and_kind_index(self) -> None:
+        store = self.open_store()
+        self.assertEqual(store.schema_version, SCHEMA_VERSION)
+        store.close()
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+            index_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='documents_kind_mtime_idx'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(meta["schema_version"], str(SCHEMA_VERSION))
+        self.assertIsNotNone(index_row)
+
+    def test_legacy_v0_and_v1_databases_migrate_cleanly(self) -> None:
+        store = self.open_store()
+        _add_document(store, "/notes/a.md", _stored_chunk("migrateword", 1))
+        store.close()
+
+        # Simulate a legacy unversioned v0 DB without vector_quant or documents_kind_mtime_idx.
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("DELETE FROM meta WHERE key IN ('schema_version', 'vector_quant')")
+            conn.execute("DROP INDEX IF EXISTS documents_kind_mtime_idx")
+            conn.commit()
+        finally:
+            conn.close()
+
+        migrated = self.open_store()
+        self.assertEqual(migrated.schema_version, SCHEMA_VERSION)
+        self.assertEqual(migrated.vector_quant, "float32")
+        self.assertEqual(migrated.stats(), {"documents": 1, "chunks": 1})
+        self.assertEqual(len(migrated.keyword_search("migrateword", 10)), 1)
+        migrated.close()
+
+        # Simulate a v1 DB missing documents_kind_mtime_idx and verify 1 -> 2 runs.
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
+            conn.execute("DROP INDEX IF EXISTS documents_kind_mtime_idx")
+            conn.commit()
+        finally:
+            conn.close()
+
+        migrated_v2 = self.open_store()
+        self.assertEqual(migrated_v2.schema_version, SCHEMA_VERSION)
+        migrated_v2.close()
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+            index_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='documents_kind_mtime_idx'"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(meta["schema_version"], str(SCHEMA_VERSION))
+        self.assertEqual(meta["vector_quant"], "float32")
+        self.assertIsNotNone(index_row)
+
+    def test_future_or_corrupt_schema_version_raises_without_mutating(self) -> None:
+        store = self.open_store()
+        store.close()
+
+        for bad_version in ("99", "not-an-int", "-1"):
+            with self.subTest(bad_version=bad_version):
+                conn = sqlite3.connect(self.db_path)
+                try:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+                        (bad_version,),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                with self.assertRaises(SchemaVersionError) as raised:
+                    Store(self.db_path, "test/model", 8)
+                self.assertIn("reindex", str(raised.exception).lower())
+
+    def test_failed_migration_rolls_back_atomically(self) -> None:
+        store = self.open_store()
+        store.close()
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("DELETE FROM meta WHERE key IN ('schema_version', 'vector_quant')")
+            conn.execute("DROP INDEX IF EXISTS documents_kind_mtime_idx")
+            conn.commit()
+        finally:
+            conn.close()
+
+        def failing_step(connection: sqlite3.Connection) -> None:
+            raise RuntimeError("boom during migration 1->2")
+
+        with (
+            mock.patch.dict(_MIGRATIONS, {1: failing_step}),
+            self.assertRaises(SchemaVersionError) as raised,
+        ):
+            Store(self.db_path, "test/model", 8)
+        self.assertIn("boom during migration", str(raised.exception))
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+        finally:
+            conn.close()
+        self.assertNotIn("schema_version", meta)
+        self.assertNotIn("vector_quant", meta)
 
 
 @unittest.skipUnless(_HAS_NUMPY, "numpy is required for the vector store tests")

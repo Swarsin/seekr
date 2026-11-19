@@ -19,14 +19,20 @@ from .cli_search import SearchError, get_hits
 from .extract import kind_for
 from .lifecycle import LifecycleError
 from .opener import format_pick_line, open_command, parse_pick_line
-from .store import ModelMismatchError
+from .store import ModelMismatchError, SchemaVersionError
 
 if TYPE_CHECKING:
     import typer
 
 __all__ = ["register"]
 
-_SEARCH_ERRORS = (SearchError, ModelMismatchError, LifecycleError, ValueError)
+_SEARCH_ERRORS = (
+    SearchError,
+    ModelMismatchError,
+    SchemaVersionError,
+    LifecycleError,
+    ValueError,
+)
 
 
 def _exit_error(command: str, message: str) -> NoReturn:

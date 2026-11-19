@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import sqlite3
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +21,7 @@ _FETCH_BATCH = 800
 # sqlite-vec's vec0 KNN scan accepts k values up to this limit.
 _VEC0_MAX_K = 4096
 VECTOR_QUANTS = frozenset({"float32", "int8"})
+SCHEMA_VERSION = 2
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -75,6 +76,54 @@ CREATE TABLE IF NOT EXISTS meta (
 
 class ModelMismatchError(RuntimeError):
     """Raised when the index was built with a different embedding model or dimension."""
+
+
+class SchemaVersionError(RuntimeError):
+    """Raised when the database schema version is unsupported or migration fails."""
+
+
+def validate_schema_version(rows: dict[str, str]) -> int:
+    """Parse and validate ``schema_version`` from metadata rows (default 0)."""
+    raw = rows.get("schema_version")
+    if raw is None:
+        return 0
+    try:
+        version = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise SchemaVersionError(
+            f"index database has invalid schema_version {raw!r}; "
+            "run `seekr reindex` to rebuild it"
+        ) from exc
+    if version < 0:
+        raise SchemaVersionError(
+            f"index database has invalid negative schema_version {version}; "
+            "run `seekr reindex` to rebuild it"
+        )
+    if version > SCHEMA_VERSION:
+        raise SchemaVersionError(
+            f"index database uses schema version {version}, which is newer than "
+            f"supported version {SCHEMA_VERSION}; upgrade seekr or run "
+            "`seekr reindex` to rebuild it"
+        )
+    return version
+
+
+def _migrate_0_to_1(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(key, value) VALUES ('vector_quant', 'float32')"
+    )
+
+
+def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS documents_kind_mtime_idx ON documents(kind, mtime_ns)"
+    )
+
+
+_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    0: _migrate_0_to_1,
+    1: _migrate_1_to_2,
+}
 
 
 @dataclass(frozen=True)
@@ -230,6 +279,7 @@ class Store:
         )
         self._requested_vector_quant = vector_quant
         self._vector_quant = "float32" if vector_quant is None else vector_quant
+        self._schema_version = SCHEMA_VERSION
         self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
         self._tx_depth = 0
@@ -251,6 +301,7 @@ class Store:
             if not foreign_keys or int(foreign_keys[0]) != 1:
                 raise RuntimeError("SQLite foreign key enforcement could not be enabled")
 
+            self._check_existing_schema_version(conn)
             conn.executescript(_SCHEMA_SQL)
             needs_metadata = self._check_metadata(conn)
             _load_vector_extension(conn)
@@ -270,6 +321,11 @@ class Store:
     def vector_quant(self) -> str:
         """Return the active vector quantization mode ('float32' or 'int8')."""
         return self._vector_quant
+
+    @property
+    def schema_version(self) -> int:
+        """Return the database schema version."""
+        return self._schema_version
 
     @property
     def _use_int8_sql(self) -> bool:
@@ -353,8 +409,49 @@ class Store:
         ).fetchone()
         return bool(row[0]) if row else False
 
+    @staticmethod
+    def _check_existing_schema_version(conn: sqlite3.Connection) -> None:
+        has_meta = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
+        ).fetchone()
+        if not has_meta:
+            return
+        rows = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+        validate_schema_version(rows)
+
+    @staticmethod
+    def _migrate_schema(
+        conn: sqlite3.Connection, current_version: int, target_version: int
+    ) -> None:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for version in range(current_version, target_version):
+                step = _MIGRATIONS.get(version)
+                if step is None:
+                    raise SchemaVersionError(
+                        f"no migration path from schema version {version} to "
+                        f"{version + 1}; run `seekr reindex` to rebuild the index"
+                    )
+                step(conn)
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (str(version + 1),),
+                )
+            conn.execute("COMMIT")
+        except SchemaVersionError:
+            _rollback(conn)
+            raise
+        except (sqlite3.Error, RuntimeError, ValueError, TypeError) as exc:
+            _rollback(conn)
+            raise SchemaVersionError(
+                f"cannot migrate index database from schema version {current_version} "
+                f"to {target_version}: {exc}; run `seekr reindex` to rebuild it"
+            ) from exc
+
     def _check_metadata(self, conn: sqlite3.Connection) -> bool:
         rows = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+        stored_version = validate_schema_version(rows)
         stored_model = rows.get("embed_model")
         stored_dim = rows.get("dim")
         if stored_model is None and stored_dim is None:
@@ -395,6 +492,9 @@ class Store:
                 f"this configuration uses {self._requested_vector_quant!r}; "
                 "run `seekr reindex` to rebuild it"
             )
+        if stored_version < SCHEMA_VERSION:
+            self._migrate_schema(conn, stored_version, SCHEMA_VERSION)
+        self._schema_version = SCHEMA_VERSION
         return False
 
     def _write_metadata(self, conn: sqlite3.Connection) -> None:
@@ -407,12 +507,15 @@ class Store:
                     ("embed_model", self._embed_model),
                     ("dim", str(self._dim)),
                     ("vector_quant", self._vector_quant),
+                    ("schema_version", str(SCHEMA_VERSION)),
                 ),
             )
+            _migrate_1_to_2(conn)
             conn.execute("COMMIT")
         except BaseException:
             _rollback(conn)
             raise
+        self._schema_version = SCHEMA_VERSION
 
     # -- documents ---------------------------------------------------------
 

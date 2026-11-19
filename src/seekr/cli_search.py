@@ -19,7 +19,13 @@ from .embed import build_embedder
 from .lifecycle import LifecycleError, lifecycle_lock
 from .models import Hit
 from .search import SEARCH_MODES, Searcher, SearchMode
-from .store import VECTOR_QUANTS, ModelMismatchError, Store
+from .store import (
+    VECTOR_QUANTS,
+    ModelMismatchError,
+    SchemaVersionError,
+    Store,
+    validate_schema_version,
+)
 
 if TYPE_CHECKING:
     import typer
@@ -125,6 +131,8 @@ def _build_searcher(cfg: Config, mode: str, rerank: bool) -> Searcher | None:
                 "run `seekr reindex` to rebuild it"
             )
         return None
+
+    validate_schema_version(meta)
 
     stored_model_raw = meta.get("embed_model")
     stored_dim_raw = meta.get("dim")
@@ -347,6 +355,7 @@ def _build_search_command(typer_module: Any) -> Any:
         except (
             SearchError,
             ModelMismatchError,
+            SchemaVersionError,
             LifecycleError,
             DaemonError,
             ValueError,
