@@ -135,15 +135,8 @@ def _build_reranker(cfg: Config) -> Reranker:
     return build_reranker(cfg)
 
 
-def _build_searcher(cfg: Config, mode: str, rerank: bool) -> Searcher | None:
-    """Open exactly the backends this query needs.
-
-    A missing or empty index returns ``None`` immediately in every mode, so no
-    embedding model or Store is built just to report no results.  A recorded
-    model mismatch is reported before ``build_embedder`` can load any model.
-    Vector/hybrid queries need the real dimension, so only those validate and
-    load the embedding model during setup.
-    """
+def _validated_store_info(cfg: Config) -> tuple[Path, int, str] | None:
+    """Validate index metadata and return ``(db_path, dim, vector_quant)`` if non-empty."""
     db_path = Path(cfg.db_path)
     meta, has_data = _inspect_db(db_path)
 
@@ -208,6 +201,15 @@ def _build_searcher(cfg: Config, mode: str, rerank: bool) -> Searcher | None:
     # creating a Store) just to answer "No results.".
     if not has_data:
         return None
+    return db_path, stored_dim, stored_quant
+
+
+def _build_searcher(cfg: Config, mode: str, rerank: bool) -> Searcher | None:
+    """Open exactly the backends this query needs."""
+    info = _validated_store_info(cfg)
+    if info is None:
+        return None
+    db_path, stored_dim, stored_quant = info
 
     embedder = build_embedder(cfg)
     if mode in ("vector", "hybrid"):
@@ -388,6 +390,119 @@ def get_hits(
             selected.store.close()
 
 
+def _vectors_for_target(
+    target_path: Path,
+    store: Store,
+    embedder: Embedder | None,
+    cfg: Config,
+    stored_dim: int | None = None,
+) -> list[Any]:
+    vectors = store.get_document_vectors(str(target_path))
+    if vectors:
+        return vectors
+    if not target_path.is_file():
+        raise SearchError(
+            f"file not found and not in index: {target_path}; "
+            "check the path or run `seekr index`"
+        )
+    from .chunking import chunk
+    from .extract import ExtractionError, extract, kind_for, language_for
+
+    file_kind = kind_for(target_path) or "text"
+    try:
+        extracted = extract(target_path, file_kind)
+    except ExtractionError as exc:
+        raise SearchError(str(exc)) from exc
+    language = language_for(target_path) if file_kind == "code" else None
+    specs = chunk(file_kind, extracted.units, cfg, language=language)
+    if not specs:
+        return []
+
+    active_embedder = embedder if embedder is not None else build_embedder(cfg)
+    actual_dim = _embedder_dim(active_embedder)
+    if stored_dim is not None and actual_dim != stored_dim:
+        raise ModelMismatchError(
+            f"embedding model {cfg.embed_model!r} produces {actual_dim}-dimensional "
+            f"vectors, but the index stores dim {stored_dim}; "
+            "run `seekr reindex` to rebuild it"
+        )
+    embedded = active_embedder.embed_documents([spec.text for spec in specs])
+    return list(embedded)
+
+
+def get_similar_hits(
+    target: Path | str,
+    k: int = 10,
+    per_file: int = 1,
+    path_prefix: str | None = None,
+    kind: str | None = None,
+    since: str | None = None,
+    *,
+    cfg: Config | None = None,
+    searcher: Searcher | None = None,
+) -> list[Hit]:
+    """Return indexed hits semantically similar to ``target``."""
+    if k <= 0:
+        raise SearchError("k must be a positive integer")
+    if per_file <= 0:
+        raise SearchError("per-file must be a positive integer")
+    kind_val = normalise_kind(kind)
+    since_mtime_ns = parse_since(since)
+    target_path = Path(target).expanduser().resolve(strict=False)
+    selected_cfg = cfg if cfg is not None else load_config()
+
+    if searcher is not None:
+        vectors = _vectors_for_target(
+            target_path, searcher.store, searcher.embedder, selected_cfg
+        )
+        return searcher.similar(
+            vectors,
+            k=k,
+            per_file=per_file,
+            path_prefix=path_prefix,
+            kind=kind_val,
+            since_mtime_ns=since_mtime_ns,
+            exclude_path=str(target_path),
+        )
+
+    log_event(
+        _LOGGER,
+        logging.DEBUG,
+        "cli_search.similar_open",
+        db_path=selected_cfg.db_path,
+        target=target_path,
+    )
+    with lifecycle_lock(selected_cfg.db_path, shared=True):
+        info = _validated_store_info(selected_cfg)
+        if info is None:
+            if not target_path.is_file():
+                raise SearchError(
+                    f"file not found and not in index: {target_path}; "
+                    "check the path or run `seekr index`"
+                )
+            return []
+        db_path, stored_dim, stored_quant = info
+        store = Store(db_path, selected_cfg.embed_model, stored_dim, vector_quant=stored_quant)
+        try:
+            vectors = _vectors_for_target(
+                target_path, store, None, selected_cfg, stored_dim=stored_dim
+            )
+            if not vectors:
+                return []
+            local_searcher = Searcher(store, None)  # type: ignore[arg-type]
+            return local_searcher.similar(
+                vectors,
+                k=k,
+                per_file=per_file,
+                path_prefix=path_prefix,
+                kind=kind_val,
+                since_mtime_ns=since_mtime_ns,
+                exclude_path=str(target_path),
+            )
+        finally:
+            store.close()
+
+
 def _hit_to_json_dict(hit: Hit) -> dict[str, Any]:
     data = dataclasses.asdict(hit)
     if data.get("explain") is None:
@@ -411,11 +526,45 @@ def _format_explain_line(info: HitExplain) -> str:
     return "  explain: " + ("  ".join(parts) if parts else "none")
 
 
-def _exit_error(message: str) -> NoReturn:
+def _echo_hits(
+    typer_module: Any,
+    hits: list[Hit],
+    *,
+    as_json: bool = False,
+    explain: bool = False,
+) -> None:
+    if as_json:
+        payload = [_hit_to_json_dict(hit) for hit in hits]
+        typer_module.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    if not hits:
+        typer_module.echo("No results.")
+        return
+
+    for hit in hits:
+        typer_module.echo(f"{hit.path}  ({hit.locator})  {hit.score:.4f}")
+        if explain and hit.explain is not None:
+            typer_module.echo(_format_explain_line(hit.explain))
+        typer_module.echo(hit.snippet)
+        typer_module.echo()
+
+
+def _exit_error(message: str, *, command: str = "search") -> NoReturn:
     import typer
 
-    typer.echo(f"seekr search: {message}", err=True)
+    typer.echo(f"seekr {command}: {message}", err=True)
     raise typer.Exit(code=1)
+
+
+_CLI_SEARCH_ERRORS = (
+    SearchError,
+    ModelMismatchError,
+    SchemaVersionError,
+    LifecycleError,
+    DaemonError,
+    ValueError,
+)
 
 
 def _build_search_command(typer_module: Any) -> Any:
@@ -471,49 +620,91 @@ def _build_search_command(typer_module: Any) -> Any:
                 path_prefix=path_prefix,
                 **extra,
             )
-        except (
-            SearchError,
-            ModelMismatchError,
-            SchemaVersionError,
-            LifecycleError,
-            DaemonError,
-            ValueError,
-        ) as exc:
-            _exit_error(str(exc))
+        except _CLI_SEARCH_ERRORS as exc:
+            _exit_error(str(exc), command="search")
         except ImportError as exc:
-            _exit_error(f"search backend is unavailable: {exc}; run `seekr doctor`")
+            _exit_error(
+                f"search backend is unavailable: {exc}; run `seekr doctor`",
+                command="search",
+            )
         except (OSError, sqlite3.Error) as exc:
-            _exit_error(f"cannot read the index: {exc}; run `seekr doctor` or `seekr reindex`")
+            _exit_error(
+                f"cannot read the index: {exc}; run `seekr doctor` or `seekr reindex`",
+                command="search",
+            )
 
-        if as_json:
-            payload = [_hit_to_json_dict(hit) for hit in hits]
-            typer_module.echo(json.dumps(payload, ensure_ascii=False, indent=2))
-            return
-
-        if not hits:
-            typer_module.echo("No results.")
-            return
-
-        for hit in hits:
-            typer_module.echo(f"{hit.path}  ({hit.locator})  {hit.score:.4f}")
-            if explain and hit.explain is not None:
-                typer_module.echo(_format_explain_line(hit.explain))
-            typer_module.echo(hit.snippet)
-            typer_module.echo()
+        _echo_hits(typer_module, hits, as_json=as_json, explain=explain)
 
     search.__doc__ = "Search the locally indexed files."
     return search
 
 
+def _build_similar_command(typer_module: Any) -> Any:
+    def similar(
+        target: Path = typer_module.Argument(
+            ..., metavar="PATH", help="Indexed file or document on disk to match against."
+        ),
+        k: int = typer_module.Option(
+            10, "-k", "--k", min=1, help="Maximum number of results."
+        ),
+        per_file: int = typer_module.Option(
+            1, "--per-file", min=1, help="Maximum number of hits per file."
+        ),
+        path_prefix: str | None = typer_module.Option(
+            None, "--path", help="Only search under this path prefix."
+        ),
+        kind: str | None = typer_module.Option(
+            None, "--kind", help="Filter by kind: pdf, code, markdown, transcript or text."
+        ),
+        since: str | None = typer_module.Option(
+            None,
+            "--since",
+            help="Only include files modified since duration (e.g. 7d, 12h) or ISO date.",
+        ),
+        as_json: bool = typer_module.Option(
+            False, "--json", help="Emit results as JSON."
+        ),
+    ) -> None:
+        """Find indexed files semantically related to PATH."""
+        try:
+            hits = get_similar_hits(
+                target,
+                k=k,
+                per_file=per_file,
+                path_prefix=path_prefix,
+                kind=kind,
+                since=since,
+            )
+        except _CLI_SEARCH_ERRORS as exc:
+            _exit_error(str(exc), command="similar")
+        except ImportError as exc:
+            _exit_error(
+                f"search backend is unavailable: {exc}; run `seekr doctor`",
+                command="similar",
+            )
+        except (OSError, sqlite3.Error) as exc:
+            _exit_error(
+                f"cannot read the index: {exc}; run `seekr doctor` or `seekr reindex`",
+                command="similar",
+            )
+
+        _echo_hits(typer_module, hits, as_json=as_json)
+
+    similar.__doc__ = "Find indexed files semantically related to PATH."
+    return similar
+
+
 def register(app: typer.Typer) -> None:
-    """Register the ``search`` command on the main Typer application."""
+    """Register the ``search`` and ``similar`` commands on the main Typer app."""
     import typer
 
     app.command("search")(_build_search_command(typer))
+    app.command("similar")(_build_similar_command(typer))
 
 
 __all__ = [
     "SearchError",
     "get_hits",
+    "get_similar_hits",
     "register",
 ]

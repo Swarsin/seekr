@@ -965,6 +965,23 @@ class Store:
         pairs.sort(key=lambda item: (item[1], item[0]))
         return pairs
 
+    def get_document_vectors(self, path: str) -> list[np.ndarray]:
+        """Return stored chunk vectors for ``path`` ordered by chunk id."""
+        with self._lock:
+            conn = self._connection()
+            rows = conn.execute(
+                """
+                SELECT v.embedding
+                FROM chunks AS c
+                JOIN documents AS d ON d.id = c.doc_id
+                JOIN chunks_vec AS v ON v.rowid = c.id
+                WHERE d.path = ?
+                ORDER BY c.id
+                """,
+                (str(path),),
+            ).fetchall()
+        return [self._deserialize(row[0]) for row in rows if row[0] is not None]
+
     def fetch_chunks(self, ids: list[int]) -> dict[int, ChunkRow]:
         """Fetch chunk rows in stable id order, ignoring unknown ids."""
         unique_ids = sorted({int(chunk_id) for chunk_id in ids})

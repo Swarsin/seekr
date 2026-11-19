@@ -537,6 +537,90 @@ class Searcher:
         )
         return hits
 
+    def similar(
+        self,
+        query_vectors: list[np.ndarray],
+        *,
+        k: int = 10,
+        per_file: int = 1,
+        path_prefix: str | None = None,
+        kind: str | None = None,
+        since_mtime_ns: int | None = None,
+        exclude_path: str | None = None,
+    ) -> list[Hit]:
+        """Return up to ``k`` chunks semantically similar to ``query_vectors``."""
+        kind_val = normalise_kind(kind)
+        if since_mtime_ns is not None and (
+            isinstance(since_mtime_ns, bool) or not isinstance(since_mtime_ns, int)
+        ):
+            raise ValueError("since_mtime_ns must be an integer or None")
+        started = time.monotonic()
+        if k <= 0 or per_file <= 0 or not query_vectors or not _store_has_chunks(self.store):
+            log_event(
+                _LOGGER,
+                logging.DEBUG,
+                "search.similar",
+                k=k,
+                per_file=per_file,
+                hits=0,
+                elapsed_ms=0.0,
+            )
+            return []
+
+        import numpy as np
+
+        stacked = np.stack([np.asarray(vec, dtype=np.float32) for vec in query_vectors])
+        centroid = np.mean(stacked, axis=0)
+        norm = float(np.linalg.norm(centroid))
+        if norm > 0.0:
+            centroid = centroid / norm
+
+        prefix = _normalise_path_prefix(path_prefix)
+        limit = max(_MIN_CANDIDATES, _CANDIDATES_PER_K * k)
+        vec_kwargs: dict[str, Any] = {}
+        if prefix is not None:
+            vec_kwargs["path_prefix"] = prefix
+        if kind_val is not None:
+            vec_kwargs["kind"] = kind_val
+        if since_mtime_ns is not None:
+            vec_kwargs["since_mtime_ns"] = since_mtime_ns
+        if exclude_path is not None:
+            vec_kwargs["exclude_path"] = exclude_path
+
+        with _snapshot(self.store):
+            vector_pairs = list(self.store.vector_search(centroid, limit, **vec_kwargs))
+            chunks = self.store.fetch_chunks([int(chunk_id) for chunk_id, _ in vector_pairs])
+
+        scored = [
+            (int(chunk_id), 1.0 / (1.0 + max(0.0, float(dist))))
+            for chunk_id, dist in vector_pairs
+            if int(chunk_id) in chunks
+        ]
+        hits: list[Hit] = []
+        for chunk_id, sim_score in _cap_per_file(scored, chunks, per_file, k):
+            chunk = chunks[chunk_id]
+            hits.append(
+                Hit(
+                    chunk_id=chunk.id,
+                    path=chunk.path,
+                    locator=chunk.locator,
+                    loc_start=chunk.loc_start,
+                    snippet=chunk.text[:_SNIPPET_CHARS],
+                    score=float(sim_score),
+                    kind=chunk.kind,
+                )
+            )
+        log_event(
+            _LOGGER,
+            logging.DEBUG,
+            "search.similar",
+            k=k,
+            per_file=per_file,
+            hits=len(hits),
+            elapsed_ms=round((time.monotonic() - started) * 1000.0, 2),
+        )
+        return hits
+
 
 __all__ = [
     "SEARCH_MODES",

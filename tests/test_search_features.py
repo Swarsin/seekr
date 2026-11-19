@@ -394,3 +394,97 @@ class CliFilterTests(unittest.TestCase):
         bad_since = CliRunner().invoke(app, ["search", "zephyr", "--since", "notadate"])
         self.assertEqual(bad_since.exit_code, 1)
         self.assertIn("--since", bad_since.output)
+
+
+@unittest.skipUnless(_NEEDS_REAL_STORE, "numpy, sqlite-vec and FTS5 are required")
+class RealStoreSimilarTests(unittest.TestCase):
+    def test_similar_indexed_and_unindexed_files_with_filters(self) -> None:
+        now = time.time()
+        recent_mtime = now - 300
+        old_mtime = now - 30 * 86400
+
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="seekr-sim-") as tmp:
+            base = Path(tmp)
+            root = base / "docs"
+            root.mkdir()
+            a_md = root / "a.md"
+            b_md = root / "b.md"
+            c_py = root / "c.py"
+            old_md = root / "old.md"
+            a_md.write_text("neural network gradient descent optimizer", encoding="utf-8")
+            b_md.write_text("neural network optimizer backpropagation", encoding="utf-8")
+            c_py.write_text("def energy():\n    return 'quantum hamiltonian'\n", encoding="utf-8")
+            old_md.write_text("neural network gradient legacy archive", encoding="utf-8")
+            os.utime(a_md, (recent_mtime, recent_mtime))
+            os.utime(b_md, (recent_mtime, recent_mtime))
+            os.utime(c_py, (recent_mtime, recent_mtime))
+            os.utime(old_md, (old_mtime, old_mtime))
+
+            cfg = Config(roots=(root,), db_path=base / "index.db", embed_model="fake")
+            embedder = FakeEmbedder(dim=8)
+            store = Store(cfg.db_path, "fake", 8, vector_quant="int8")
+            try:
+                Indexer(store, embedder, cfg).sync([root])
+            finally:
+                store.close()
+
+            with mock.patch("seekr.cli_search.build_embedder") as build_emb:
+                indexed_hits = cli_search.get_similar_hits(a_md, k=5, since="7d", cfg=cfg)
+            build_emb.assert_not_called()
+            self.assertNotIn(str(a_md.resolve()), [hit.path for hit in indexed_hits])
+            self.assertNotIn(str(old_md.resolve()), [hit.path for hit in indexed_hits])
+            self.assertEqual(indexed_hits[0].path, str(b_md.resolve()))
+            self.assertGreater(indexed_hits[0].score, 0.0)
+
+            draft = base / "draft.md"
+            draft.write_text("neural network gradient descent optimizer", encoding="utf-8")
+            with mock.patch("seekr.cli_search.build_embedder", return_value=embedder):
+                unindexed_hits = cli_search.get_similar_hits(draft, k=5, cfg=cfg)
+                code_only = cli_search.get_similar_hits(draft, k=5, kind="code", cfg=cfg)
+            self.assertIn(str(a_md.resolve()), [hit.path for hit in unindexed_hits[:2]])
+            self.assertEqual([hit.path for hit in code_only], [str(c_py.resolve())])
+
+            with self.assertRaises(cli_search.SearchError):
+                cli_search.get_similar_hits(base / "missing.md", cfg=cfg)
+
+
+@unittest.skipUnless(_HAS_TYPER, "typer is not installed")
+class CliSimilarTests(unittest.TestCase):
+    def test_similar_command_forwards_args_and_formats_json_and_text(self) -> None:
+        from typer.testing import CliRunner
+
+        hit = Hit(
+            chunk_id=9,
+            path="/docs/related.md",
+            locator="§Methods",
+            loc_start=12.0,
+            snippet="similar section",
+            score=0.875,
+            kind="markdown",
+        )
+        with mock.patch("seekr.cli_search.get_similar_hits", return_value=[hit]) as sim_mock:
+            text_res = CliRunner().invoke(
+                app,
+                ["similar", "/docs/source.md", "-k", "4", "--kind", "markdown", "--since", "7d"],
+            )
+            json_res = CliRunner().invoke(app, ["similar", "/docs/source.md", "--json"])
+
+        self.assertEqual(text_res.exit_code, 0, text_res.output)
+        self.assertEqual(json_res.exit_code, 0, json_res.output)
+        self.assertEqual(sim_mock.call_args_list[0].kwargs["k"], 4)
+        self.assertEqual(sim_mock.call_args_list[0].kwargs["kind"], "markdown")
+        self.assertEqual(sim_mock.call_args_list[0].kwargs["since"], "7d")
+        self.assertIn("/docs/related.md", text_res.output)
+        self.assertIn("0.8750", text_res.output)
+
+        parsed = json.loads(json_res.stdout)
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["path"], "/docs/related.md")
+
+        with mock.patch(
+            "seekr.cli_search.get_similar_hits",
+            side_effect=cli_search.SearchError("file not found"),
+        ):
+            err_res = CliRunner().invoke(app, ["similar", "/docs/missing.md"])
+        self.assertEqual(err_res.exit_code, 1)
+        self.assertIn("file not found", err_res.output)
