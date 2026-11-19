@@ -240,8 +240,26 @@ def _build_daemon_command(typer_module: Any) -> Any:
     return daemon
 
 
+def _build_mcp_command(typer_module: Any) -> Any:
+    def mcp() -> None:
+        """Run an MCP (Model Context Protocol) server over stdio."""
+        from .mcp_server import McpServer
+
+        try:
+            McpServer().serve_stdio()
+        except KeyboardInterrupt:
+            return
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+            typer_module.echo(f"seekr mcp: {exc}", err=True)
+            raise typer_module.Exit(code=1) from exc
+
+    mcp.__doc__ = "Run an MCP (Model Context Protocol) server over stdio."
+    return mcp
+
+
 def register(app: typer.Typer) -> None:
-    """Register the ``daemon`` command on the main Typer application."""
+    """Register the ``daemon`` and ``mcp`` commands on the main Typer app."""
     import typer
 
     app.command("daemon")(_build_daemon_command(typer))
+    app.command("mcp")(_build_mcp_command(typer))
