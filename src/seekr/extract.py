@@ -48,6 +48,7 @@ _LANGUAGE_BY_SUFFIX = {
 _TEXT_KINDS = frozenset({"markdown", "text", "code"})
 _MIN_PDF_PAGE_WORDS = 20
 _BINARY_SNIFF_BYTES = 8192
+_PDF_ERRORS = (RuntimeError, ValueError, KeyError, IndexError, TypeError)
 
 _TIMESTAMP_PATTERN = r"(?:\d+:){1,2}\d{1,2}(?:[.,]\d{1,3})?"
 _CUE_TIMING_RE = re.compile(
@@ -110,8 +111,23 @@ def _read_bytes(path: Path) -> bytes:
 
 def _read_text(path: Path) -> tuple[str, list[str]]:
     raw = _read_bytes(path)
+    # Check UTF-16 BOM before the NUL-byte binary sniff because ASCII code points
+    # in UTF-16 contain NUL bytes on every other octet.
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")) and not raw.startswith(b"\xff\xfe\x00\x00"):
+        try:
+            decoded = raw.decode("utf-16")
+        except UnicodeDecodeError:
+            decoded = ""
+        else:
+            if "\x00" not in decoded[:_BINARY_SNIFF_BYTES]:
+                return decoded, ["file is UTF-16 encoded; decoded with UTF-16 fallback"]
     if b"\x00" in raw[:_BINARY_SNIFF_BYTES]:
         raise ExtractionError(f"binary file {path}: NUL byte in the first 8 KB")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        try:
+            return raw.decode("utf-8-sig"), []
+        except UnicodeDecodeError:
+            return raw.decode("latin-1"), ["file is not valid UTF-8; used latin-1 fallback"]
     try:
         return raw.decode("utf-8"), []
     except UnicodeDecodeError:
@@ -228,7 +244,7 @@ def _extract_pdf(path: Path) -> ExtractionResult:
         raise
     except OSError as exc:
         raise ExtractionError(f"cannot read PDF {path}: {exc}") from exc
-    except (RuntimeError, ValueError) as exc:
+    except _PDF_ERRORS as exc:
         if not path.exists():
             raise FileNotFoundError(path) from exc
         raise ExtractionError(f"could not open corrupt or unreadable PDF {path}: {exc}") from exc
@@ -241,7 +257,7 @@ def _extract_pdf(path: Path) -> ExtractionResult:
         for number, page in enumerate(document, start=1):
             try:
                 page_text = (page.get_text("text") or "").strip()
-            except (RuntimeError, ValueError) as exc:
+            except _PDF_ERRORS as exc:
                 raise ExtractionError(f"could not read page {number} of PDF {path}: {exc}") from exc
             if len(page_text.split()) < _MIN_PDF_PAGE_WORDS:
                 warnings.append(f"page {number} has no extractable text")
@@ -253,7 +269,7 @@ def _extract_pdf(path: Path) -> ExtractionResult:
                     loc_start=float(number),
                 )
             )
-    except (RuntimeError, ValueError) as exc:
+    except _PDF_ERRORS as exc:
         if not path.exists():
             raise FileNotFoundError(path) from exc
         raise ExtractionError(f"could not read PDF {path}: {exc}") from exc

@@ -21,6 +21,7 @@ import socket
 import stat
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -385,10 +386,14 @@ def _bind_listener(path: Path) -> tuple[socket.socket, tuple[int, int]]:
     else:
         if not stat.S_ISSOCK(existing.st_mode):
             raise DaemonError(
-                f"refusing to replace non-socket file at {path}; remove it manually"
+                f"refusing to replace non-socket file at {path}; remove it manually "
+                "or pass a different --socket path"
             )
         if _socket_is_active(path):
-            raise DaemonError(f"another seekr daemon is already listening on {path}")
+            raise DaemonError(
+                f"another seekr daemon is already listening on {path}; stop it or pass "
+                "a different --socket path"
+            )
         try:
             path.unlink()
         except FileNotFoundError:
@@ -398,21 +403,54 @@ def _bind_listener(path: Path) -> tuple[socket.socket, tuple[int, int]]:
 
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     bound_at: tuple[int, int] | None = None
+    tmp_path = path.parent / f".seekr-{uuid.uuid4().hex[:8]}.tmp"
+    tmp_created = False
+    # Publish via a pre-listened sibling temp socket when it fits AF_UNIX sun_path,
+    # so `path` is never visible before chmod(0600) and listen() finish.
+    use_atomic_link = len(os.fsencode(tmp_path)) <= 100
     try:
         old_umask = os.umask(0o177)
         try:
-            listener.bind(str(path))
+            if use_atomic_link:
+                listener.bind(str(tmp_path))
+                tmp_created = True
+            else:
+                listener.bind(str(path))
         finally:
             os.umask(old_umask)
-        created = os.lstat(path)
-        bound_at = (created.st_dev, created.st_ino)
-        os.chmod(path, _SOCKET_MODE)
-        listener.listen(_MAX_CONNECTIONS)
-        listener.settimeout(_ACCEPT_TIMEOUT)
+        if use_atomic_link:
+            os.chmod(tmp_path, _SOCKET_MODE)
+            listener.listen(_MAX_CONNECTIONS)
+            listener.settimeout(_ACCEPT_TIMEOUT)
+            try:
+                os.link(tmp_path, path)
+            except FileExistsError as exc:
+                raise DaemonError(
+                    f"another seekr daemon is already listening on {path}; stop it or "
+                    "pass a different --socket path"
+                ) from exc
+            created = os.lstat(path)
+            bound_at = (created.st_dev, created.st_ino)
+        else:
+            created = os.lstat(path)
+            bound_at = (created.st_dev, created.st_ino)
+            os.chmod(path, _SOCKET_MODE)
+            listener.listen(_MAX_CONNECTIONS)
+            listener.settimeout(_ACCEPT_TIMEOUT)
+    except DaemonError:
+        listener.close()
+        _remove_owned_socket(path, bound_at)
+        raise
     except OSError as exc:
         listener.close()
         _remove_owned_socket(path, bound_at)
         raise DaemonError(f"cannot create daemon socket {path}: {exc}") from exc
+    finally:
+        if tmp_created:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
     return listener, bound_at
 
 
