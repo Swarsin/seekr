@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import threading
 from collections.abc import Iterable, Iterator
@@ -19,6 +20,7 @@ _DELETE_BATCH = 500
 _FETCH_BATCH = 800
 # sqlite-vec's vec0 KNN scan accepts k values up to this limit.
 _VEC0_MAX_K = 4096
+VECTOR_QUANTS = frozenset({"float32", "int8"})
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -128,16 +130,46 @@ def _create_vector_table(conn: sqlite3.Connection, dim: int) -> None:
     )
 
 
+_DEFAULT_LOAD_VECTOR_EXTENSION = _load_vector_extension
+_DEFAULT_CREATE_VECTOR_TABLE = _create_vector_table
+
+
+def _int8_scale(dim: int) -> float:
+    return float(min(500.0, max(127.0, 25.0 * math.sqrt(dim))))
+
+
+def _create_vector_table_int8(conn: sqlite3.Connection, dim: int) -> None:
+    conn.execute(
+        f"CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(embedding int8[{int(dim)}])"
+    )
+
+
 def _serialize_vector(vector: object) -> bytes:
     import numpy as np
 
     return np.ascontiguousarray(vector, dtype="<f4").tobytes()
 
 
+def _serialize_vector_int8(vector: object, dim: int) -> bytes:
+    import numpy as np
+
+    scale = np.float32(_int8_scale(dim))
+    scaled = np.rint(np.asarray(vector, dtype=np.float32) * scale)
+    clamped = np.clip(scaled, -127.0, 127.0).astype(np.int8)
+    return np.ascontiguousarray(clamped).tobytes()
+
+
 def _deserialize_vector(payload: bytes | memoryview) -> np.ndarray:
     import numpy as np
 
     return np.frombuffer(payload, dtype=np.float32).copy()
+
+
+def _deserialize_vector_int8(payload: bytes | memoryview, dim: int) -> np.ndarray:
+    import numpy as np
+
+    scale = np.float32(_int8_scale(dim))
+    return np.frombuffer(payload, dtype=np.int8).astype(np.float32) / scale
 
 
 def _path_prefix_clause(
@@ -171,15 +203,33 @@ class Store:
     fallback backend: if the extension is missing, construction fails.
     """
 
-    def __init__(self, db_path: Path, embed_model: str, dim: int) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        embed_model: str,
+        dim: int,
+        *,
+        vector_quant: str | None = None,
+    ) -> None:
         if not isinstance(embed_model, str) or not embed_model.strip():
             raise ValueError("embed_model must be a non-empty string")
         if not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0:
             raise ValueError("dim must be a positive integer")
+        if vector_quant is not None and (
+            not isinstance(vector_quant, str) or vector_quant not in VECTOR_QUANTS
+        ):
+            choices = ", ".join(sorted(VECTOR_QUANTS))
+            raise ValueError(f"vector_quant must be one of {choices}")
 
         self._db_path = Path(db_path)
         self._embed_model = embed_model
         self._dim = dim
+        self._stubbed_backend = (
+            _load_vector_extension is not _DEFAULT_LOAD_VECTOR_EXTENSION
+            or _create_vector_table is not _DEFAULT_CREATE_VECTOR_TABLE
+        )
+        self._requested_vector_quant = vector_quant
+        self._vector_quant = "float32" if vector_quant is None else vector_quant
         self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
         self._tx_depth = 0
@@ -204,7 +254,10 @@ class Store:
             conn.executescript(_SCHEMA_SQL)
             needs_metadata = self._check_metadata(conn)
             _load_vector_extension(conn)
-            _create_vector_table(conn, dim)
+            if self._use_int8_sql:
+                _create_vector_table_int8(conn, dim)
+            else:
+                _create_vector_table(conn, dim)
             if needs_metadata:
                 self._write_metadata(conn)
         except BaseException:
@@ -212,6 +265,25 @@ class Store:
             raise
 
         self._conn = conn
+
+    @property
+    def vector_quant(self) -> str:
+        """Return the active vector quantization mode ('float32' or 'int8')."""
+        return self._vector_quant
+
+    @property
+    def _use_int8_sql(self) -> bool:
+        return self._vector_quant == "int8" and not self._stubbed_backend
+
+    def _serialize(self, vector: object) -> bytes:
+        if self._use_int8_sql:
+            return _serialize_vector_int8(vector, self._dim)
+        return _serialize_vector(vector)
+
+    def _deserialize(self, payload: bytes | memoryview) -> np.ndarray:
+        if self._use_int8_sql:
+            return _deserialize_vector_int8(payload, self._dim)
+        return _deserialize_vector(payload)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -309,6 +381,20 @@ class Store:
                 f"{self._embed_model!r} (dim {self._dim}); "
                 "run `seekr reindex` to rebuild it"
             )
+        stored_quant = rows.get("vector_quant", "float32")
+        if stored_quant not in VECTOR_QUANTS:
+            raise ModelMismatchError(
+                f"index database has unsupported vector quantization {stored_quant!r}; "
+                "run `seekr reindex` to rebuild it"
+            )
+        if self._requested_vector_quant is None:
+            self._vector_quant = stored_quant
+        elif self._requested_vector_quant != stored_quant:
+            raise ModelMismatchError(
+                f"index database uses vector quantization {stored_quant!r}, but "
+                f"this configuration uses {self._requested_vector_quant!r}; "
+                "run `seekr reindex` to rebuild it"
+            )
         return False
 
     def _write_metadata(self, conn: sqlite3.Connection) -> None:
@@ -317,7 +403,11 @@ class Store:
             conn.executemany(
                 "INSERT INTO meta(key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (("embed_model", self._embed_model), ("dim", str(self._dim))),
+                (
+                    ("embed_model", self._embed_model),
+                    ("dim", str(self._dim)),
+                    ("vector_quant", self._vector_quant),
+                ),
             )
             conn.execute("COMMIT")
         except BaseException:
@@ -460,10 +550,11 @@ class Store:
                         ),
                     )
                     new_ids.append(int(cursor.lastrowid))
+                value_expr = "vec_int8(?)" if self._use_int8_sql else "?"
                 conn.executemany(
-                    "INSERT INTO chunks_vec(rowid, embedding) VALUES (?, ?)",
+                    f"INSERT INTO chunks_vec(rowid, embedding) VALUES (?, {value_expr})",
                     [
-                        (chunk_id, _serialize_vector(chunk.vector))
+                        (chunk_id, self._serialize(chunk.vector))
                         for chunk_id, chunk in zip(new_ids, items)
                     ],
                 )
@@ -526,7 +617,7 @@ class Store:
             ).fetchone()
         if vector_row is None or vector_row[0] is None:
             return None
-        return _deserialize_vector(vector_row[0])
+        return self._deserialize(vector_row[0])
 
     def find_vectors_by_text_shas(self, shas: Iterable[str]) -> dict[str, np.ndarray]:
         """Return stored vectors keyed by content hash for any known chunks."""
@@ -552,7 +643,7 @@ class Store:
                 for row in rows:
                     sha = str(row[0])
                     if sha not in vectors and row[1] is not None:
-                        vectors[sha] = _deserialize_vector(row[1])
+                        vectors[sha] = self._deserialize(row[1])
         return vectors
 
     def keyword_search(
@@ -619,13 +710,15 @@ class Store:
         blob: bytes,
         limit: int,
         path_prefix: str | None,
+        *,
+        value_expr: str = "?",
     ) -> list[tuple[object, ...]]:
         """Exact vector search using sqlite-vec's scalar L2 distance."""
         clause, prefix_params = _path_prefix_clause(path_prefix, column="d.path")
         if clause:
             return conn.execute(
                 f"""
-                SELECT v.rowid, vec_distance_L2(v.embedding, ?) AS distance
+                SELECT v.rowid, vec_distance_L2(v.embedding, {value_expr}) AS distance
                 FROM chunks_vec AS v
                 JOIN chunks AS c ON c.id = v.rowid
                 JOIN documents AS d ON d.id = c.doc_id
@@ -636,8 +729,8 @@ class Store:
                 (blob, *prefix_params, limit),
             ).fetchall()
         return conn.execute(
-            """
-            SELECT v.rowid, vec_distance_L2(v.embedding, ?) AS distance
+            f"""
+            SELECT v.rowid, vec_distance_L2(v.embedding, {value_expr}) AS distance
             FROM chunks_vec AS v
             JOIN chunks AS c ON c.id = v.rowid
             ORDER BY distance ASC, v.rowid ASC
@@ -667,17 +760,20 @@ class Store:
         array = np.asarray(vec, dtype=np.float32)
         if array.ndim != 1 or array.shape[0] != self._dim:
             raise ValueError(f"expected a {self._dim}-dimensional vector, got {array.shape}")
-        blob = _serialize_vector(array)
+        blob = self._serialize(array)
+        value_expr = "vec_int8(?)" if self._use_int8_sql else "?"
         with self._lock:
             conn = self._connection()
             if path_prefix is not None or int(limit) > _VEC0_MAX_K:
-                rows = self._vector_scalar_search(conn, blob, int(limit), path_prefix)
+                rows = self._vector_scalar_search(
+                    conn, blob, int(limit), path_prefix, value_expr=value_expr
+                )
             else:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT rowid, distance
                     FROM chunks_vec
-                    WHERE embedding MATCH ? AND k = ?
+                    WHERE embedding MATCH {value_expr} AND k = ?
                     ORDER BY distance
                     """,
                     (blob, int(limit)),

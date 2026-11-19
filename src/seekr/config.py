@@ -10,6 +10,8 @@ from typing import Any
 
 DEFAULT_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+DEFAULT_VECTOR_QUANT = "int8"
+VALID_VECTOR_QUANTS = frozenset({"float32", "int8"})
 DEFAULT_MAX_FILE_BYTES = 20_000_000
 DEFAULT_CHUNK_TARGET_WORDS = 300
 DEFAULT_CHUNK_MAX_WORDS = 450
@@ -54,6 +56,7 @@ class Config:
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES
     embed_model: str = DEFAULT_EMBED_MODEL
     rerank_model: str = DEFAULT_RERANK_MODEL
+    vector_quant: str = DEFAULT_VECTOR_QUANT
     chunk_target_words: int = DEFAULT_CHUNK_TARGET_WORDS
     chunk_max_words: int = DEFAULT_CHUNK_MAX_WORDS
     chunk_overlap_words: int = DEFAULT_CHUNK_OVERLAP_WORDS
@@ -79,6 +82,12 @@ class Config:
             raise ConfigError("embed_model must be a non-empty string")
         if not isinstance(self.rerank_model, str) or not self.rerank_model.strip():
             raise ConfigError("rerank_model must be a non-empty string")
+        if (
+            not isinstance(self.vector_quant, str)
+            or self.vector_quant not in VALID_VECTOR_QUANTS
+        ):
+            choices = ", ".join(sorted(VALID_VECTOR_QUANTS))
+            raise ConfigError(f"vector_quant must be one of {choices}")
         if not isinstance(self.max_file_bytes, int) or isinstance(self.max_file_bytes, bool):
             raise ConfigError("max_file_bytes must be an integer")
         if self.max_file_bytes <= 0:
@@ -160,6 +169,8 @@ def load_config(path: Path | None = None) -> Config:
         values["embed_model"] = data["embed_model"]
     if "rerank_model" in data:
         values["rerank_model"] = data["rerank_model"]
+    if "vector_quant" in data:
+        values["vector_quant"] = data["vector_quant"]
     if "chunk_target_words" in data:
         values["chunk_target_words"] = data["chunk_target_words"]
     if "chunk_max_words" in data:

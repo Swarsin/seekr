@@ -923,6 +923,86 @@ class RealSqliteVecTests(unittest.TestCase):
         self.assertEqual(self.store.vector_search(chunk.vector, 10), [])
         self.assertIsNone(self.store.find_vector_by_text_sha(text_sha("gonevectorword")))
 
+    def test_int8_vector_search_path_prefix_large_k_and_sha_roundtrip(self) -> None:
+        import numpy as np
+
+        int8_path = Path(self._tmp.name) / "int8.db"
+        int8_store = Store(int8_path, "test/model", 8, vector_quant="int8")
+        self.addCleanup(int8_store.close)
+        self.assertEqual(int8_store.vector_quant, "int8")
+
+        q = np.zeros(8, dtype=np.float32)
+        q[0] = 1.0
+        blocked_chunk = _stored_chunk_with_vector("int8blocked", q.copy())
+        allowed_vec = np.zeros(8, dtype=np.float32)
+        allowed_vec[1] = 1.0
+        allowed_chunk = _stored_chunk_with_vector("int8allowed", allowed_vec)
+        diag_vec = np.full(8, 1.0 / np.sqrt(8.0), dtype=np.float32)
+        diag_chunk = _stored_chunk_with_vector("int8diag", diag_vec)
+
+        blocked_doc = _add_document(int8_store, "/notes/blocked/b.md", blocked_chunk)
+        _add_document(int8_store, "/notes/allowed/a.md", allowed_chunk, diag_chunk)
+        blocked_id = int8_store.keyword_search('"int8blocked"', 10)[0][0]
+        allowed_id = int8_store.keyword_search('"int8allowed"', 10)[0][0]
+
+        knn_hits = int8_store.vector_search(q, 3)
+        self.assertEqual(knn_hits[0][0], blocked_id)
+
+        filtered = int8_store.vector_search(q, 2, path_prefix="/notes/allowed")
+        self.assertEqual(len(filtered), 2)
+        self.assertEqual(filtered[1][0], allowed_id)
+
+        large_k = int8_store.vector_search(q, 5000)
+        self.assertEqual(large_k[0][0], blocked_id)
+
+        reused = int8_store.find_vector_by_text_sha(diag_chunk.text_sha)
+        assert reused is not None
+        self.assertEqual(reused.dtype, np.float32)
+        self.assertTrue(np.allclose(reused, diag_vec, atol=0.02))
+        batch_reused = int8_store.find_vectors_by_text_shas(
+            [diag_chunk.text_sha, "missing"]
+        )
+        self.assertEqual(set(batch_reused), {diag_chunk.text_sha})
+
+        int8_store.replace_chunks(blocked_doc, [])
+        self.assertIsNone(int8_store.find_vector_by_text_sha(blocked_chunk.text_sha))
+        int8_store.delete_document("/notes/allowed/a.md")
+        self.assertEqual(int8_store.stats(), {"documents": 1, "chunks": 0})
+        int8_store.delete_document("/notes/blocked/b.md")
+        self.assertEqual(int8_store.stats(), {"documents": 0, "chunks": 0})
+        int8_store.close()
+
+        reopened_auto = Store(int8_path, "test/model", 8)
+        self.addCleanup(reopened_auto.close)
+        self.assertEqual(reopened_auto.vector_quant, "int8")
+        reopened_auto.close()
+
+        with self.assertRaises(ModelMismatchError) as raised:
+            Store(int8_path, "test/model", 8, vector_quant="float32")
+        self.assertIn("seekr reindex", str(raised.exception))
+
+    def test_legacy_db_defaults_to_float32_and_rejects_quant_mismatch(self) -> None:
+        legacy_path = Path(self._tmp.name) / "legacy.db"
+        store = Store(legacy_path, "test/model", 8)
+        _add_document(store, "/notes/a.md", _stored_chunk("legacyword", 1))
+        store.close()
+
+        conn = sqlite3.connect(legacy_path)
+        try:
+            conn.execute("DELETE FROM meta WHERE key = 'vector_quant'")
+            conn.commit()
+        finally:
+            conn.close()
+
+        reopened = Store(legacy_path, "test/model", 8)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.vector_quant, "float32")
+        reopened.close()
+
+        with self.assertRaises(ModelMismatchError) as raised:
+            Store(legacy_path, "test/model", 8, vector_quant="int8")
+        self.assertIn("seekr reindex", str(raised.exception))
+
 
 class VectorExtensionLoaderTests(unittest.TestCase):
     def test_loader_enables_and_disables_extension_loading(self) -> None:

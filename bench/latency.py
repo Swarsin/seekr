@@ -41,6 +41,8 @@ DEFAULT_QUERIES = 50
 DEFAULT_K = 10
 DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_SEED = 202_611_18
+DEFAULT_QUANT = "int8"
+VECTOR_QUANTS = ("float32", "int8")
 MODES = ("keyword", "vector", "hybrid")
 RESULTS_PATH = Path(__file__).resolve().parents[1] / "bench" / "latency-results.md"
 
@@ -421,6 +423,15 @@ def _doc_count(chunk_count: int) -> int:
     return math.ceil(chunk_count / _CHUNKS_PER_DOC)
 
 
+def _db_size_mib(db_path: Path) -> float:
+    total_bytes = 0
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(str(db_path) + suffix)
+        if candidate.exists():
+            total_bytes += candidate.stat().st_size
+    return float(total_bytes) / (1024.0 * 1024.0)
+
+
 def render_results(
     *,
     chunk_count: int,
@@ -433,6 +444,8 @@ def render_results(
     notes: Sequence[tuple[str, str]],
     index_seconds: float | None = None,
     peak_rss_mib: float | None = None,
+    vector_quant: str = "float32",
+    db_size_mib: float | None = None,
 ) -> str:
     """Render measured samples as Markdown, refusing incomplete measurements."""
     for mode in MODES:
@@ -449,8 +462,8 @@ def render_results(
         "",
         (
             f"- Synthetic corpus: {chunk_count:,} chunks in "
-            f"{_doc_count(chunk_count):,} documents, normalised 384-dimensional "
-            "float32 vectors."
+            f"{_doc_count(chunk_count):,} documents, normalised {DIM}-dimensional "
+            f"{vector_quant} vectors."
         ),
         f"- Queries: {query_count} per mode, {repetitions} timed round(s) over the set.",
         "- Each mode received one untimed warm-up after the index was fully written.",
@@ -496,7 +509,7 @@ def render_results(
             "No embedding latency is reported."
         )
 
-    if index_seconds is not None or peak_rss_mib is not None:
+    if index_seconds is not None or peak_rss_mib is not None or db_size_mib is not None:
         lines.extend(
             [
                 "",
@@ -515,6 +528,8 @@ def render_results(
                     f"| Indexing throughput (chunks/sec) | {chunk_count / index_seconds:.1f} |",
                 ]
             )
+        if db_size_mib is not None:
+            lines.append(f"| Database size (MiB) | {db_size_mib:.2f} |")
         if peak_rss_mib is not None:
             lines.append(f"| Peak process RSS | {peak_rss_mib:.1f} MiB |")
 
@@ -544,11 +559,14 @@ def run_benchmark(
     seed: int = DEFAULT_SEED,
     dim: int = DIM,
     k: int = DEFAULT_K,
+    quant: str = DEFAULT_QUANT,
 ) -> Path:
     """Run the benchmark and write measured results to *out*."""
     np_module, store_class, _ = _require_runtime()
     if chunks <= 0 or queries <= 0 or repetitions <= 0 or dim <= 0 or k <= 0:
         raise BenchmarkError("chunks, queries, repetitions, dim and k must be positive")
+    if quant not in VECTOR_QUANTS:
+        raise BenchmarkError(f"unsupported vector quantization {quant!r}")
 
     query_list = make_queries(queries, dim=dim, seed=seed + 2)
     temporary: tempfile.TemporaryDirectory[str] | None = None
@@ -564,7 +582,7 @@ def run_benchmark(
             )
 
     try:
-        store = store_class(database, _BENCH_DB_MODEL, dim)
+        store = store_class(database, _BENCH_DB_MODEL, dim, vector_quant=quant)
         try:
             index_started = time.perf_counter()
             populate_store(store, chunks, dim=dim, seed=seed)
@@ -588,6 +606,7 @@ def run_benchmark(
             }
         finally:
             store.close()
+        db_size_mib = _db_size_mib(database)
     finally:
         if temporary is not None:
             temporary.cleanup()
@@ -607,6 +626,8 @@ def run_benchmark(
         notes=environment_notes(np_module),
         index_seconds=index_seconds,
         peak_rss_mib=peak_rss_mib,
+        vector_quant=quant,
+        db_size_mib=db_size_mib,
     )
 
     output = Path(out).expanduser()
@@ -677,6 +698,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_K,
         help=f"hits requested per query (default: {DEFAULT_K})",
     )
+    parser.add_argument(
+        "--quant",
+        choices=VECTOR_QUANTS,
+        default=DEFAULT_QUANT,
+        help=f"vector quantization mode in sqlite-vec (default: {DEFAULT_QUANT})",
+    )
     return parser
 
 
@@ -693,6 +720,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             out=args.out,
             seed=args.seed,
             k=args.k,
+            quant=args.quant,
         )
     except BenchmarkError as exc:
         print(f"seekr latency benchmark: {exc}", file=sys.stderr)

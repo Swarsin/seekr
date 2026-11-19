@@ -19,7 +19,7 @@ from .embed import build_embedder
 from .lifecycle import LifecycleError, lifecycle_lock
 from .models import Hit
 from .search import SEARCH_MODES, Searcher, SearchMode
-from .store import ModelMismatchError, Store
+from .store import VECTOR_QUANTS, ModelMismatchError, Store
 
 if TYPE_CHECKING:
     import typer
@@ -165,6 +165,12 @@ def _build_searcher(cfg: Config, mode: str, rerank: bool) -> Searcher | None:
             f"{stored_model!r} (dim {stored_dim}), but this configuration uses "
             f"{cfg.embed_model!r}; run `seekr reindex` to rebuild it"
         )
+    stored_quant = meta.get("vector_quant", "float32")
+    if stored_quant not in VECTOR_QUANTS:
+        raise ModelMismatchError(
+            f"index database has unsupported vector quantization {stored_quant!r}; "
+            "run `seekr reindex` to rebuild it"
+        )
 
     # An empty index cannot produce hits in any mode.  Returning before
     # ``build_embedder`` keeps vector/hybrid queries from loading a model (or
@@ -183,7 +189,7 @@ def _build_searcher(cfg: Config, mode: str, rerank: bool) -> Searcher | None:
             )
 
     reranker = _build_reranker(cfg) if rerank else None
-    store = Store(db_path, cfg.embed_model, stored_dim)
+    store = Store(db_path, cfg.embed_model, stored_dim, vector_quant=stored_quant)
     return Searcher(store, embedder, reranker)
 
 

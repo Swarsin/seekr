@@ -132,6 +132,7 @@ def run_daemon(
                 selected_cfg.db_path,
                 selected_cfg.embed_model,
                 dim,
+                vector_quant=selected_cfg.vector_quant,
             )
             try:
                 searcher = Searcher(store, active_embedder, None)
@@ -141,6 +142,7 @@ def run_daemon(
                     ),
                     "embed_model": selected_cfg.embed_model,
                     "dim": dim,
+                    "vector_quant": selected_cfg.vector_quant,
                     "rerank_model": selected_cfg.rerank_model,
                 }
                 indexer = Indexer(store, active_embedder, selected_cfg)

@@ -375,7 +375,11 @@ def rebuild_index(
     """
     _validate_rebuild_roots(cfg)
 
-    store_factory = store_factory or Store
+    resolved_store_factory = store_factory or (
+        lambda path, model, vector_dim: Store(
+            path, model, vector_dim, vector_quant=cfg.vector_quant
+        )
+    )
     indexer_factory = indexer_factory or Indexer
     live_path = Path(cfg.db_path).expanduser()
     try:
@@ -407,7 +411,7 @@ def rebuild_index(
             ) from exc
 
         try:
-            store = store_factory(temp_path, cfg.embed_model, dim)
+            store = resolved_store_factory(temp_path, cfg.embed_model, dim)
             indexer = indexer_factory(store, embedder, cfg)
             report = indexer.sync(list(cfg.roots))
             stats = store.stats()

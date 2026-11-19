@@ -34,6 +34,7 @@ class ConfigLoadingTests(unittest.TestCase):
         self.assertEqual(cfg.max_file_bytes, 20_000_000)
         self.assertEqual(cfg.embed_model, "BAAI/bge-small-en-v1.5")
         self.assertEqual(cfg.rerank_model, "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        self.assertEqual(cfg.vector_quant, "int8")
         self.assertEqual(cfg.chunk_target_words, 300)
         self.assertEqual(cfg.chunk_max_words, 450)
         self.assertEqual(cfg.chunk_overlap_words, 50)
@@ -50,6 +51,16 @@ class ConfigLoadingTests(unittest.TestCase):
 
         self.assertEqual(cfg.chunk_target_words, 200)
         self.assertEqual(cfg.chunk_max_words, 450)
+
+    def test_vector_quant_override_and_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = self._write(Path(tmp), 'vector_quant = "float32"\n')
+            cfg = load_config(cfg_path)
+            self.assertEqual(cfg.vector_quant, "float32")
+
+            bad_path = self._write(Path(tmp), 'vector_quant = "binary"\n')
+            with self.assertRaises(ConfigError):
+                load_config(bad_path)
 
     def test_db_path_expands_tilde(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -121,6 +132,7 @@ class ConfigLoadingTests(unittest.TestCase):
             {"ignore_globs": [".git"]},
             {"max_file_bytes": "big"},
             {"embed_model": ""},
+            {"vector_quant": 8},
             {"chunk_target_words": "300"},
         ]
         for kwargs in cases:

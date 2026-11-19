@@ -44,6 +44,7 @@ __all__ = [
 
 EVAL_MODES = ("keyword", "vector", "hybrid", "hybrid+rerank")
 _FIXED_METRIC_K = 10
+_DEFAULT_STORE = Store
 
 
 @dataclass(frozen=True)
@@ -273,7 +274,15 @@ def run_eval(
             db_path=db_path,
             embed_model=embedder.model_name,
         )
-        store = Store(db_path, embedder.model_name, int(embedder.dim))
+        if Store is _DEFAULT_STORE:
+            store = Store(
+                db_path,
+                embedder.model_name,
+                int(embedder.dim),
+                vector_quant=cfg.vector_quant,
+            )
+        else:
+            store = Store(db_path, embedder.model_name, int(embedder.dim))
         try:
             report = Indexer(store, embedder, cfg).sync([root_path])
             errors = list(getattr(report, "errors", []))

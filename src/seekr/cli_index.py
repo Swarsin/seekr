@@ -36,8 +36,16 @@ def _build_embedder(cfg: Config) -> Embedder:
     return build_embedder(cfg)
 
 
-def _open_store(cfg: Config, dim: int) -> Store:
-    return Store(cfg.db_path, cfg.embed_model, dim)
+_USE_CONFIG = object()
+
+
+def _open_store(
+    cfg: Config, dim: int, *, vector_quant: object = _USE_CONFIG
+) -> Store:
+    quant = cfg.vector_quant if vector_quant is _USE_CONFIG else vector_quant
+    if quant is None:
+        return Store(cfg.db_path, cfg.embed_model, dim)
+    return Store(cfg.db_path, cfg.embed_model, dim, vector_quant=str(quant))
 
 
 def _stored_dim(cfg: Config) -> int | None:
@@ -160,7 +168,7 @@ def status() -> None:
                     return
                 dim = _build_embedder(cfg).dim
 
-            store = _open_store(cfg, dim)
+            store = _open_store(cfg, dim, vector_quant=None)
             try:
                 stats = store.stats()
                 last_errors = store.get_last_error_count()
