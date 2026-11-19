@@ -38,7 +38,9 @@ def _exit_error(command: str, message: str) -> NoReturn:
 
 def _build_pick_command(typer_module: Any) -> Any:
     def pick(
-        query: str = typer_module.Argument(..., help="Words to search for."),
+        query: str = typer_module.Argument(
+            ..., metavar="QUERY", help="Words to search for."
+        ),
         k: int = typer_module.Option(10, "-k", "--k", min=1, help="Maximum number of results."),
         mode: str = typer_module.Option(
             "hybrid", "--mode", help="Search mode: keyword, vector or hybrid."
@@ -78,7 +80,7 @@ def _build_pick_command(typer_module: Any) -> Any:
 def _build_open_command(typer_module: Any) -> Any:
     def open_target(
         target: str = typer_module.Argument(
-            ..., help="A pick line or an unambiguous path:locator."
+            ..., metavar="TARGET", help="A pick line or an unambiguous path:locator."
         ),
     ) -> None:
         """Open a result at its page, line or Markdown heading."""

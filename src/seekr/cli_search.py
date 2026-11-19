@@ -302,7 +302,9 @@ def _exit_error(message: str) -> NoReturn:
 
 def _build_search_command(typer_module: Any) -> Any:
     def search(
-        query: str = typer_module.Argument(..., help="Words to search for."),
+        query: str = typer_module.Argument(
+            ..., metavar="QUERY", help="Words to search for."
+        ),
         k: int = typer_module.Option(
             10, "-k", "--k", min=1, help="Maximum number of results."
         ),

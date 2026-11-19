@@ -83,7 +83,13 @@ def _print_report(report: SyncReport) -> None:
         typer.echo(f"warning: {path}: {message}")
 
 
-def index(paths: list[Path] = typer.Argument(None)) -> None:
+def index(
+    paths: list[Path] = typer.Argument(
+        None,
+        metavar="PATHS",
+        help="Files or directories to index (defaults to configured roots).",
+    ),
+) -> None:
     """Index files or directories, defaulting to the configured roots."""
     try:
         cfg = _load_config()
