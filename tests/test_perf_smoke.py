@@ -89,6 +89,37 @@ class PercentileTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bench.percentile([], 0.95)
 
+    def test_render_results_includes_optional_indexing_and_memory(self) -> None:
+        samples = {"keyword": [1.0, 2.0], "vector": [3.0, 4.0], "hybrid": [5.0, 6.0]}
+        without = bench.render_results(
+            chunk_count=400,
+            query_count=2,
+            repetitions=1,
+            mode_samples=samples,
+            embedding_samples=None,
+            embedding_note="not measured",
+            model_name="fake",
+            notes=[("Python", "3.12")],
+        )
+        self.assertNotIn("## Indexing and memory", without)
+
+        rendered = bench.render_results(
+            chunk_count=400,
+            query_count=2,
+            repetitions=1,
+            mode_samples=samples,
+            embedding_samples=None,
+            embedding_note="not measured",
+            model_name="fake",
+            notes=[("Python", "3.12")],
+            index_seconds=2.0,
+            peak_rss_mib=128.5,
+        )
+        self.assertIn("## Indexing and memory", rendered)
+        self.assertIn("Indexing throughput (docs/sec) | 5.0", rendered)
+        self.assertIn("Indexing throughput (chunks/sec) | 200.0", rendered)
+        self.assertIn("Peak process RSS | 128.5 MiB", rendered)
+
 
 @_slow
 @unittest.skipIf(_SKIP_REASON is not None, _SKIP_REASON or "")

@@ -371,9 +371,35 @@ def _vector_backend_version() -> str:
     return str(row[0]) if row and row[0] is not None else "unknown"
 
 
+def _peak_rss_mib() -> float | None:
+    """Return process peak resident set size in MiB when available."""
+    try:
+        import resource
+    except ImportError:
+        return None
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if rss <= 0:
+        return None
+    if sys.platform == "darwin":
+        return float(rss) / (1024.0 * 1024.0)
+    return float(rss) / 1024.0
+
+
+def _accelerator_note() -> tuple[str, str] | None:
+    torch_mod = sys.modules.get("torch")
+    if torch_mod is None:
+        return None
+    try:
+        if torch_mod.cuda.is_available():
+            return ("Accelerator", f"CUDA ({torch_mod.cuda.get_device_name(0)})")
+    except Exception:  # noqa: BLE001 - informational environment note only
+        return None
+    return ("Accelerator", "CPU")
+
+
 def environment_notes(np_module: Any) -> list[tuple[str, str]]:
     """Return measured environment facts for the results file."""
-    return [
+    notes = [
         ("Python", platform.python_version()),
         ("Platform", platform.platform()),
         ("CPU", _cpu_description()),
@@ -381,6 +407,10 @@ def environment_notes(np_module: Any) -> list[tuple[str, str]]:
         ("sqlite-vec", _vector_backend_version()),
         ("NumPy", str(np_module.__version__)),
     ]
+    accel = _accelerator_note()
+    if accel is not None:
+        notes.append(accel)
+    return notes
 
 
 def _md_cell(value: object) -> str:
@@ -401,6 +431,8 @@ def render_results(
     embedding_note: str | None,
     model_name: str,
     notes: Sequence[tuple[str, str]],
+    index_seconds: float | None = None,
+    peak_rss_mib: float | None = None,
 ) -> str:
     """Render measured samples as Markdown, refusing incomplete measurements."""
     for mode in MODES:
@@ -464,6 +496,28 @@ def render_results(
             "No embedding latency is reported."
         )
 
+    if index_seconds is not None or peak_rss_mib is not None:
+        lines.extend(
+            [
+                "",
+                "## Indexing and memory",
+                "",
+                "| metric | value |",
+                "| --- | ---: |",
+            ]
+        )
+        if index_seconds is not None and index_seconds > 0:
+            doc_count = _doc_count(chunk_count)
+            lines.extend(
+                [
+                    f"| Store populate time | {index_seconds:.2f} s |",
+                    f"| Indexing throughput (docs/sec) | {doc_count / index_seconds:.1f} |",
+                    f"| Indexing throughput (chunks/sec) | {chunk_count / index_seconds:.1f} |",
+                ]
+            )
+        if peak_rss_mib is not None:
+            lines.append(f"| Peak process RSS | {peak_rss_mib:.1f} MiB |")
+
     lines.extend(
         [
             "",
@@ -512,7 +566,9 @@ def run_benchmark(
     try:
         store = store_class(database, _BENCH_DB_MODEL, dim)
         try:
+            index_started = time.perf_counter()
             populate_store(store, chunks, dim=dim, seed=seed)
+            index_seconds = time.perf_counter() - index_started
             actual_chunks = int(store.stats()["chunks"])
             if actual_chunks != chunks:
                 raise BenchmarkError(
@@ -539,6 +595,7 @@ def run_benchmark(
     embedding_samples, embedding_note = measure_query_embedding(
         query_list, model, repetitions=repetitions
     )
+    peak_rss_mib = _peak_rss_mib()
     text = render_results(
         chunk_count=actual_chunks,
         query_count=len(query_list),
@@ -548,6 +605,8 @@ def run_benchmark(
         embedding_note=embedding_note,
         model_name=model,
         notes=environment_notes(np_module),
+        index_seconds=index_seconds,
+        peak_rss_mib=peak_rss_mib,
     )
 
     output = Path(out).expanduser()
