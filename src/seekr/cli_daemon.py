@@ -10,8 +10,10 @@ single watcher thread keeps the index current.
 from __future__ import annotations
 
 import signal
+import sqlite3
 import threading
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -69,6 +71,23 @@ def _reranker_factory(cfg: Config) -> Callable[[], object]:
     return build
 
 
+def _stored_meta(cfg: Config) -> dict[str, str] | None:
+    db_path = Path(cfg.db_path)
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=1.0)
+    except sqlite3.Error:
+        return None
+    try:
+        rows = conn.execute("SELECT key, value FROM meta").fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return {str(key): str(value) for key, value in rows}
+
+
 def run_daemon(
     *,
     cfg: Config | None = None,
@@ -96,10 +115,23 @@ def run_daemon(
             active_embedder = (
                 embedder if embedder is not None else build_embedder(selected_cfg)
             )
+            dim: int | None = None
+            if embedder is None:
+                stored_meta = _stored_meta(selected_cfg)
+                if stored_meta is not None:
+                    try:
+                        candidate_dim = int(stored_meta.get("dim", "0"))
+                    except (TypeError, ValueError):
+                        candidate_dim = 0
+                    if candidate_dim > 0:
+                        dim = candidate_dim
+            if dim is None:
+                dim = int(active_embedder.dim)
+
             store = Store(
                 selected_cfg.db_path,
                 selected_cfg.embed_model,
-                int(active_embedder.dim),
+                dim,
             )
             try:
                 searcher = Searcher(store, active_embedder, None)
@@ -108,7 +140,7 @@ def run_daemon(
                         Path(selected_cfg.db_path).expanduser().resolve(strict=False)
                     ),
                     "embed_model": selected_cfg.embed_model,
-                    "dim": int(active_embedder.dim),
+                    "dim": dim,
                     "rerank_model": selected_cfg.rerank_model,
                 }
                 indexer = Indexer(store, active_embedder, selected_cfg)
@@ -124,6 +156,20 @@ def run_daemon(
                 watcher.start(paused=True)
                 indexer.sync(list(selected_cfg.roots))
                 watcher.resume()
+
+                if embedder is None:
+
+                    def _prewarm() -> None:
+                        if event.is_set():
+                            return
+                        with suppress(ImportError, OSError, RuntimeError, ValueError):
+                            _ = active_embedder.dim
+
+                    threading.Thread(
+                        target=_prewarm,
+                        name="seekr-embed-prewarm",
+                        daemon=True,
+                    ).start()
 
                 serve(
                     searcher,

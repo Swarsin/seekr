@@ -43,43 +43,50 @@ def _read_only_connection(db_path: Path) -> sqlite3.Connection:
         raise SearchError(f"cannot open index database {db_path}: {exc}") from exc
 
 
-def _read_meta(db_path: Path) -> dict[str, str] | None:
-    """Read embedding metadata without opening the Store or loading a model."""
+def _inspect_db(db_path: Path) -> tuple[dict[str, str] | None, bool]:
+    """Read metadata and data-presence on a single read-only SQLite connection."""
     if not db_path.exists():
-        return None
+        return None, False
 
     conn = _read_only_connection(db_path)
     try:
-        rows = conn.execute("SELECT key, value FROM meta").fetchall()
-    except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc).lower():
-            return None
-        raise SearchError(f"cannot read index metadata from {db_path}: {exc}") from exc
-    except sqlite3.DatabaseError as exc:
-        raise SearchError(f"cannot read index metadata from {db_path}: {exc}") from exc
+        try:
+            rows = conn.execute("SELECT key, value FROM meta").fetchall()
+            meta: dict[str, str] | None = {str(key): str(value) for key, value in rows}
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                meta = None
+            else:
+                raise SearchError(f"cannot read index metadata from {db_path}: {exc}") from exc
+        except sqlite3.DatabaseError as exc:
+            raise SearchError(f"cannot read index metadata from {db_path}: {exc}") from exc
+
+        try:
+            row = conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM documents) OR EXISTS(SELECT 1 FROM chunks)"
+            ).fetchone()
+            has_data = bool(row[0]) if row else False
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                has_data = False
+            else:
+                raise SearchError(f"cannot read index database {db_path}: {exc}") from exc
+        except sqlite3.DatabaseError as exc:
+            raise SearchError(f"cannot read index database {db_path}: {exc}") from exc
     finally:
         conn.close()
-    return {str(key): str(value) for key, value in rows}
+    return meta, has_data
+
+
+def _read_meta(db_path: Path) -> dict[str, str] | None:
+    """Read embedding metadata without opening the Store or loading a model."""
+    meta, _ = _inspect_db(db_path)
+    return meta
 
 
 def _has_indexed_data(db_path: Path) -> bool:
-    if not db_path.exists():
-        return False
-
-    conn = _read_only_connection(db_path)
-    try:
-        row = conn.execute(
-            "SELECT EXISTS(SELECT 1 FROM documents) OR EXISTS(SELECT 1 FROM chunks)"
-        ).fetchone()
-    except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc).lower():
-            return False
-        raise SearchError(f"cannot read index database {db_path}: {exc}") from exc
-    except sqlite3.DatabaseError as exc:
-        raise SearchError(f"cannot read index database {db_path}: {exc}") from exc
-    finally:
-        conn.close()
-    return bool(row[0]) if row else False
+    _, has_data = _inspect_db(db_path)
+    return has_data
 
 
 def _embedder_dim(embedder: Embedder) -> int:
@@ -109,10 +116,10 @@ def _build_searcher(cfg: Config, mode: str, rerank: bool) -> Searcher | None:
     load the embedding model during setup.
     """
     db_path = Path(cfg.db_path)
-    meta = _read_meta(db_path)
+    meta, has_data = _inspect_db(db_path)
 
     if not meta:
-        if _has_indexed_data(db_path):
+        if has_data:
             raise ModelMismatchError(
                 "index database has no recorded embedding model; "
                 "run `seekr reindex` to rebuild it"
@@ -122,7 +129,7 @@ def _build_searcher(cfg: Config, mode: str, rerank: bool) -> Searcher | None:
     stored_model_raw = meta.get("embed_model")
     stored_dim_raw = meta.get("dim")
     if stored_model_raw is None and stored_dim_raw is None:
-        if _has_indexed_data(db_path):
+        if has_data:
             raise ModelMismatchError(
                 "index database has no recorded embedding model; "
                 "run `seekr reindex` to rebuild it"
@@ -162,7 +169,7 @@ def _build_searcher(cfg: Config, mode: str, rerank: bool) -> Searcher | None:
     # An empty index cannot produce hits in any mode.  Returning before
     # ``build_embedder`` keeps vector/hybrid queries from loading a model (or
     # creating a Store) just to answer "No results.".
-    if not _has_indexed_data(db_path):
+    if not has_data:
         return None
 
     embedder = build_embedder(cfg)

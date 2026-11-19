@@ -830,6 +830,84 @@ class DaemonRunnerTests(unittest.TestCase):
 
         self.assertEqual(events, ["lock", "close", "unlock"])
 
+    def test_run_daemon_with_existing_db_defers_embedder_load_until_serve(self) -> None:
+        import sqlite3
+
+        events: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "index.db"
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                conn.executemany(
+                    "INSERT INTO meta(key, value) VALUES (?, ?)",
+                    (("embed_model", "BAAI/bge-small-en-v1.5"), ("dim", "12")),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            cfg = Config(roots=(Path(tmp),), db_path=db_path)
+            dim_ready = threading.Event()
+
+            class LazyEmbedder:
+                model_name = cfg.embed_model
+
+                @property
+                def dim(self) -> int:
+                    events.append("embedder.dim")
+                    dim_ready.set()
+                    return 12
+
+            store = mock.Mock()
+            searcher = mock.Mock()
+            indexer = mock.Mock()
+            indexer.sync.side_effect = lambda roots: events.append("sync")
+            watcher = mock.Mock()
+            watcher.resume.side_effect = lambda: events.append("watcher.resume")
+            stop_event = threading.Event()
+
+            @contextlib.contextmanager
+            def lock(path, *, shared=True):
+                yield object()
+
+            def serve(searcher_arg, sock_path, stop_event_arg, **kwargs):
+                events.append("serve")
+                dim_ready.wait(timeout=2.0)
+
+            def open_store(*args, **kwargs):
+                events.append("store")
+                return store
+
+            with (
+                mock.patch("seekr.cli_daemon.build_embedder", return_value=LazyEmbedder()),
+                mock.patch("seekr.cli_daemon.Store", side_effect=open_store) as store_cls,
+                mock.patch("seekr.cli_daemon.Searcher", return_value=searcher),
+                mock.patch("seekr.cli_daemon.Indexer", return_value=indexer),
+                mock.patch("seekr.cli_daemon.Watcher", return_value=watcher),
+                mock.patch("seekr.cli_daemon.serve", side_effect=serve),
+                mock.patch("seekr.cli_daemon.lifecycle_lock", side_effect=lock),
+                mock.patch(
+                    "seekr.cli_daemon.socket_path",
+                    return_value=Path(tmp) / "seekr.sock",
+                ),
+            ):
+                cli_daemon.run_daemon(
+                    cfg=cfg,
+                    stop_event=stop_event,
+                    handle_signals=False,
+                )
+
+        self.assertIn("serve", events)
+        self.assertIn("embedder.dim", events)
+        self.assertLess(events.index("store"), events.index("embedder.dim"))
+        self.assertLess(events.index("sync"), events.index("embedder.dim"))
+        self.assertLess(events.index("watcher.resume"), events.index("embedder.dim"))
+        store_cls.assert_called_once_with(db_path, cfg.embed_model, 12)
+        self.assertEqual(searcher.daemon_metadata["dim"], 12)
+
 
 class ServiceUnitTests(unittest.TestCase):
     def test_service_unit_runs_seekr_daemon_as_a_user_unit(self) -> None:

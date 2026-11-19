@@ -120,6 +120,9 @@ def _normalise_path_prefix(prefix: str | None) -> str | None:
 
 
 def _store_has_chunks(store: Store) -> bool:
+    has_chunks_fn = getattr(store, "has_chunks", None)
+    if callable(has_chunks_fn):
+        return bool(has_chunks_fn())
     stats_fn = getattr(store, "stats", None)
     if stats_fn is None:
         return True
