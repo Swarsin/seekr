@@ -414,7 +414,10 @@ class RealCrossEncoderTests(unittest.TestCase):
         reranker = CrossEncoderReranker(str(model_dir))
         query = "How do neural networks learn from their mistakes?"
         passages = [
-            "Backpropagation computes gradients of the loss with respect to each weight.",
+            (
+                "Neural networks learn from errors using backpropagation to compute "
+                "gradients of the loss and update each weight."
+            ),
             "The mitochondria is the powerhouse of the cell.",
             "Rust ownership prevents data races without a garbage collector.",
         ]
