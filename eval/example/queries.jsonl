@@ -1,0 +1,9 @@
+{"id": "exact-wal-checkpoint", "query": "WAL checkpoint", "relevant": ["sqlite.md"]}
+{"id": "exact-hyprland-rofi", "query": "rofi dmenu Hyprland bind", "relevant": ["hyprland.md"]}
+{"id": "semantic-starter-care", "query": "how do I keep a bread starter alive and healthy", "relevant": ["sourdough.md"]}
+{"id": "semantic-cancelled-task", "query": "stop an async task and clean up without hiding cancellation", "relevant": ["python.md"]}
+{"id": "semantic-cold-hike", "query": "what clothing and safety gear for a cold mountain day walk", "relevant": ["hiking.md"]}
+{"id": "semantic-filing-deadline", "query": "when is the online tax return due and what happens if I am late", "relevant": ["taxes.md"]}
+{"id": "semantic-recover-commit", "query": "find a commit that disappeared after resetting a branch", "relevant": ["git.md"]}
+{"id": "semantic-espresso-fast-shot", "query": "espresso runs too fast and tastes sour what should I change", "relevant": ["espresso.md"]}
+{"id": "multi-data-safety", "query": "protect local work from interrupted writes or an accidental reset", "relevant": ["sqlite.md", "git.md"]}

@@ -1,0 +1,437 @@
+"""Tests for pick-line formatting, parsing, opening and the rofi popup."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+from seekr import cli_open
+from seekr.models import Hit
+from seekr.opener import format_pick_line, open_command, parse_pick_line
+
+ROOT = Path(__file__).resolve().parents[1]
+POPUP_PATH = ROOT / "contrib" / "seekr-popup.sh"
+
+
+def _hit(
+    path: str,
+    locator: str = "",
+    snippet: str = "a snippet",
+    kind: str = "text",
+) -> Hit:
+    return Hit(
+        chunk_id=1,
+        path=path,
+        locator=locator,
+        loc_start=1.0,
+        snippet=snippet,
+        score=1.0,
+        kind=kind,
+    )
+
+
+def _run_popup(rofi_body: str, seekr_body: str) -> subprocess.CompletedProcess[str]:
+    """Run the popup with fake rofi/seekr commands first on PATH."""
+    with tempfile.TemporaryDirectory() as directory:
+        bin_dir = Path(directory)
+        for name, body in (("rofi", rofi_body), ("seekr", seekr_body)):
+            script = bin_dir / name
+            script.write_text(body, encoding="utf-8")
+            script.chmod(0o755)
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        return subprocess.run(
+            [shutil.which("bash") or "bash", str(POPUP_PATH)],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+
+class PickLineTests(unittest.TestCase):
+    def test_pick_line_roundtrip_with_colons_in_path(self) -> None:
+        path = "/a/b:c/d.md"
+        locator = "§Intro"
+
+        line = format_pick_line(_hit(path, locator))
+
+        self.assertEqual(parse_pick_line(line), (path, locator))
+
+    def test_pick_line_collapses_newlines(self) -> None:
+        line = format_pick_line(_hit("/notes.md", "§Intro", "first\nsecond\r\nthird"))
+
+        self.assertNotIn("\n", line)
+        self.assertNotIn("\r", line)
+        self.assertTrue(line.endswith("\tfirst second third"))
+
+    def test_pick_line_shows_common_colon_locators_verbatim(self) -> None:
+        transcript = format_pick_line(_hit("/video.vtt", "00:01:02", "hello"))
+        heading = format_pick_line(_hit("/notes.md", "§Methods: Results", "body"))
+
+        self.assertEqual(transcript.split("\t", 1)[0], "/video.vtt:00:01:02")
+        self.assertEqual(heading.split("\t", 1)[0], "/notes.md:§Methods: Results")
+
+    def test_pick_line_roundtrips_escaped_path_and_locator_data(self) -> None:
+        cases = [
+            ("/a/b:c/d.md", "§Intro"),
+            ("/tmp/a\tb\nc\r.md", "00:01:02"),
+            ("/tmp/100%/über:😀.md", "§Methods: Results > Part 1"),
+            ("/tmp/back\\slash.md", "a\\b:c"),
+            ("/tmp/control\x01\x1b\u2028.md", "loc\x00:ator\x7f"),
+            ("-leading: colon.md", "L1-2"),
+        ]
+
+        for path, locator in cases:
+            with self.subTest(path=path, locator=locator):
+                line = format_pick_line(_hit(path, locator, "a\nb\tc"))
+                self.assertEqual(line.count("\t"), 1)
+                self.assertEqual(len(line.splitlines()), 1)
+                self.assertEqual(parse_pick_line(line), (path, locator))
+
+        visible = format_pick_line(
+            _hit("/tmp/100%/über:😀.md", "§Methods: Results > Part 1", "body")
+        )
+        self.assertIn("100%", visible)
+        self.assertIn("über", visible)
+        self.assertIn("😀", visible)
+        self.assertIn("§Methods: Results > Part 1", visible)
+
+    def test_pick_line_empty_locator_keeps_the_separator(self) -> None:
+        line = format_pick_line(_hit("/a/b:c.txt", "", "snippet"))
+
+        self.assertEqual(line, "/a/b\\:c.txt:\tsnippet")
+        self.assertEqual(parse_pick_line(line), ("/a/b:c.txt", ""))
+
+    def test_parse_raw_path_locator_is_compatible_for_unambiguous_inputs(self) -> None:
+        self.assertEqual(
+            parse_pick_line("/tmp/video.vtt:00:01:02"),
+            ("/tmp/video.vtt", "00:01:02"),
+        )
+        self.assertEqual(
+            parse_pick_line("/tmp/notes.md:§Methods: Results"),
+            ("/tmp/notes.md", "§Methods: Results"),
+        )
+        self.assertEqual(parse_pick_line("/tmp/plain.txt"), ("/tmp/plain.txt", ""))
+
+    def test_snippet_is_sanitised_and_bounded(self) -> None:
+        snippet = ("word\n\t\x1b" * 500) + "tail"
+        line = format_pick_line(_hit("/notes.md", "§Intro", snippet))
+        rendered = line.split("\t", 1)[1]
+
+        self.assertLessEqual(len(rendered), 240)
+        self.assertNotIn("\x1b", rendered)
+        self.assertTrue(rendered.startswith("word word"))
+        self.assertTrue(rendered.endswith("…"))
+
+
+class OpenCommandTests(unittest.TestCase):
+    def test_open_command_pdf_zathura_page(self) -> None:
+        calls: list[str] = []
+
+        def which(name: str) -> str | None:
+            calls.append(name)
+            return "/usr/bin/zathura"
+
+        argv = open_command("/papers/paper.pdf", "p.12", "pdf", {}, which)
+
+        self.assertEqual(argv, ["zathura", "-P", "12", "/papers/paper.pdf"])
+        self.assertEqual(calls, ["zathura"])
+
+    def test_open_command_pdf_fallback_xdg_open(self) -> None:
+        argv = open_command("/papers/paper.pdf", "p.12", "pdf", {}, lambda _name: None)
+
+        self.assertEqual(argv, ["xdg-open", "/papers/paper.pdf"])
+
+    def test_open_command_code_line_uses_editor_env(self) -> None:
+        self.assertEqual(
+            open_command("file.py", "L10-20", "code", {"EDITOR": "nano"}, lambda _: None),
+            ["nano", "+10", "file.py"],
+        )
+        self.assertEqual(
+            open_command("file.py", "L10-20", "code", {}, lambda _: None),
+            ["nvim", "+10", "file.py"],
+        )
+
+    def test_open_command_editor_env_is_split_without_a_shell(self) -> None:
+        argv = open_command("file.py", "L3-4", "code", {"EDITOR": "code --wait"}, lambda _: None)
+        malformed = open_command(
+            "file.py", "L3-4", "code", {"EDITOR": "'unterminated"}, lambda _: None
+        )
+
+        self.assertEqual(argv, ["code", "--wait", "+3", "file.py"])
+        self.assertEqual(malformed, ["nvim", "+3", "file.py"])
+
+    def test_open_command_text_line_uses_editor(self) -> None:
+        argv = open_command("notes.txt", "L7-9", "text", {}, lambda _: None)
+
+        self.assertEqual(argv, ["nvim", "+7", "notes.txt"])
+
+    def test_open_command_transcript_uses_xdg_open(self) -> None:
+        calls: list[str] = []
+
+        def which(name: str) -> str | None:
+            calls.append(name)
+            return "/usr/bin/zathura"
+
+        argv = open_command("lecture.vtt", "00:01:02", "transcript", {}, which)
+
+        self.assertEqual(argv, ["xdg-open", "lecture.vtt"])
+        self.assertEqual(calls, [])
+
+    def test_open_command_unknown_or_unlocated_uses_xdg_open(self) -> None:
+        self.assertEqual(
+            open_command("archive.bin", "", "binary", {}, lambda _: None),
+            ["xdg-open", "archive.bin"],
+        )
+        self.assertEqual(
+            open_command("paper.pdf", "not-a-page", "pdf", {}, lambda _: None),
+            ["xdg-open", "paper.pdf"],
+        )
+        self.assertEqual(
+            open_command("notes.md", "", "markdown", {}, lambda _: None),
+            ["xdg-open", "notes.md"],
+        )
+
+    def test_open_command_prefixes_leading_hyphen_paths(self) -> None:
+        self.assertEqual(
+            open_command("-notes.md", "L1-2", "markdown", {}, lambda _: None),
+            ["nvim", "+1", "./-notes.md"],
+        )
+        self.assertEqual(
+            open_command("-paper.pdf", "p.2", "pdf", {}, lambda _: "zathura"),
+            ["zathura", "-P", "2", "./-paper.pdf"],
+        )
+        self.assertEqual(
+            open_command("-file.bin", "", "binary", {}, lambda _: None),
+            ["xdg-open", "./-file.bin"],
+        )
+
+    def test_open_command_neutralises_leading_plus_editor_commands(self) -> None:
+        for path in ("+!cmd", "+foo", "+"):
+            with self.subTest(path=path):
+                argv = open_command(path, "L3-4", "markdown", {"EDITOR": "nano"}, lambda _: None)
+                self.assertEqual(argv, ["nano", "+3", f"./{path}"])
+
+
+class MarkdownHeadingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = Path(self.dir.name) / "notes.md"
+        self.path.write_text(
+            "# Intro\n"
+            "\n"
+            "Some intro text.\n"
+            "\n"
+            "# Methods: Results\n"
+            "\n"
+            "More text.\n"
+            "\n"
+            "## Nested: Detail\n"
+            "\n"
+            "Detail text.\n",
+            encoding="utf-8",
+        )
+
+    def test_open_command_markdown_heading_uses_exact_editor_line(self) -> None:
+        self.assertEqual(
+            open_command(str(self.path), "§Intro", "markdown", {}, lambda _: None),
+            ["nvim", "+1", str(self.path)],
+        )
+        self.assertEqual(
+            open_command(str(self.path), "§Methods: Results", "markdown", {}, lambda _: None),
+            ["nvim", "+5", str(self.path)],
+        )
+        self.assertEqual(
+            open_command(
+                str(self.path),
+                "§Methods: Results > Nested: Detail",
+                "markdown",
+                {},
+                lambda _: None,
+            ),
+            ["nvim", "+9", str(self.path)],
+        )
+
+    def test_missing_heading_or_file_falls_back_to_xdg_open(self) -> None:
+        self.assertEqual(
+            open_command(str(self.path), "§Missing", "markdown", {}, lambda _: None),
+            ["xdg-open", str(self.path)],
+        )
+        missing = Path(self.dir.name) / "missing.md"
+        self.assertEqual(
+            open_command(str(missing), "§Intro", "markdown", {}, lambda _: None),
+            ["xdg-open", str(missing)],
+        )
+
+
+class _FakeExit(Exception):
+    def __init__(self, code: int = 0) -> None:
+        super().__init__(code)
+        self.exit_code = code
+
+
+class _FakeTyper(types.ModuleType):
+    def __init__(self) -> None:
+        super().__init__("typer")
+        self.output: list[str] = []
+        self.Argument = lambda default, **_kwargs: default
+        self.Option = lambda default, *_args, **_kwargs: default
+        self.Exit = _FakeExit
+        self.echo = self._echo
+
+    def _echo(self, *args: Any, **_kwargs: Any) -> None:
+        self.output.append(" ".join(str(arg) for arg in args))
+
+
+class _FakeApp:
+    def __init__(self) -> None:
+        self.commands: dict[str, Any] = {}
+
+    def command(self, name: str) -> Any:
+        def decorator(function: Any) -> Any:
+            self.commands[name] = function
+            return function
+
+        return decorator
+
+
+class CliTests(unittest.TestCase):
+    def _registered(self) -> tuple[_FakeApp, _FakeTyper]:
+        fake_typer = _FakeTyper()
+        app = _FakeApp()
+        with mock.patch.dict(sys.modules, {"typer": fake_typer}):
+            cli_open.register(app)
+        return app, fake_typer
+
+    def test_register_adds_pick_and_open(self) -> None:
+        app, _ = self._registered()
+
+        self.assertEqual(set(app.commands), {"pick", "open"})
+
+    def test_pick_uses_shared_get_hits_and_prints_pick_lines(self) -> None:
+        app, fake_typer = self._registered()
+        hits = [
+            _hit("/notes/a.md", "§A", "first\nsnippet", "markdown"),
+            _hit("/video.vtt", "00:01:02", "second", "transcript"),
+        ]
+
+        with mock.patch.object(cli_open, "get_hits", return_value=hits) as get_hits:
+            app.commands["pick"](query="needle")
+
+        get_hits.assert_called_once_with(
+            "needle",
+            k=10,
+            mode="hybrid",
+            per_file=2,
+            rerank=False,
+            path_prefix=None,
+        )
+        self.assertEqual(
+            fake_typer.output,
+            [format_pick_line(hit) for hit in hits],
+        )
+
+    def test_open_command_runs_expected_argv_without_a_shell(self) -> None:
+        app, _ = self._registered()
+        py_file = Path(tempfile.gettempdir()) / "seekr-open-test.py"
+        completed = types.SimpleNamespace(returncode=0)
+
+        with (
+            mock.patch.dict(os.environ, {"EDITOR": "nano"}),
+            mock.patch.object(cli_open.subprocess, "run", return_value=completed) as run,
+        ):
+            app.commands["open"](target=f"{py_file}:L10-12")
+
+        run.assert_called_once_with(["nano", "+10", str(py_file)], check=False)
+        self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_open_accepts_a_pick_line_and_never_fakes_transcript_media(self) -> None:
+        app, _ = self._registered()
+        vtt_file = Path(tempfile.gettempdir()) / "seekr-open-test.vtt"
+        line = format_pick_line(_hit(str(vtt_file), "00:01:02", "hello", "transcript"))
+        completed = types.SimpleNamespace(returncode=0)
+
+        with mock.patch.object(cli_open.subprocess, "run", return_value=completed) as run:
+            app.commands["open"](target=line)
+
+        run.assert_called_once_with(["xdg-open", str(vtt_file)], check=False)
+
+    def test_open_resolves_markdown_heading_to_editor_line(self) -> None:
+        app, _ = self._registered()
+        with tempfile.TemporaryDirectory() as directory:
+            notes = Path(directory) / "notes.md"
+            notes.write_text("# Intro\n\nbody\n", encoding="utf-8")
+            line = format_pick_line(_hit(str(notes), "§Intro", "body", "markdown"))
+            completed = types.SimpleNamespace(returncode=0)
+
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(cli_open.subprocess, "run", return_value=completed) as run,
+            ):
+                app.commands["open"](target=line)
+
+        run.assert_called_once_with(["nvim", "+1", str(notes)], check=False)
+
+
+class PopupScriptTests(unittest.TestCase):
+    def test_popup_script_has_two_prompts_and_cancellation_guards(self) -> None:
+        source = POPUP_PATH.read_text(encoding="utf-8")
+
+        self.assertGreaterEqual(source.count("rofi -dmenu"), 2)
+        self.assertIn("seekr pick", source)
+        self.assertIn("seekr open", source)
+        self.assertNotIn("eval ", source)
+        self.assertGreaterEqual(source.count("exit 0"), 2)
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required for the popup tests")
+    def test_popup_reports_pick_failure_instead_of_cancelling(self) -> None:
+        rofi = "#!/usr/bin/env bash\nprintf 'query\\n'\nexit 0\n"
+        seekr = (
+            "#!/usr/bin/env bash\n"
+            'if [[ "${1:-}" == "pick" ]]; then\n'
+            "    printf 'pick exploded\\n' >&2\n"
+            "    exit 7\n"
+            "fi\n"
+            "exit 0\n"
+        )
+
+        result = _run_popup(rofi, seekr)
+
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertIn("pick failed", result.stderr.lower())
+        self.assertIn("pick exploded", result.stderr)
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required for the popup tests")
+    def test_popup_rofi_cancellation_is_a_quiet_zero_exit(self) -> None:
+        rofi = "#!/usr/bin/env bash\nexit 1\n"
+        seekr = "#!/usr/bin/env bash\nexit 0\n"
+
+        result = _run_popup(rofi, seekr)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is required for the syntax check")
+    def test_popup_script_has_valid_shell_syntax(self) -> None:
+        result = subprocess.run(
+            [shutil.which("bash") or "bash", "-n", str(POPUP_PATH)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

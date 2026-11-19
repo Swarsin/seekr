@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seekr"
+version = "0.1.0"
+description = "Offline hybrid semantic and keyword search over your own files"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "seekr contributors" }]
+keywords = [
+    "local-first",
+    "offline",
+    "semantic-search",
+    "full-text-search",
+    "sqlite",
+    "fts5",
+    "sqlite-vec",
+    "retrieval",
+    "rrf",
+    "sentence-transformers",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Desktop Environment",
+    "Topic :: Text Processing :: Indexing",
+]
+dependencies = [
+    # Documented conservative minimum: SentenceTransformer and CrossEncoder are
+    # assumed to accept local_files_only/trust_remote_code (src/seekr/offline.py)
+    # from sentence-transformers 3.0 onward; this is an assumption, not a pin.
+    "sentence-transformers>=3.0",
+    "sqlite-vec>=0.1",
+    "pymupdf>=1.23",
+    "watchdog>=3.0",
+    "typer>=0.9",
+    "numpy>=1.24",
+    "tree-sitter-language-pack>=0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+seekr = "seekr.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/seekr/seekr"
+Repository = "https://github.com/seekr/seekr"
+Issues = "https://github.com/seekr/seekr/issues"
+Documentation = "https://github.com/seekr/seekr#readme"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Typer's Option/Argument defaults are its documented declarative API.
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# These modules deliberately isolate arbitrary third-party, filesystem and
+# per-file failures into diagnostics (report errors/warnings or line fallback)
+# rather than aborting an index or chunking run.
+"src/seekr/indexer.py" = ["BLE001"]
+"src/seekr/chunking.py" = ["BLE001"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "slow: tests that require downloaded models, network access, or benchmarks",
+]

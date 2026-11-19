@@ -1,0 +1,495 @@
+"""Incremental filesystem watching for the seekr daemon.
+
+Events are debounced per path and executed by one worker thread, so indexing,
+deletes, directory scans and moves are serialized through a single writer.
+Moves between indexed paths are routed through :meth:`Indexer.move_path` rather
+than a delete followed by an insert, which preserves vectors and embedding
+work.
+
+Watchdog is imported only when watching starts, so importing this module (and
+the CLI) stays cheap and works on hosts without the optional dependency.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import stat
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+__all__ = ["Watcher", "WatcherError"]
+
+_IDLE_WAIT = 0.25
+_EVENT_TYPES = frozenset({"created", "modified", "moved", "deleted"})
+
+
+class WatcherError(RuntimeError):
+    """The watcher could not be created, started or stopped safely."""
+
+
+@dataclass(frozen=True)
+class _Pending:
+    key: tuple[str, ...]
+    due: float
+    seq: int
+    kind: str
+    src: Path
+    dst: Path | None = None
+
+
+def _decode_path(value: object) -> str:
+    if isinstance(value, bytes):
+        return os.fsdecode(value)
+    return os.fspath(value)  # type: ignore[arg-type]
+
+
+class _EventDispatch:
+    """Duck-typed watchdog event handler; no watchdog import is required."""
+
+    def __init__(self, watcher: Watcher) -> None:
+        self._watcher = watcher
+
+    def dispatch(self, event: object) -> None:
+        try:
+            event_type = getattr(event, "event_type", None)
+            if not isinstance(event_type, str) or event_type not in _EVENT_TYPES:
+                return
+            raw_src = getattr(event, "src_path", None)
+            if raw_src is None:
+                return
+            raw_dst = getattr(event, "dest_path", None)
+            destination = _decode_path(raw_dst) if raw_dst else None
+            self._watcher._handle_event(
+                event_type,
+                _decode_path(raw_src),
+                destination,
+                is_directory=bool(getattr(event, "is_directory", False)),
+            )
+        except Exception as exc:  # noqa: BLE001 - a bad event must not kill the observer
+            self._watcher._record_error("cannot handle filesystem event", exc)
+
+
+class Watcher:
+    """Debounced watchdog observer with one serialized writer thread."""
+
+    def __init__(
+        self,
+        indexer: Any,
+        roots: list[Path],
+        debounce_s: float = 1.0,
+        *,
+        observer_factory: Callable[[], Any] | None = None,
+    ) -> None:
+        try:
+            debounce = float(debounce_s)
+        except (TypeError, ValueError) as exc:
+            raise WatcherError("debounce_s must be a non-negative number") from exc
+        if not math.isfinite(debounce) or debounce < 0:
+            raise WatcherError("debounce_s must be a non-negative finite number")
+
+        self._indexer = indexer
+        self._roots = tuple(Path(root).expanduser() for root in roots)
+        self._resolved_roots = tuple(self._resolve(root) for root in self._roots)
+        self._debounce_s = debounce
+        self._observer_factory = observer_factory
+
+        self._condition = threading.Condition()
+        self._pending: dict[tuple[str, ...], _Pending] = {}
+        self._sequence = 0
+        self._paused = False
+        self._stopping = False
+        self._started = False
+
+        self._worker: threading.Thread | None = None
+        self._observer: Any | None = None
+        self._handler: _EventDispatch | None = None
+
+        self._error_lock = threading.Lock()
+        self._errors: list[tuple[str, str]] = []
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def start(self, *, paused: bool = False) -> None:
+        """Start the observer and writer.
+
+        ``paused=True`` starts the observer while buffering events for a caller
+        that is running an initial ``Indexer.sync`` first.  Call :meth:`resume`
+        when that sync has finished.
+        """
+        with self._condition:
+            if self._started:
+                raise WatcherError("watcher is already started")
+            self._paused = bool(paused)
+            self._stopping = False
+            self._started = True
+
+        worker = threading.Thread(
+            target=self._run,
+            name="seekr-watcher",
+            daemon=True,
+        )
+        self._worker = worker
+        worker.start()
+
+        observer: Any | None = None
+        try:
+            observer = self._build_observer()
+            handler = _EventDispatch(self)
+            self._schedule_watches(observer, handler)
+            observer.start()
+        except Exception as exc:
+            self._abort_start(worker, observer)
+            if isinstance(exc, WatcherError):
+                raise
+            raise WatcherError(f"cannot start file watcher: {exc}") from exc
+
+        self._observer = observer
+        self._handler = handler
+
+    def resume(self) -> None:
+        """Allow a watcher started with ``paused=True`` to apply events."""
+        with self._condition:
+            self._paused = False
+            self._condition.notify_all()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Stop the observer and writer; safe to call more than once."""
+        with self._condition:
+            self._stopping = True
+            self._pending.clear()
+            self._condition.notify_all()
+
+        observer = self._observer
+        self._observer = None
+        self._handler = None
+        if observer is not None:
+            try:
+                observer.stop()
+            except Exception as exc:  # noqa: BLE001 - third-party observer
+                self._record_error("cannot stop filesystem observer", exc)
+            try:
+                observer.join(timeout=timeout)
+            except Exception as exc:  # noqa: BLE001 - third-party observer
+                self._record_error("cannot join filesystem observer", exc)
+
+        worker = self._worker
+        self._worker = None
+        if (
+            worker is not None
+            and worker is not threading.current_thread()
+        ):
+            worker.join(timeout=timeout)
+            # Never leave the single writer alive when a caller may close the
+            # Store immediately after stop().  At worst this waits for the one
+            # indexing operation already in flight.
+            while worker.is_alive():
+                worker.join()
+
+        with self._condition:
+            self._started = False
+
+    @property
+    def errors(self) -> list[tuple[str, str]]:
+        with self._error_lock:
+            return list(self._errors)
+
+    # -- observer setup ----------------------------------------------------
+
+    def _build_observer(self) -> Any:
+        if self._observer_factory is not None:
+            return self._observer_factory()
+        try:
+            from watchdog.observers import Observer
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise WatcherError(
+                "watchdog is required for `seekr daemon`; install the watchdog package"
+            ) from exc
+        return Observer()
+
+    def _schedule_watches(self, observer: Any, handler: _EventDispatch) -> None:
+        watches: dict[str, bool] = {}
+        for root in self._roots:
+            resolved = self._resolve(root)
+            try:
+                root_stat = resolved.stat()
+            except OSError as exc:
+                self._record_error(
+                    f"cannot watch missing or unreadable root {resolved}", exc
+                )
+                continue
+            if stat.S_ISDIR(root_stat.st_mode):
+                watch_path = resolved
+                recursive = True
+            elif stat.S_ISREG(root_stat.st_mode):
+                watch_path = resolved.parent
+                recursive = False
+            else:
+                self._record_error(f"cannot watch non-file root {resolved}", None)
+                continue
+            key = str(watch_path)
+            watches[key] = watches.get(key, False) or recursive
+
+        for watch_path, recursive in sorted(watches.items()):
+            observer.schedule(handler, watch_path, recursive=recursive)
+
+    def _abort_start(self, worker: threading.Thread, observer: Any | None) -> None:
+        with self._condition:
+            self._stopping = True
+            self._pending.clear()
+            self._condition.notify_all()
+        if observer is not None:
+            try:
+                observer.stop()
+            except Exception as exc:  # noqa: BLE001 - best-effort startup cleanup
+                self._record_error("cannot stop filesystem observer during startup", exc)
+        worker.join(timeout=5.0)
+        with self._condition:
+            self._started = False
+        self._handler = None
+        self._observer = None
+
+    # -- event intake ------------------------------------------------------
+
+    def _handle_event(
+        self,
+        event_type: str,
+        src_path: str | os.PathLike[str],
+        dest_path: str | os.PathLike[str] | None = None,
+        *,
+        is_directory: bool = False,
+    ) -> None:
+        if not self._started:
+            return
+
+        source = self._inside_roots(src_path)
+        if event_type == "moved":
+            destination = (
+                self._inside_roots(dest_path) if dest_path is not None else None
+            )
+            if source is None and destination is None:
+                return
+            if is_directory:
+                if source is not None and destination is not None:
+                    self._schedule("move_dir", source, destination)
+                elif destination is not None:
+                    self._schedule("scan_dir", destination)
+                else:
+                    assert source is not None
+                    self._schedule("remove_dir", source)
+            else:
+                if source is not None and destination is not None:
+                    self._schedule("move", source, destination)
+                elif destination is not None:
+                    self._schedule("index", destination)
+                else:
+                    assert source is not None
+                    self._schedule("remove", source)
+            return
+
+        if source is None:
+            return
+        if event_type == "created":
+            self._schedule("scan_dir" if is_directory else "index", source)
+        elif event_type == "modified":
+            # Directory mtimes change for every child event; only child paths
+            # need work.  A modified file is re-indexed.
+            if not is_directory:
+                self._schedule("index", source)
+        elif event_type == "deleted":
+            self._schedule("remove_dir" if is_directory else "remove", source)
+
+    def _schedule(self, kind: str, src: Path, dst: Path | None = None) -> None:
+        with self._condition:
+            if self._stopping:
+                return
+            if dst is not None and kind in ("move", "move_dir"):
+                src = self._merge_pending_move(kind, src, dst)
+            # Move entries are keyed by (source, destination): keying only by
+            # the destination lets a later move with the same target discard an
+            # earlier move before its source is reconciled.
+            if dst is None:
+                key = (kind, str(src))
+            else:
+                key = (kind, str(src), str(dst))
+            self._sequence += 1
+            self._pending[key] = _Pending(
+                key=key,
+                due=time.monotonic() + self._debounce_s,
+                seq=self._sequence,
+                kind=kind,
+                src=src,
+                dst=dst,
+            )
+            self._condition.notify_all()
+
+    def _merge_pending_move(self, kind: str, src: Path, dst: Path) -> Path:
+        """Collapse a debounced A→B, B→C chain into one A→C move.
+
+        The caller holds ``self._condition``.  A replacement for the same
+        source path is also folded, so at most one move for a source family is
+        pending.  Moves with different sources and the same destination remain
+        distinct.
+        """
+        while True:
+            for key, pending in list(self._pending.items()):
+                if pending.kind != kind:
+                    continue
+                if pending.src == src or pending.dst == src:
+                    if pending.dst == src:
+                        src = pending.src
+                    del self._pending[key]
+                    break
+            else:
+                return src
+
+    def _inside_roots(self, raw_path: object) -> Path | None:
+        try:
+            resolved = Path(_decode_path(raw_path)).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        for root in self._resolved_roots:
+            if resolved == root:
+                return resolved
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                continue
+            return resolved
+        return None
+
+    # -- worker ------------------------------------------------------------
+
+    def _run(self) -> None:
+        while True:
+            due: list[_Pending] = []
+            with self._condition:
+                while not due:
+                    if self._stopping:
+                        return
+                    if self._paused:
+                        self._condition.wait(_IDLE_WAIT)
+                        continue
+                    if not self._pending:
+                        self._condition.wait(_IDLE_WAIT)
+                        continue
+                    now = time.monotonic()
+                    due = sorted(
+                        (
+                            pending
+                            for pending in self._pending.values()
+                            if pending.due <= now
+                        ),
+                        key=lambda pending: (pending.due, pending.seq),
+                    )
+                    if due:
+                        for pending in due:
+                            self._pending.pop(pending.key, None)
+                        break
+                    next_due = min(
+                        pending.due for pending in self._pending.values()
+                    )
+                    self._condition.wait(
+                        max(0.001, min(next_due - now, _IDLE_WAIT))
+                    )
+
+            for pending in due:
+                with self._condition:
+                    if self._stopping:
+                        return
+                try:
+                    self._execute(pending)
+                except Exception as exc:  # noqa: BLE001 - isolate every event
+                    self._record_error(
+                        f"cannot apply {pending.kind} for {pending.src}", exc
+                    )
+
+    def _execute(self, pending: _Pending) -> None:
+        if pending.kind == "index":
+            self._indexer.index_path(pending.src)
+        elif pending.kind == "remove":
+            self._indexer.remove_path(pending.src)
+        elif pending.kind == "move":
+            assert pending.dst is not None
+            self._indexer.move_path(pending.src, pending.dst)
+        elif pending.kind == "scan_dir":
+            self._indexer.sync([pending.src])
+        elif pending.kind == "remove_dir":
+            self._remove_directory(pending.src)
+        elif pending.kind == "move_dir":
+            assert pending.dst is not None
+            self._move_directory(pending.src, pending.dst)
+
+    def _remove_directory(self, directory: Path) -> None:
+        store = getattr(self._indexer, "store", None)
+        list_paths = getattr(store, "list_paths", None)
+        if not callable(list_paths):
+            self._record_error(
+                f"cannot remove indexed files below {directory}: store has no list_paths",
+                None,
+            )
+            return
+        try:
+            indexed = list(list_paths(str(directory)))
+        except Exception as exc:  # noqa: BLE001 - store is an injected backend
+            self._record_error(f"cannot list indexed files below {directory}", exc)
+            return
+        for path in indexed:
+            self._indexer.remove_path(Path(path))
+
+    def _move_directory(self, source: Path, destination: Path) -> None:
+        for file_path in self._walk_files(destination):
+            try:
+                relative = file_path.relative_to(destination)
+            except ValueError:
+                continue
+            self._indexer.move_path(source / relative, file_path)
+        # Anything left at the old path (deleted files, ignored files) must go.
+        self._remove_directory(source)
+
+    def _walk_files(self, directory: Path) -> list[Path]:
+        files: list[Path] = []
+
+        def onerror(exc: OSError) -> None:
+            self._record_error(f"cannot read directory {directory}", exc)
+
+        for dirpath, dirnames, filenames in os.walk(
+            directory,
+            topdown=True,
+            onerror=onerror,
+            followlinks=False,
+        ):
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if not os.path.islink(os.path.join(dirpath, name))
+            ]
+            for name in filenames:
+                candidate = Path(dirpath) / name
+                resolved = self._inside_roots(candidate)
+                if resolved is not None:
+                    files.append(resolved)
+        files.sort(key=str)
+        return files
+
+    # -- helpers -----------------------------------------------------------
+
+    @staticmethod
+    def _resolve(path: Path) -> Path:
+        try:
+            return Path(path).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError):
+            return Path(path).expanduser()
+
+    def _record_error(self, message: str, exc: BaseException | None) -> None:
+        detail = message
+        if exc is not None:
+            text = str(exc).strip()
+            detail = f"{message}: {text or exc.__class__.__name__}"
+        with self._error_lock:
+            self._errors.append((detail, exc.__class__.__name__ if exc else ""))
+            del self._errors[:-100]
