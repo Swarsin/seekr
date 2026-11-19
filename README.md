@@ -119,13 +119,11 @@ PDFs open in zathura at the page when available; code and Markdown open in
 
 ## Evaluation
 
-The repository deliberately ships **no pre-filled benchmark numbers**. Results
-must come from real runs on a stated corpus and machine.
+All benchmark numbers below were measured on an AMD Ryzen 9 3900X (24 logical CPUs), 31 GiB RAM, and NVIDIA GeForce RTX 3070 (CUDA, PyTorch 2.15.0+cu132, Python 3.12.15, SQLite 3.53.1, sqlite-vec v0.1.9).
 
-### Retrieval quality (BEIR SciFact)
+### Retrieval quality (BEIR SciFact & NFCorpus)
 
-Download and convert the public SciFact dataset once, then run the four
-retrieval modes:
+Download and convert the datasets once, then run all four retrieval modes:
 
 ```bash
 python eval/beir_scifact.py
@@ -134,13 +132,55 @@ seekr eval \
   --queries eval/data/scifact/queries.jsonl \
   --modes keyword,vector,hybrid,hybrid+rerank \
   --out bench/scifact-results.md
+
+python eval/beir_nfcorpus.py
+seekr eval \
+  --root eval/data/nfcorpus/corpus \
+  --queries eval/data/nfcorpus/queries.jsonl \
+  --modes keyword,vector,hybrid,hybrid+rerank \
+  --out bench/nfcorpus-results.md
 ```
 
-This produces a markdown table of `recall@5`, `recall@10`, `mrr@10`, `ndcg@10`,
-and `p50_ms` for each mode. `eval/data/` is git-ignored. To evaluate your own
-notes instead, see [`docs/eval.md`](docs/eval.md) for the query JSONL format and
-guidance on writing roughly 50 file-level queries. A small versioned example
-corpus is available at `eval/example/`.
+**BEIR SciFact** (5,183 documents, 300 queries; `BAAI/bge-small-en-v1.5`, `cross-encoder/ms-marco-MiniLM-L-6-v2`):
+
+| mode | recall@5 | recall@10 | mrr@10 | ndcg@10 | p50_ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| keyword | 0.7387 | 0.8078 | 0.6547 | 0.6866 | 14.21 |
+| vector | 0.7590 | 0.8379 | 0.6853 | 0.7159 | 23.94 |
+| **hybrid** | **0.7806** | **0.8701** | **0.6962** | **0.7318** | **32.54** |
+| hybrid+rerank | 0.7499 | 0.8322 | 0.6669 | 0.7010 | 119.88 |
+
+**BEIR NFCorpus** (3,633 documents, 323 queries; same models):
+
+| mode | recall@5 | recall@10 | mrr@10 | ndcg@10 | p50_ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| keyword | 0.1228 | 0.1553 | 0.5224 | 0.3214 | 3.26 |
+| vector | 0.1267 | 0.1614 | 0.5316 | 0.3427 | 22.35 |
+| **hybrid** | **0.1376** | **0.1733** | **0.5694** | **0.3642** | **24.48** |
+| hybrid+rerank | 0.1389 | 0.1695 | 0.5842 | 0.3569 | 106.30 |
+
+### Retrieval ablations
+
+Controlled single-variable ablations against the default `hybrid` baseline (`0.7318` SciFact, `0.3642` NFCorpus, macro-avg `0.5480`; full tables in [`docs/experiments.md`](docs/experiments.md)):
+
+| Experiment | Variant | SciFact ndcg@10 | NFCorpus ndcg@10 | Avg ndcg@10 | ΔAvg (pts) | Decision |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| Baseline | `bge-small-en-v1.5`, 300/50 chunks, RRF k=60, `porter unicode61` | 0.7318 | 0.3642 | 0.5480 | 0.00 | Default |
+| Chunking | 150 words / 50 overlap | 0.7223 | 0.3686 | 0.5455 | -0.25 | Reverted |
+| Chunking | 300 words / 0 overlap | 0.7349 | 0.3655 | 0.5502 | +0.22 | Reverted (< +1.0 pt) |
+| Chunking | 450 words / 50 overlap | 0.7305 | 0.3649 | 0.5477 | -0.03 | Reverted |
+| Headers | Prepend filename + heading path (BEIR IDs) | 0.7232 | 0.3635 | 0.5433 | -0.47 | Reverted |
+| Fusion | RRF `k=10` | 0.7362 | 0.3662 | 0.5512 | +0.32 | Reverted (< +1.0 pt) |
+| Fusion | Min-max score linear fusion (`alpha_kw=0.5`) | 0.7357 | 0.3640 | 0.5499 | +0.19 | Reverted (< +1.0 pt) |
+| Rerank | Direct cross-encoder replacement (top 30) | 0.7010 | 0.3569 | 0.5289 | -1.91 | Opt-in only (`--rerank`) |
+| Rerank | RRF blend (first-stage hybrid + CE, top 30) | 0.7297 | 0.3641 | 0.5469 | -0.11 | Logged |
+| Prefix | BGE query prefix OFF | 0.7414 | 0.3626 | 0.5520 | +0.40 | Reverted (vector NF -0.53) |
+| FTS5 | `unicode61` without Porter stemmer | 0.7107 | 0.3555 | 0.5331 | -1.49 | Reverted |
+| Model | `BAAI/bge-base-en-v1.5` (768-d, 102.9 chunks/s) | 0.7411 | 0.3745 | 0.5578 | +0.98 | Opt-in config |
+| Model | `sentence-transformers/all-MiniLM-L6-v2` (384-d, 878.8 chunks/s) | 0.7185 | 0.3530 | 0.5357 | -1.23 | Rejected |
+| Model | `intfloat/e5-small-v2` (`query:`/`passage:`, 256.4 chunks/s) | 0.7321 | 0.3510 | 0.5415 | -0.65 | Rejected |
+
+To evaluate your own notes instead, see [`docs/eval.md`](docs/eval.md) for the query JSONL format and guidance on writing roughly 50 file-level queries. A small versioned example corpus lives at `eval/example/`.
 
 ### Retrieval latency
 
@@ -148,25 +188,16 @@ corpus is available at `eval/example/`.
 python bench/latency.py --chunks 20000
 ```
 
-The script builds a temporary synthetic index with real `Store`/`Searcher`
-paths, 20,000 chunks, normalised 384-dimensional vectors, and FTS-friendly
-text. It reports p50/p95 for keyword, vector, and hybrid retrieval, excluding
-embedding-model inference, and reports real query-embedding p50/p95 separately
-when the embedding model is already cached. It writes
-`bench/latency-results.md` only after all retrieval measurements succeed. If
-the model is unavailable, the file says so instead of inventing a number.
+Measured on 20,000 synthetic chunks (500 documents, 384-d float32, 50 queries per mode after warm-up; [`bench/latency-results.md`](bench/latency-results.md)):
 
-### Current status
+| Measurement | p50 | p95 | Notes |
+| --- | ---: | ---: | --- |
+| Keyword retrieval (FTS5 BM25) | 1.41 ms | 1.54 ms | Excludes embedding |
+| Vector retrieval (sqlite-vec float32) | 12.04 ms | 13.05 ms | Excludes embedding |
+| Hybrid retrieval (RRF k=60) | 14.12 ms | 14.53 ms | Excludes embedding |
+| Query embedding (`BAAI/bge-small-en-v1.5`, CUDA) | 10.17 ms | 11.02 ms | Measured separately |
 
-| Measurement | Status |
-| --- | --- |
-| BEIR SciFact retrieval quality | To be measured: run the commands above and commit only the generated, real table. |
-| Synthetic 20k-chunk retrieval latency | To be measured: run `python bench/latency.py --chunks 20000`. |
-| Warm-daemon versus cold-CLI search time | To be measured: compare `time seekr search ...` with `seekr daemon` running and stopped. |
-| Personal-notes evaluation | To be measured on the owner's corpus. |
-
-No row above is a claim about achieved performance. Results are added only when
-a real run has produced them.
+Real end-to-end indexing of BEIR SciFact (5,183 files / 5,820 chunks) with `BAAI/bge-small-en-v1.5` on CUDA took 86.555 s (`59.88 docs/sec`, `67.24 chunks/sec`), producing a 24.17 MiB SQLite index at 1411.4 MiB peak RSS.
 
 ## Design decisions
 

@@ -109,3 +109,138 @@ Measured in a fresh subprocess running `SentenceTransformerEmbedder("BAAI/bge-sm
 | Total throughput (docs/sec) | 56.50 |
 | SQLite DB size | 24.17 MiB |
 | Peak process RSS (`ru_maxrss`) | 1411.4 MiB |
+
+## Phase 1: Retrieval Quality Experiments
+
+All Phase 1 experiments were run as controlled single-variable comparisons on both BEIR SciFact (5,183 docs, 300 queries) and BEIR NFCorpus (3,633 docs, 323 queries) using the real `extract`, `chunk`, `Store`, `Searcher`, `SentenceTransformerEmbedder`, `CrossEncoderReranker`, and `evaluation` modules. A batch-indexed parity check matched Phase 0 `seekr eval` baselines to 4 decimal places on every metric and mode (`hybrid` `ndcg@10`: SciFact `0.7318`, NFCorpus `0.3642`, macro-avg `0.5480`).
+
+Keep rule: retain a change only if it improves macro-average `ndcg@10` by at least `+1.00` point (`+0.0100`) without regressing either dataset by more than `0.50` points (`-0.0050`).
+
+### Exp 1.1: Chunk Size & Overlap Sweep (`BAAI/bge-small-en-v1.5`, hybrid `ndcg@10`)
+
+`chunk_max_words` was set to `max(450, chunk_target_words)`.
+
+| Target / Overlap | SF Chunks | NF Chunks | SciFact ndcg@10 | NFCorpus ndcg@10 | Macro-Avg | ΔAvg (pts) | ΔMin (pts) | Outcome |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 150 / 0 | 10,066 | 7,349 | 0.7240 | 0.3658 | 0.5449 | -0.31 | -0.78 | Reverted |
+| 150 / 50 | 11,292 | 8,631 | 0.7223 | 0.3686 | 0.5455 | -0.25 | -0.94 | Reverted |
+| 150 / 100 | 14,804 | 11,772 | 0.7225 | 0.3669 | 0.5447 | -0.33 | -0.92 | Reverted |
+| 300 / 0 | 5,811 | 4,127 | 0.7349 | 0.3655 | 0.5502 | +0.22 | +0.13 | Not adopted (< +1.00 pt) |
+| **300 / 50 (baseline)** | **5,820** | **4,134** | **0.7318** | **0.3642** | **0.5480** | **0.00** | **0.00** | **Kept** |
+| 300 / 100 | 5,842 | 4,147 | 0.7292 | 0.3647 | 0.5470 | -0.10 | -0.25 | Reverted |
+| 450 / 0 | 5,256 | 3,674 | 0.7274 | 0.3653 | 0.5464 | -0.16 | -0.43 | Reverted |
+| 450 / 50 | 5,257 | 3,674 | 0.7305 | 0.3649 | 0.5477 | -0.03 | -0.12 | Reverted |
+| 450 / 100 | 5,260 | 3,675 | 0.7276 | 0.3650 | 0.5463 | -0.17 | -0.42 | Reverted |
+
+### Exp 1.2: Contextual Chunk Headers (`BAAI/bge-small-en-v1.5`, hybrid `ndcg@10`)
+
+Prepended `{filename}` (or `{stem}`) plus heading locator when present (`§A > B`) to the chunk text embedded and FTS-indexed. Also verified on `eval/example/` (8 Markdown files with headings), where all 3 variants scored `1.0000` across `keyword`, `vector`, and `hybrid`.
+
+| Variant | SciFact ndcg@10 | NFCorpus ndcg@10 | Macro-Avg | ΔAvg (pts) | ΔMin (pts) | Outcome |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| **none (baseline)** | **0.7318** | **0.3642** | **0.5480** | **0.00** | **0.00** | **Kept** |
+| filename + heading | 0.7232 | 0.3635 | 0.5433 | -0.47 | -0.86 | Reverted |
+| stem + heading | 0.7281 | 0.3630 | 0.5456 | -0.24 | -0.36 | Reverted |
+
+Why it regressed on BEIR: BEIR corpus documents use opaque numeric/ID filenames (`10004123.txt`, `MED-1234.txt`) with no Markdown headings; prepending opaque IDs adds token noise and would also break path-independent chunk `text_sha` reuse across file renames.
+
+### Exp 1.3: Fusion, Candidate Depth & Rerank Depth
+
+#### RRF Constant `k` (limit=50, equal weights)
+
+| Variant | SciFact ndcg@10 | NFCorpus ndcg@10 | Macro-Avg | ΔAvg (pts) | ΔMin (pts) | Outcome |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| k=10 | 0.7362 | 0.3662 | 0.5512 | +0.32 | +0.19 | Not adopted (< +1.00 pt) |
+| k=20 | 0.7338 | 0.3643 | 0.5491 | +0.11 | +0.01 | Reverted |
+| k=40 | 0.7307 | 0.3647 | 0.5477 | -0.03 | -0.10 | Reverted |
+| **k=60 (baseline)** | **0.7318** | **0.3642** | **0.5480** | **0.00** | **0.00** | **Kept** |
+| k=80 | 0.7313 | 0.3642 | 0.5477 | -0.02 | -0.05 | Reverted |
+| k=100 | 0.7313 | 0.3641 | 0.5477 | -0.03 | -0.05 | Reverted |
+
+#### Weighted RRF (limit=50)
+
+| Variant | SciFact ndcg@10 | NFCorpus ndcg@10 | Macro-Avg | ΔAvg (pts) | ΔMin (pts) | Outcome |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| k=60, w_kw=0.2, w_vec=0.8 | 0.7318 | 0.3593 | 0.5456 | -0.24 | -0.50 | Reverted |
+| k=60, w_kw=0.3, w_vec=0.7 | 0.7305 | 0.3608 | 0.5456 | -0.24 | -0.35 | Reverted |
+| k=60, w_kw=0.4, w_vec=0.6 | 0.7288 | 0.3602 | 0.5445 | -0.35 | -0.40 | Reverted |
+| **k=60, w_kw=0.5, w_vec=0.5** | **0.7318** | **0.3642** | **0.5480** | **0.00** | **0.00** | **Kept** |
+| k=60, w_kw=0.6, w_vec=0.4 | 0.7241 | 0.3635 | 0.5438 | -0.42 | -0.76 | Reverted |
+| k=60, w_kw=0.7, w_vec=0.3 | 0.7223 | 0.3625 | 0.5424 | -0.56 | -0.95 | Reverted |
+| k=20, w_kw=0.2, w_vec=0.8 | 0.7302 | 0.3577 | 0.5440 | -0.40 | -0.65 | Reverted |
+| k=20, w_kw=0.3, w_vec=0.7 | 0.7323 | 0.3645 | 0.5484 | +0.04 | +0.02 | Reverted |
+| k=20, w_kw=0.4, w_vec=0.6 | 0.7335 | 0.3647 | 0.5491 | +0.11 | +0.05 | Reverted |
+| k=20, w_kw=0.5, w_vec=0.5 | 0.7338 | 0.3643 | 0.5491 | +0.11 | +0.01 | Reverted |
+| k=20, w_kw=0.6, w_vec=0.4 | 0.7266 | 0.3630 | 0.5448 | -0.32 | -0.51 | Reverted |
+| k=20, w_kw=0.7, w_vec=0.3 | 0.7187 | 0.3564 | 0.5376 | -1.04 | -1.31 | Reverted |
+
+#### Score-Normalized Linear Fusion (per-query min-max `-bm25` and cosine similarity `1 - 0.5*d^2`, limit=50)
+
+| Variant | SciFact ndcg@10 | NFCorpus ndcg@10 | Macro-Avg | ΔAvg (pts) | ΔMin (pts) | Outcome |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| alpha_kw=0.2 | 0.7298 | 0.3536 | 0.5417 | -0.63 | -1.07 | Reverted |
+| alpha_kw=0.3 | 0.7306 | 0.3596 | 0.5451 | -0.29 | -0.46 | Reverted |
+| alpha_kw=0.4 | 0.7356 | 0.3629 | 0.5492 | +0.12 | -0.14 | Reverted |
+| alpha_kw=0.5 | 0.7357 | 0.3640 | 0.5499 | +0.19 | -0.02 | Reverted |
+| alpha_kw=0.6 | 0.7284 | 0.3592 | 0.5438 | -0.42 | -0.50 | Reverted |
+| alpha_kw=0.7 | 0.7200 | 0.3529 | 0.5365 | -1.15 | -1.17 | Reverted |
+
+#### Candidate Depth Per Retriever (`limit`, RRF k=60)
+
+| Limit | SciFact ndcg@10 | NFCorpus ndcg@10 | Macro-Avg | ΔAvg (pts) | ΔMin (pts) | Outcome |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 20 | 0.7326 | 0.3632 | 0.5479 | -0.01 | -0.11 | Reverted |
+| **50 (baseline)** | **0.7318** | **0.3642** | **0.5480** | **0.00** | **0.00** | **Kept** |
+| 100 | 0.7305 | 0.3651 | 0.5478 | -0.02 | -0.13 | Reverted |
+| 150 | 0.7316 | 0.3653 | 0.5484 | +0.04 | -0.02 | Reverted |
+| 200 | 0.7316 | 0.3658 | 0.5487 | +0.07 | -0.02 | Reverted |
+
+#### Rerank Depth (`20/30/50`) and Rerank Fusion (`cross-encoder/ms-marco-MiniLM-L-6-v2` vs `hybrid` baseline)
+
+| Variant | SciFact ndcg@10 | NFCorpus ndcg@10 | Macro-Avg | ΔAvg vs hybrid (pts) | SF p50 (ms) | NF p50 (ms) | Outcome |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| replace, depth=20 | 0.7046 | 0.3615 | 0.5331 | -1.49 | 64.75 | 61.94 | Reverted |
+| **replace, depth=30 (baseline)** | **0.7010** | **0.3569** | **0.5289** | **-1.91** | **91.82** | **88.90** | **Kept (opt-in `--rerank`)** |
+| replace, depth=50 | 0.7008 | 0.3516 | 0.5262 | -2.18 | 125.72 | 123.51 | Reverted |
+| rrf(hybrid, ce), depth=20 | 0.7297 | 0.3629 | 0.5463 | -0.17 | 65.27 | 62.36 | Logged (recovers +1.74 pts vs replace@30) |
+| rrf(hybrid, ce), depth=30 | 0.7297 | 0.3641 | 0.5469 | -0.11 | 92.78 | 89.64 | Logged (recovers +1.80 pts vs replace@30) |
+| rrf(hybrid, ce), depth=50 | 0.7286 | 0.3610 | 0.5448 | -0.32 | 125.48 | 123.33 | Logged |
+
+### Exp 1.4: Query Prefix, FTS5 Tokenizer & BM25 Column Weighting
+
+#### BGE Query Prefix (`BAAI/bge-small-en-v1.5`)
+
+| Variant | SF vec | NF vec | SF hyb | NF hyb | Macro-Avg hyb | ΔAvg hyb (pts) | ΔMin hyb (pts) | Outcome |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| **prefix_on (baseline)** | **0.7159** | **0.3427** | **0.7318** | **0.3642** | **0.5480** | **0.00** | **0.00** | **Kept** |
+| prefix_off | 0.7205 | 0.3374 | 0.7414 | 0.3626 | 0.5520 | +0.40 | -0.17 | Reverted (< +1.00 pt; vector NF -0.53) |
+
+#### FTS5 Tokenizer
+
+| Tokenizer | SF kw | NF kw | SF hyb | NF hyb | Macro-Avg hyb | ΔAvg hyb (pts) | Outcome |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| **porter unicode61 (baseline)** | **0.6866** | **0.3214** | **0.7318** | **0.3642** | **0.5480** | **0.00** | **Kept** |
+| unicode61 (no stemming) | 0.6639 | 0.3052 | 0.7107 | 0.3555 | 0.5331 | -1.49 | Reverted (proves Porter stemming helps) |
+| porter unicode61 remove_diacritics 2 | 0.6866 | 0.3214 | 0.7318 | 0.3642 | 0.5480 | 0.00 | Not adopted (identical) |
+| porter unicode61 tokenchars '_' | 0.6866 | 0.3214 | 0.7318 | 0.3642 | 0.5480 | 0.00 | Not adopted (identical) |
+
+#### BM25 2-Column Weighting (`header` = title/first paragraph, `body` = remainder)
+
+| Weights `(header, body)` | SF kw | NF kw | SF hyb | NF hyb | Macro-Avg hyb | ΔAvg hyb (pts) | Outcome |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| **1.0, 1.0 (baseline)** | **0.6866** | **0.3214** | **0.7318** | **0.3642** | **0.5480** | **0.00** | **Kept** |
+| 2.0, 1.0 | 0.6832 | 0.3169 | 0.7340 | 0.3643 | 0.5492 | +0.12 | Reverted (< +1.00 pt) |
+| 3.0, 1.0 | 0.6726 | 0.3081 | 0.7318 | 0.3622 | 0.5470 | -0.10 | Reverted |
+| 5.0, 1.0 | 0.6607 | 0.2976 | 0.7260 | 0.3596 | 0.5428 | -0.52 | Reverted |
+
+### Exp 1.5: Embedding Model Comparison (Isolated Subprocesses, `trust_remote_code=False`)
+
+| Model | Dim | SF vec | NF vec | SF hyb | NF hyb | Macro-Avg hyb | ΔAvg hyb (pts) | SF emb (chunks/s) | Query p50/p95 (ms) | SF DB (MiB) | Peak RSS (MiB) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **BAAI/bge-small-en-v1.5 (baseline)** | **384** | **0.7159** | **0.3427** | **0.7318** | **0.3642** | **0.5480** | **0.00** | **258.5** | **10.95 / 20.74** | **24.23** | **1562.6** |
+| BAAI/bge-base-en-v1.5 | 768 | 0.7439 | 0.3740 | 0.7411 | 0.3745 | 0.5578 | +0.98 | 102.9 | 17.84 / 20.05 | 33.27 | 1585.9 |
+| sentence-transformers/all-MiniLM-L6-v2 | 384 | 0.6518 | 0.3168 | 0.7185 | 0.3530 | 0.5357 | -1.23 | 878.8 | 13.66 / 14.52 | 24.23 | 1562.2 |
+| intfloat/e5-small-v2 (`query:`/`passage:`) | 384 | 0.6837 | 0.3243 | 0.7321 | 0.3510 | 0.5415 | -0.65 | 256.4 | 19.79 / 26.47 | 24.23 | 1568.3 |
+| intfloat/e5-small-v2 (no prefix) | 384 | 0.6823 | 0.3183 | 0.7362 | 0.3487 | 0.5425 | -0.55 | 258.1 | 10.57 / 11.11 | 24.23 | 1564.1 |
+
+Decision: keep `BAAI/bge-small-en-v1.5` as the default embedding model (`bge-base-en-v1.5` gained `+0.98` pts hybrid and `+2.97` pts vector-only, just below the `+1.00` pt threshold, while cutting indexing throughput by 2.5x and increasing DB size by 37%; users wanting higher semantic recall can select `BAAI/bge-base-en-v1.5` via `embed_model` in `config.toml`).
