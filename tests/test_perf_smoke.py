@@ -60,10 +60,16 @@ def _vector_backend_reason() -> str | None:
         try:
             import sqlite_vec
 
+            conn.enable_load_extension(True)
             sqlite_vec.load(conn)
             conn.execute("SELECT vec_version()").fetchone()
         except (ImportError, OSError, RuntimeError, sqlite3.Error) as exc:
             return f"real vector backend unavailable: sqlite-vec cannot load: {exc}"
+        finally:
+            try:
+                conn.enable_load_extension(False)
+            except (AttributeError, sqlite3.Error):
+                pass
     finally:
         conn.close()
     return None

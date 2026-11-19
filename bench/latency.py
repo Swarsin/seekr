@@ -149,6 +149,7 @@ def _require_runtime() -> tuple[Any, Any, Any]:
                 "includes FTS5 (run `seekr doctor`)"
             )
         try:
+            conn.enable_load_extension(True)
             sqlite_vec.load(conn)
             conn.execute("SELECT vec_version()").fetchone()
         except (ImportError, OSError, RuntimeError, sqlite3.Error) as exc:
@@ -156,6 +157,11 @@ def _require_runtime() -> tuple[Any, Any, Any]:
                 f"sqlite-vec is installed but could not be loaded: {exc}; "
                 "run `seekr doctor` for diagnostics"
             ) from exc
+        finally:
+            try:
+                conn.enable_load_extension(False)
+            except (AttributeError, sqlite3.Error):
+                pass
     finally:
         conn.close()
 
@@ -351,11 +357,16 @@ def _vector_backend_version() -> str:
     try:
         import sqlite_vec
 
+        conn.enable_load_extension(True)
         sqlite_vec.load(conn)
         row = conn.execute("SELECT vec_version()").fetchone()
     except (ImportError, OSError, RuntimeError, sqlite3.Error) as exc:
         return f"unknown ({exc})"
     finally:
+        try:
+            conn.enable_load_extension(False)
+        except (AttributeError, sqlite3.Error):
+            pass
         conn.close()
     return str(row[0]) if row and row[0] is not None else "unknown"
 
