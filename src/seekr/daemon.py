@@ -167,10 +167,13 @@ def _search_arguments(request: Mapping[str, Any]) -> dict[str, Any]:
     rerank = request.get("rerank", False)
     if not isinstance(rerank, bool):
         raise TypeError("rerank must be a boolean")
+    explain = request.get("explain", False)
+    if not isinstance(explain, bool):
+        raise TypeError("explain must be a boolean")
     path_prefix = request.get("path_prefix")
     if path_prefix is not None and not isinstance(path_prefix, str):
         raise TypeError("path_prefix must be a string or null")
-    return {
+    arguments: dict[str, Any] = {
         "query": query,
         "k": _positive_int(request.get("k", 10), "k"),
         "mode": mode,
@@ -178,6 +181,9 @@ def _search_arguments(request: Mapping[str, Any]) -> dict[str, Any]:
         "rerank": rerank,
         "path_prefix": path_prefix,
     }
+    if explain:
+        arguments["explain"] = True
+    return arguments
 
 
 def _ensure_reranker(
@@ -210,9 +216,15 @@ def _ensure_reranker(
 
 def _hit_to_dict(hit: object) -> dict[str, Any]:
     if isinstance(hit, Hit) or dataclasses.is_dataclass(hit):
-        return dataclasses.asdict(hit)  # type: ignore[arg-type]
+        data = dataclasses.asdict(hit)  # type: ignore[arg-type]
+        if data.get("explain") is None:
+            data.pop("explain", None)
+        return data
     if isinstance(hit, Mapping):
-        return dict(hit)
+        data = dict(hit)
+        if data.get("explain") is None:
+            data.pop("explain", None)
+        return data
     raise TypeError(f"search returned an unsupported hit type {type(hit).__name__}")
 
 

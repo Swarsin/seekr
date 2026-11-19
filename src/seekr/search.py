@@ -16,7 +16,7 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Literal
 
 from .logging_config import log_event
-from .models import Hit
+from .models import Hit, HitExplain
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -175,8 +175,13 @@ def _ranked_candidates(
     query_vector: np.ndarray | None,
     limit: int,
     path_prefix: str | None,
-) -> list[tuple[int, float]]:
-    """Return the ordered candidates from the retrievers named by ``mode``.
+) -> tuple[
+    list[tuple[int, float]],
+    dict[int, tuple[int, float]],
+    dict[int, tuple[int, float]],
+    dict[int, float],
+]:
+    """Return candidates plus per-retriever rank/score metadata.
 
     Non-null ``path_prefix`` is forwarded to both store retrievers, which apply
     exact component-aware filtering before their limit.  The Searcher therefore
@@ -194,14 +199,38 @@ def _ranked_candidates(
         assert query_vector is not None
         vector_pairs = _vector_search(store, query_vector, limit, path_prefix)
 
+    keyword_info: dict[int, tuple[int, float]] = {}
+    for rank, (raw_id, raw_score) in enumerate(keyword_pairs, start=1):
+        chunk_id = int(raw_id)
+        if chunk_id not in keyword_info:
+            keyword_info[chunk_id] = (rank, float(raw_score))
+
+    vector_info: dict[int, tuple[int, float]] = {}
+    for rank, (raw_id, raw_score) in enumerate(vector_pairs, start=1):
+        chunk_id = int(raw_id)
+        if chunk_id not in vector_info:
+            vector_info[chunk_id] = (rank, float(raw_score))
+
     if mode == "keyword":
-        return [(int(chunk_id), float(score)) for chunk_id, score in keyword_pairs]
+        return (
+            [(int(chunk_id), float(score)) for chunk_id, score in keyword_pairs],
+            keyword_info,
+            vector_info,
+            {},
+        )
     if mode == "vector":
-        return [(int(chunk_id), float(score)) for chunk_id, score in vector_pairs]
+        return (
+            [(int(chunk_id), float(score)) for chunk_id, score in vector_pairs],
+            keyword_info,
+            vector_info,
+            {},
+        )
 
     keyword_rank = [int(chunk_id) for chunk_id, _ in keyword_pairs]
     vector_rank = [int(chunk_id) for chunk_id, _ in vector_pairs]
-    return rrf([keyword_rank, vector_rank])
+    fused = rrf([keyword_rank, vector_rank])
+    rrf_scores = {chunk_id: float(score) for chunk_id, score in fused}
+    return fused, keyword_info, vector_info, rrf_scores
 
 
 def _cap_per_file(
@@ -231,14 +260,14 @@ def _rerank_candidates(
     query: str,
     candidates: list[tuple[int, float]],
     chunks: dict[int, ChunkRow],
-) -> list[tuple[int, float]]:
+) -> tuple[list[tuple[int, float]], dict[int, tuple[int, float]]]:
     selected = [
         (chunk_id, score)
         for chunk_id, score in candidates[:_RERANK_CANDIDATES]
         if chunk_id in chunks
     ]
     if not selected:
-        return []
+        return [], {}
 
     passages = [chunks[chunk_id].text for chunk_id, _ in selected]
     raw_scores = list(reranker.score(query, passages))
@@ -252,7 +281,12 @@ def _rerank_candidates(
         for rank, ((chunk_id, _), score) in enumerate(zip(selected, raw_scores))
     ]
     ranked.sort(key=lambda item: (-item[1], item[2]))
-    return [(chunk_id, score) for chunk_id, score, _ in ranked]
+    candidates_out = [(chunk_id, score) for chunk_id, score, _ in ranked]
+    rerank_info = {
+        chunk_id: (final_rank, score)
+        for final_rank, (chunk_id, score, _) in enumerate(ranked, start=1)
+    }
+    return candidates_out, rerank_info
 
 
 def _build_hits(
@@ -261,10 +295,30 @@ def _build_hits(
     query: str,
     per_file: int,
     k: int,
+    *,
+    explain: bool = False,
+    keyword_info: dict[int, tuple[int, float]] | None = None,
+    vector_info: dict[int, tuple[int, float]] | None = None,
+    rrf_scores: dict[int, float] | None = None,
+    rerank_info: dict[int, tuple[int, float]] | None = None,
 ) -> list[Hit]:
     hits: list[Hit] = []
     for chunk_id, score in _cap_per_file(candidates, chunks, per_file, k):
         chunk = chunks[chunk_id]
+        hit_explain: HitExplain | None = None
+        if explain:
+            kw = keyword_info.get(chunk_id) if keyword_info is not None else None
+            vec = vector_info.get(chunk_id) if vector_info is not None else None
+            rr = rerank_info.get(chunk_id) if rerank_info is not None else None
+            hit_explain = HitExplain(
+                keyword_rank=kw[0] if kw is not None else None,
+                keyword_bm25=kw[1] if kw is not None else None,
+                vector_rank=vec[0] if vec is not None else None,
+                vector_distance=vec[1] if vec is not None else None,
+                rrf_score=rrf_scores.get(chunk_id) if rrf_scores is not None else None,
+                rerank_rank=rr[0] if rr is not None else None,
+                rerank_score=rr[1] if rr is not None else None,
+            )
         hits.append(
             Hit(
                 chunk_id=chunk.id,
@@ -274,6 +328,7 @@ def _build_hits(
                 snippet=_best_snippet(chunk.text, query),
                 score=float(score),
                 kind=chunk.kind,
+                explain=hit_explain,
             )
         )
     return hits
@@ -300,6 +355,8 @@ class Searcher:
         per_file: int = 2,
         rerank: bool = False,
         path_prefix: str | None = None,
+        *,
+        explain: bool = False,
     ) -> list[Hit]:
         """Return up to ``k`` hits, capped per file and optionally path-scoped."""
         return self.get_hits(
@@ -309,6 +366,7 @@ class Searcher:
             per_file=per_file,
             rerank=rerank,
             path_prefix=path_prefix,
+            explain=explain,
         )
 
     def get_hits(
@@ -319,6 +377,8 @@ class Searcher:
         per_file: int = 2,
         rerank: bool = False,
         path_prefix: str | None = None,
+        *,
+        explain: bool = False,
     ) -> list[Hit]:
         """Pure retrieval entry point shared by the CLI and future ``pick``."""
         if mode not in SEARCH_MODES:
@@ -395,7 +455,7 @@ class Searcher:
         limit = max(_MIN_CANDIDATES, _CANDIDATES_PER_K * k)
 
         with _snapshot(self.store):
-            candidates = _ranked_candidates(
+            candidates, keyword_info, vector_info, rrf_scores = _ranked_candidates(
                 self.store, mode, match_query, query_vector, limit, prefix
             )
             chunks = self.store.fetch_chunks(
@@ -408,11 +468,25 @@ class Searcher:
             if chunk_id in chunks
         ]
 
+        rerank_info: dict[int, tuple[int, float]] | None = None
         if rerank:
             assert self.reranker is not None
-            selected = _rerank_candidates(self.reranker, query, selected, chunks)
+            selected, rerank_info = _rerank_candidates(
+                self.reranker, query, selected, chunks
+            )
 
-        hits = _build_hits(selected, chunks, query, per_file, k)
+        hits = _build_hits(
+            selected,
+            chunks,
+            query,
+            per_file,
+            k,
+            explain=explain,
+            keyword_info=keyword_info,
+            vector_info=vector_info,
+            rrf_scores=rrf_scores,
+            rerank_info=rerank_info,
+        )
         log_event(
             _LOGGER,
             logging.DEBUG,

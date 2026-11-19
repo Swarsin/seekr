@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .daemon import MAX_RESPONSE_BYTES, socket_path
-from .models import Hit
+from .models import Hit, HitExplain
 
 __all__ = ["DaemonError", "DaemonMismatchError", "try_daemon_search"]
 
@@ -120,6 +120,43 @@ def _expected_payload(expected: Mapping[str, Any] | None) -> dict[str, Any] | No
     return normalized
 
 
+def _optional_int(value: object, name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DaemonError(f"daemon hit explain field {name!r} must be an integer or null")
+    return value
+
+
+def _optional_float(value: object, name: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise DaemonError(f"daemon hit explain field {name!r} must be a number or null")
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise DaemonError(
+            f"daemon hit explain field {name!r} must be a number or null"
+        ) from exc
+
+
+def _explain_from_dict(payload: object) -> HitExplain | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, Mapping):
+        raise DaemonError("daemon hit explain must be a JSON object")
+    return HitExplain(
+        keyword_rank=_optional_int(payload.get("keyword_rank"), "keyword_rank"),
+        keyword_bm25=_optional_float(payload.get("keyword_bm25"), "keyword_bm25"),
+        vector_rank=_optional_int(payload.get("vector_rank"), "vector_rank"),
+        vector_distance=_optional_float(payload.get("vector_distance"), "vector_distance"),
+        rrf_score=_optional_float(payload.get("rrf_score"), "rrf_score"),
+        rerank_rank=_optional_int(payload.get("rerank_rank"), "rerank_rank"),
+        rerank_score=_optional_float(payload.get("rerank_score"), "rerank_score"),
+    )
+
+
 def _hit_from_dict(payload: object) -> Hit:
     if not isinstance(payload, Mapping):
         raise DaemonError("daemon returned a hit that is not a JSON object")
@@ -150,6 +187,7 @@ def _hit_from_dict(payload: object) -> Hit:
         score_value = float(score)
     except (TypeError, ValueError) as exc:
         raise DaemonError("daemon hit has invalid numeric fields") from exc
+    explain = _explain_from_dict(payload.get("explain"))
     return Hit(
         chunk_id=chunk_id,
         path=path,
@@ -158,6 +196,7 @@ def _hit_from_dict(payload: object) -> Hit:
         snippet=snippet,
         score=score_value,
         kind=kind,
+        explain=explain,
     )
 
 

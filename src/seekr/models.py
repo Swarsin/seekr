@@ -25,6 +25,19 @@ class ChunkSpec:
 
 
 @dataclass(frozen=True)
+class HitExplain:
+    """Per-retriever rank and score breakdown for an explained hit."""
+
+    keyword_rank: int | None = None
+    keyword_bm25: float | None = None
+    vector_rank: int | None = None
+    vector_distance: float | None = None
+    rrf_score: float | None = None
+    rerank_rank: int | None = None
+    rerank_score: float | None = None
+
+
+@dataclass(frozen=True)
 class Hit:
     """One search result pointing back to a location in a file."""
 
@@ -35,6 +48,7 @@ class Hit:
     snippet: str
     score: float
     kind: str
+    explain: HitExplain | None = None
 
 
 def text_sha(text: str) -> str:

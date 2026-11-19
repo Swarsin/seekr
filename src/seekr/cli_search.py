@@ -9,6 +9,8 @@ daemon fast path lives inside ``get_hits`` without touching
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import logging
 import sqlite3
 from pathlib import Path
@@ -19,7 +21,7 @@ from .config import Config, load_config
 from .embed import build_embedder
 from .lifecycle import LifecycleError, lifecycle_lock
 from .logging_config import log_event
-from .models import Hit
+from .models import Hit, HitExplain
 from .search import SEARCH_MODES, Searcher, SearchMode
 from .store import (
     VECTOR_QUANTS,
@@ -229,6 +231,8 @@ def _daemon_search(
     per_file: int,
     rerank: bool,
     path_prefix: str | None,
+    *,
+    explain: bool = False,
 ) -> list[Hit] | None:
     """Try the warm daemon without opening a Store or loading any model.
 
@@ -245,7 +249,7 @@ def _daemon_search(
     }
     if rerank:
         expected["rerank_model"] = cfg.rerank_model
-    params = {
+    params: dict[str, Any] = {
         "op": "search",
         "query": query,
         "k": k,
@@ -254,6 +258,8 @@ def _daemon_search(
         "rerank": rerank,
         "path_prefix": path_prefix,
     }
+    if explain:
+        params["explain"] = True
     try:
         hits = try_daemon_search(params, expected=expected)
     except DaemonMismatchError:
@@ -285,6 +291,7 @@ def get_hits(
     rerank: bool = False,
     path_prefix: str | None = None,
     *,
+    explain: bool = False,
     cfg: Config | None = None,
     searcher: Searcher | None = None,
 ) -> list[Hit]:
@@ -309,6 +316,7 @@ def get_hits(
         # `seekr search ""` prints "No results." even on a model-less host.
         return []
 
+    searcher_kwargs: dict[str, Any] = {"explain": True} if explain else {}
     if searcher is not None:
         return searcher.get_hits(
             query,
@@ -317,6 +325,7 @@ def get_hits(
             per_file=per_file,
             rerank=rerank,
             path_prefix=path_prefix,
+            **searcher_kwargs,
         )
 
     selected_cfg = cfg if cfg is not None else load_config()
@@ -328,6 +337,7 @@ def get_hits(
         per_file,
         rerank,
         path_prefix,
+        explain=explain,
     )
     if daemon_hits is not None:
         return daemon_hits
@@ -353,9 +363,33 @@ def get_hits(
                 per_file=per_file,
                 rerank=rerank,
                 path_prefix=path_prefix,
+                **searcher_kwargs,
             )
         finally:
             selected.store.close()
+
+
+def _hit_to_json_dict(hit: Hit) -> dict[str, Any]:
+    data = dataclasses.asdict(hit)
+    if data.get("explain") is None:
+        data.pop("explain", None)
+    return data
+
+
+def _format_explain_line(info: HitExplain) -> str:
+    parts: list[str] = []
+    if info.keyword_rank is not None:
+        bm25 = f" (bm25={info.keyword_bm25:.4f})" if info.keyword_bm25 is not None else ""
+        parts.append(f"keyword=#{info.keyword_rank}{bm25}")
+    if info.vector_rank is not None:
+        dist = f" (dist={info.vector_distance:.4f})" if info.vector_distance is not None else ""
+        parts.append(f"vector=#{info.vector_rank}{dist}")
+    if info.rrf_score is not None:
+        parts.append(f"rrf={info.rrf_score:.4f}")
+    if info.rerank_rank is not None:
+        rscore = f" (score={info.rerank_score:.4f})" if info.rerank_score is not None else ""
+        parts.append(f"rerank=#{info.rerank_rank}{rscore}")
+    return "  explain: " + ("  ".join(parts) if parts else "none")
 
 
 def _exit_error(message: str) -> NoReturn:
@@ -385,8 +419,17 @@ def _build_search_command(typer_module: Any) -> Any:
         path_prefix: str | None = typer_module.Option(
             None, "--path", help="Only search under this path prefix."
         ),
+        as_json: bool = typer_module.Option(
+            False, "--json", help="Emit results as JSON."
+        ),
+        explain: bool = typer_module.Option(
+            False, "--explain", help="Include retriever rank and score attribution."
+        ),
     ) -> None:
         """Search the locally indexed files."""
+        extra: dict[str, Any] = {}
+        if explain:
+            extra["explain"] = True
         try:
             hits = get_hits(
                 query,
@@ -395,6 +438,7 @@ def _build_search_command(typer_module: Any) -> Any:
                 per_file=per_file,
                 rerank=rerank,
                 path_prefix=path_prefix,
+                **extra,
             )
         except (
             SearchError,
@@ -410,12 +454,19 @@ def _build_search_command(typer_module: Any) -> Any:
         except (OSError, sqlite3.Error) as exc:
             _exit_error(f"cannot read the index: {exc}; run `seekr doctor` or `seekr reindex`")
 
+        if as_json:
+            payload = [_hit_to_json_dict(hit) for hit in hits]
+            typer_module.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+            return
+
         if not hits:
             typer_module.echo("No results.")
             return
 
         for hit in hits:
             typer_module.echo(f"{hit.path}  ({hit.locator})  {hit.score:.4f}")
+            if explain and hit.explain is not None:
+                typer_module.echo(_format_explain_line(hit.explain))
             typer_module.echo(hit.snippet)
             typer_module.echo()
 
