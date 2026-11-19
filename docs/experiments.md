@@ -244,3 +244,84 @@ Why it regressed on BEIR: BEIR corpus documents use opaque numeric/ID filenames 
 | intfloat/e5-small-v2 (no prefix) | 384 | 0.6823 | 0.3183 | 0.7362 | 0.3487 | 0.5425 | -0.55 | 258.1 | 10.57 / 11.11 | 24.23 | 1564.1 |
 
 Decision: keep `BAAI/bge-small-en-v1.5` as the default embedding model (`bge-base-en-v1.5` gained `+0.98` pts hybrid and `+2.97` pts vector-only, just below the `+1.00` pt threshold, while cutting indexing throughput by 2.5x and increasing DB size by 37%; users wanting higher semantic recall can select `BAAI/bge-base-en-v1.5` via `embed_model` in `config.toml`).
+
+## Phase 2: Performance Profiling, Hotspot Fixes, `int8` Quantization & 100k Scale Test
+
+### Profiling Baseline (Pre-Optimization)
+
+1. **Fresh BEIR SciFact indexing (`91.91 s` instrumented total, `86.555 s` uninstrumented `Indexer.sync`)**:
+   - **`embed_documents`**: `85.14 s` (**92.6%**) across `5,183` single-file calls (1 file / ~1.12 chunks per GPU encode call, amortising PyTorch kernel launch + tokenization overhead per file).
+   - `store_replace_chunks`: `1.86 s` across `5,183` separate SQLite write transactions.
+   - `sha256_file`: `0.25 s`, `chunk`: `0.22 s`, `store_upsert_document`: `0.19 s`, `walk_root`: `0.19 s`, `extract`: `0.17 s`, `store_get_document`: `0.085 s`, `store_find_vec_by_sha`: `0.061 s`.
+2. **Unchanged SciFact re-sync (`2.269 s` for `5,183` files)**: `walk_root` `0.034 s`, `store_get_document` `0.073 s`, ~`2.16 s` in per-file `Path.resolve()`, `_is_ignored()` (`PurePosixPath.match` + `fnmatch`), and duplicate `stat()`.
+3. **20k-chunk `Searcher.get_hits` hybrid breakdown (`14.74 ms` p50 / `16.02 ms` p95)**:
+   - `vector_search`: `14.19 ms` p50 / `14.96 ms` p95 (**96%**)
+   - `keyword_search`: `0.77 ms` p50 / `0.94 ms` p95
+   - `fetch_chunks`: `0.55 ms` p50, `build_hits`: `0.42 ms` p50, `rrf`: `0.078 ms` p50, `stats_check` (`2x COUNT(*)`): `0.029 ms` p50.
+4. **Cold `seekr daemon` startup (`7.282 s` to `ping` ready on existing SciFact DB)**: forced synchronous `embedder.dim` (~5 s model load) + `2.27 s` unchanged `indexer.sync` BEFORE binding the Unix socket.
+
+### Optimization Results (Before vs. After Phase 2 Commits `db03cb9`, `290d0df`, `da667dc`)
+
+Changes implemented:
+- Cross-file sync batching (`64` files / `128` chunks per batch): one `find_vectors_by_text_shas` lookup, one `embed_documents` call, and one `store.transaction(write=True)` commit (with per-file fallback preserving isolation on errors).
+- Per-root metadata prefetch (`Store.get_documents_metadata`), `os.lstat` canonical fast path on non-symlink regular files, and precompiled `ignore_globs` exact-part `frozenset`.
+- WAL performance pragmas (`synchronous=NORMAL`, `temp_store=MEMORY`, `cache_size=-32000`), direct `np.ascontiguousarray(..., dtype="<f4").tobytes()` vector serialization, skipping empty chunk deletes on new docs, `Store.has_chunks()` (`SELECT EXISTS(...)`), single-connection `cli_search._inspect_db`, and deferred background embedder prewarm in `cli_daemon`.
+- Default `vector_quant = "int8"` in `Config` (`sqlite-vec` `int8[dim]` with dimension-aware scaling `min(500, max(127, 25 * sqrt(dim)))`; `Store(...)` direct constructor keeps `"float32"` default for backwards compatibility and legacy DBs default to `"float32"`).
+
+| Benchmark / Metric | Phase 0 / Baseline (`float32`) | Phase 2 (`int8`, batched) | Speedup / Delta |
+| --- | ---: | ---: | ---: |
+| SciFact fresh `Indexer.sync` (5,183 docs / 5,820 chunks) | 86.555 s (59.88 docs/s, 67.24 chunks/s) | 26.432 s (196.08 docs/s, 220.18 chunks/s) | **3.27x faster** |
+| SciFact end-to-end DB size | 24.17 MiB | 17.41 MiB | **-28.0%** |
+| SciFact unchanged re-sync (5,183 files) | 2.269 s | 0.122 s | **18.6x faster** |
+| Cold `seekr daemon` time to `ping` ready (SciFact DB) | 7.282 s | 0.349 s | **20.9x faster** |
+| SciFact `seekr eval` wall time (all 4 modes) | 156.97 s | 91.38 s | **1.72x faster** |
+| NFCorpus `seekr eval` wall time (all 4 modes) | 119.89 s | 76.59 s | **1.57x faster** |
+| 20k synthetic DB size (`float32` vs `int8`) | 44.88 MiB | 22.35 MiB | **2.01x smaller** |
+| 20k synthetic `vector` latency p50 / p95 | 14.17 / 15.72 ms (`float32` post-opt) | 8.48 / 8.98 ms | **1.67x / 1.75x faster** |
+| 20k synthetic `hybrid` latency p50 / p95 | 16.27 / 16.81 ms (`float32` post-opt) | 10.96 / 11.39 ms | **1.48x / 1.48x faster** |
+
+> **Test note (`tests/test_indexer.py:308`):** `SyncTests.test_sync_adds_files` previously asserted `len(self.embedder.calls) == 3` when syncing 3 single-chunk files, which explicitly enforced the unbatched 1-file-per-call bottleneck. It was updated to assert `sum(len(call) for call in self.embedder.calls) == 3` and `len(self.embedder.calls) == 1`, alongside new batch deduplication and partial-failure isolation tests.
+
+### Vector Quantization Trade-Off Study (`sqlite-vec v0.1.9`, 384-d `bge-small-en-v1.5`)
+
+Standalone quantization sweep (fixed corpus/query vectors across variants; adopt only if quality loss < 1.00 `ndcg@10` point):
+
+| Variant | SF vec | NF vec | SF hyb | NF hyb | Macro-Avg hyb | ΔAvg hyb (pts) | 20k vec p50/p95 (ms) | Outcome |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `float32` L2 | 0.7159 | 0.3427 | 0.7318 | 0.3642 | 0.5480 | 0.00 | 13.78 / 15.51 | Legacy / opt-in |
+| **`int8` L2 (scale 500 -> adopted `min(500, 25*sqrt(dim))`)** | **0.7148** | **0.3424** | **0.7312** | **0.3636** | **0.5474** | **-0.06** | **8.67 / 8.88** | **Adopted (default)** |
+| `int8` L2 (scale 127) | 0.7138 | 0.3424 | 0.7292 | 0.3641 | 0.5466 | -0.14 | — | Superseded by higher scale |
+| `int8` cosine (maxabs) | 0.7171 | 0.3419 | 0.7317 | 0.3643 | 0.5480 | 0.00 | 12.82 / 13.93 | Reverted (slower in sqlite-vec) |
+| `bit` (binary Hamming) | 0.6296 | 0.2808 | 0.7087 | 0.3488 | 0.5287 | -1.93 | 1.89 / 2.05 | Rejected (> 1 pt loss) |
+| `bit` top-200 + `int8` rescore | 0.7098 | 0.3412 | 0.7177 | 0.3654 | 0.5416 | -0.64 | — | Rejected (SF -1.40 pts) |
+
+### 100,000-Chunk Scale Test (`tests/test_scale_100k.py`, `@pytest.mark.slow`)
+
+Measured on `100,000` synthetic chunks (`2,500` documents × `40` chunks/doc, 384-d `int8` vectors, single write transaction, 30 warm queries after 1 warm-up per mode):
+
+| Metric | Measured Value |
+| --- | ---: |
+| Store populate time | 9.11 s (10,977 chunks/sec) |
+| Database size on disk | 110.45 MiB |
+| `keyword` p50 / p95 latency | 4.35 ms / 5.00 ms |
+| `vector` p50 / p95 latency | 41.39 ms / 42.55 ms |
+| `hybrid` p50 / p95 latency | 44.37 ms / 46.38 ms |
+
+### Post-Phase 2 Full BEIR `seekr eval` Results (SciFact, NFCorpus & FiQA, `int8` Default)
+
+| Dataset | Mode | recall@5 | recall@10 | mrr@10 | ndcg@10 | p50_ms | Eval Wall |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SciFact (`5,183` docs, `300` q) | keyword | 0.7387 | 0.8078 | 0.6547 | 0.6866 | 14.20 | 91.38 s |
+| SciFact | vector | 0.7623 | 0.8262 | 0.6822 | 0.7109 | 23.77 | 91.38 s |
+| SciFact | **hybrid** | **0.7872** | **0.8712** | **0.6960** | **0.7320** | **31.26** | 91.38 s |
+| SciFact | hybrid+rerank | 0.7532 | 0.8356 | 0.6673 | 0.7020 | 118.78 | 91.38 s |
+| NFCorpus (`3,633` docs, `323` q) | keyword | 0.1228 | 0.1553 | 0.5224 | 0.3214 | 3.28 | 76.59 s |
+| NFCorpus | vector | 0.1266 | 0.1626 | 0.5253 | 0.3410 | 20.87 | 76.59 s |
+| NFCorpus | **hybrid** | **0.1372** | **0.1744** | **0.5666** | **0.3632** | **17.45** | 76.59 s |
+| NFCorpus | hybrid+rerank | 0.1393 | 0.1693 | 0.5842 | 0.3570 | 105.20 | 76.59 s |
+| FiQA (`57,638` docs, `648` q) | keyword | 0.2384 | 0.3044 | 0.3000 | 0.2447 | 72.13 | 501.65 s |
+| FiQA | **vector** | **0.3771** | **0.4536** | **0.4818** | **0.3963** | **46.83** | 501.65 s |
+| FiQA | hybrid | 0.3513 | 0.4412 | 0.4285 | 0.3589 | 118.78 | 501.65 s |
+| FiQA | hybrid+rerank | 0.3780 | 0.4482 | 0.4446 | 0.3761 | 187.93 | 501.65 s |
+
+3-Dataset Macro-Average `ndcg@10` (`int8` default): `keyword` = `0.4176`, `vector` = `0.4827`, `hybrid` = `0.4847`, `hybrid+rerank` = `0.4784`. SciFact+NFCorpus `hybrid` macro-avg moved only `-0.04` pts (`0.5480 -> 0.5476`: SciFact `+0.02`, NFCorpus `-0.10`). On FiQA (conversational personal-finance Q&A), `OR`-joined FTS5 queries match many weak lexical postings (72.13 ms `p50`), so pure `vector` (`0.3963`) beats equal-weight `hybrid` (`0.3589`) while `--rerank` recovers `+1.72` pts over `hybrid` (`0.3761`).

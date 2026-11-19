@@ -1,10 +1,10 @@
 # seekr latency benchmark
 
-Measured 2026-11-19 02:23:05 UTC by `bench/latency.py`. Only measured values appear here.
+Measured 2026-11-19 03:40:16 UTC by `bench/latency.py`. Only measured values appear here.
 
 ## Setup
 
-- Synthetic corpus: 20,000 chunks in 500 documents, normalised 384-dimensional float32 vectors.
+- Synthetic corpus: 20,000 chunks in 500 documents, normalised 384-dimensional int8 vectors.
 - Queries: 50 per mode, 1 timed round(s) over the set.
 - Each mode received one untimed warm-up after the index was fully written.
 - Retrieval timing covers `Searcher.get_hits`: SQLite FTS5/vec0 retrieval, RRF, per-file capping and hit construction.
@@ -12,9 +12,9 @@ Measured 2026-11-19 02:23:05 UTC by `bench/latency.py`. Only measured values app
 
 | mode | p50 (ms) | p95 (ms) | samples |
 | --- | ---: | ---: | ---: |
-| keyword | 1.41 | 1.54 | 50 |
-| vector | 12.04 | 13.05 | 50 |
-| hybrid | 14.12 | 14.53 | 50 |
+| keyword | 1.35 | 1.51 | 50 |
+| vector | 8.48 | 8.98 | 50 |
+| hybrid | 10.96 | 11.39 | 50 |
 
 ## Query embedding
 
@@ -22,18 +22,19 @@ Model: `BAAI/bge-small-en-v1.5` (real local model, measured separately from retr
 
 | statistic | value |
 | --- | ---: |
-| p50 | 10.17 ms |
-| p95 | 11.02 ms |
+| p50 | 18.32 ms |
+| p95 | 19.65 ms |
 | samples | 50 |
 
 ## Indexing and memory
 
 | metric | value |
 | --- | ---: |
-| Store populate time | 2.09 s |
-| Indexing throughput (docs/sec) | 239.6 |
-| Indexing throughput (chunks/sec) | 9582.5 |
-| Peak process RSS | 1327.5 MiB |
+| Store populate time | 1.83 s |
+| Indexing throughput (docs/sec) | 272.5 |
+| Indexing throughput (chunks/sec) | 10901.0 |
+| Database size (MiB) | 22.35 |
+| Peak process RSS | 1330.5 MiB |
 
 ## Environment
 
