@@ -132,7 +132,10 @@ class SentenceTransformerEmbedder:
                     kind="embedding",
                     device=self._device,
                 )
-                dimension = model.get_sentence_embedding_dimension()
+                get_dim = getattr(model, "get_embedding_dimension", None)
+                if not callable(get_dim):
+                    get_dim = getattr(model, "get_sentence_embedding_dimension", None)
+                dimension = get_dim() if callable(get_dim) else None
                 if dimension is None:
                     raise ValueError(
                         f"embedding model {self.model_name!r} did not report a dimension"
