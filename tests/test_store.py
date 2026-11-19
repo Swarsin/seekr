@@ -456,6 +456,31 @@ class StorePathTests(_FakeBackendTestCase):
         self.assertEqual(store.list_paths(""), sorted(paths))
         self.assertEqual(store.list_paths("/"), sorted(paths))
 
+    def test_get_documents_metadata_has_chunks_and_batch_sha_lookup(self) -> None:
+        import numpy as np
+
+        store = self.open_store()
+        self.assertFalse(store.has_chunks())
+        c1 = _stored_chunk("alpha beta", 1)
+        c2 = _stored_chunk("gamma delta", 2)
+        _add_document(store, "/notes/a.md", c1)
+        _add_document(store, "/other/b.md", c2)
+
+        self.assertTrue(store.has_chunks())
+        all_docs = store.get_documents_metadata()
+        self.assertEqual(set(all_docs), {"/notes/a.md", "/other/b.md"})
+        notes_docs = store.get_documents_metadata("/notes")
+        self.assertEqual(set(notes_docs), {"/notes/a.md"})
+        self.assertEqual(store.get_documents_metadata("/notes2"), {})
+
+        found = store.find_vectors_by_text_shas(
+            [c1.text_sha, "missing", c2.text_sha, c1.text_sha]
+        )
+        self.assertEqual(set(found), {c1.text_sha, c2.text_sha})
+        self.assertTrue(np.allclose(found[c1.text_sha], c1.vector))
+        self.assertTrue(np.allclose(found[c2.text_sha], c2.vector))
+        self.assertEqual(store.find_vectors_by_text_shas([]), {})
+
 
 @unittest.skipUnless(_HAS_NUMPY, "numpy is required for the vector store tests")
 class StoreMoveTests(_FakeBackendTestCase):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -130,10 +130,8 @@ def _create_vector_table(conn: sqlite3.Connection, dim: int) -> None:
 
 def _serialize_vector(vector: object) -> bytes:
     import numpy as np
-    import sqlite_vec
 
-    array = np.asarray(vector, dtype=np.float32)
-    return sqlite_vec.serialize_float32(array)
+    return np.ascontiguousarray(vector, dtype="<f4").tobytes()
 
 
 def _deserialize_vector(payload: bytes | memoryview) -> np.ndarray:
@@ -195,6 +193,9 @@ class Store:
         )
         try:
             conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA cache_size=-32000")
             conn.execute("PRAGMA foreign_keys=ON")
             foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()
             if not foreign_keys or int(foreign_keys[0]) != 1:
@@ -374,6 +375,28 @@ class Store:
             kind=str(row[5]),
         )
 
+    def get_documents_metadata(self, prefix: str | None = None) -> dict[str, DocRow]:
+        """Return indexed document rows keyed by path, optionally under *prefix*."""
+        clause, params = _path_prefix_clause(prefix)
+        sql = "SELECT id, path, mtime_ns, size, sha256, kind FROM documents"
+        if clause:
+            sql += f" WHERE {clause}"
+        with self._lock:
+            conn = self._connection()
+            rows = conn.execute(sql, params).fetchall()
+        docs: dict[str, DocRow] = {}
+        for row in rows:
+            path = str(row[1])
+            docs[path] = DocRow(
+                id=int(row[0]),
+                path=path,
+                mtime_ns=int(row[2]),
+                size=int(row[3]),
+                sha256=str(row[4]),
+                kind=str(row[5]),
+            )
+        return docs
+
     def move_document(self, src: str, dst: str, *, mtime_ns: int, size: int) -> int:
         """Move an unchanged document to a new path and update its stat fields.
 
@@ -416,8 +439,9 @@ class Store:
                         "SELECT id FROM chunks WHERE doc_id = ? ORDER BY id", (int(doc_id),)
                     )
                 ]
-                self._delete_vectors(conn, old_ids)
-                conn.execute("DELETE FROM chunks WHERE doc_id = ?", (int(doc_id),))
+                if old_ids:
+                    self._delete_vectors(conn, old_ids)
+                    conn.execute("DELETE FROM chunks WHERE doc_id = ?", (int(doc_id),))
                 if not items:
                     return
                 new_ids: list[int] = []
@@ -503,6 +527,33 @@ class Store:
         if vector_row is None or vector_row[0] is None:
             return None
         return _deserialize_vector(vector_row[0])
+
+    def find_vectors_by_text_shas(self, shas: Iterable[str]) -> dict[str, np.ndarray]:
+        """Return stored vectors keyed by content hash for any known chunks."""
+        unique_shas = list(dict.fromkeys(str(sha) for sha in shas))
+        vectors: dict[str, np.ndarray] = {}
+        if not unique_shas:
+            return vectors
+        with self._lock:
+            conn = self._connection()
+            for start in range(0, len(unique_shas), _FETCH_BATCH):
+                batch = unique_shas[start : start + _FETCH_BATCH]
+                placeholders = ", ".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"""
+                    SELECT c.text_sha, v.embedding
+                    FROM chunks AS c
+                    JOIN chunks_vec AS v ON v.rowid = c.id
+                    WHERE c.text_sha IN ({placeholders})
+                    ORDER BY c.id
+                    """,
+                    batch,
+                ).fetchall()
+                for row in rows:
+                    sha = str(row[0])
+                    if sha not in vectors and row[1] is not None:
+                        vectors[sha] = _deserialize_vector(row[1])
+        return vectors
 
     def keyword_search(
         self,
@@ -670,6 +721,13 @@ class Store:
         return chunks
 
     # -- status ------------------------------------------------------------
+
+    def has_chunks(self) -> bool:
+        """Return whether the store currently holds at least one chunk."""
+        with self._lock:
+            conn = self._connection()
+            row = conn.execute("SELECT EXISTS(SELECT 1 FROM chunks)").fetchone()
+        return bool(row[0]) if row else False
 
     def stats(self) -> dict[str, int]:
         """Return the document and chunk counts; no other keys are included."""

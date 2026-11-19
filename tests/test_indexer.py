@@ -305,7 +305,20 @@ class SyncTests(_IndexerTestCase):
         self.assertEqual((report.added, report.updated, report.unchanged), (3, 0, 0))
         self.assertEqual(report.errors, [])
         self.assertEqual(self.store.stats(), {"documents": 3, "chunks": 3})
-        self.assertEqual(len(self.embedder.calls), 3)
+        self.assertEqual(sum(len(call) for call in self.embedder.calls), 3)
+        self.assertEqual(len(self.embedder.calls), 1)
+
+    def test_sync_batch_deduplicates_identical_chunks_across_files(self) -> None:
+        self.write("a.txt", "shared chunk text across files")
+        self.write("b.txt", "shared chunk text across files")
+        self.write("c.txt", "distinct chunk text")
+
+        report = self.indexer.sync([self.root])
+
+        self.assertEqual((report.added, report.errors), (3, []))
+        self.assertEqual(self.store.stats(), {"documents": 3, "chunks": 3})
+        self.assertEqual(len(self.embedder.calls), 1)
+        self.assertEqual(len(self.embedder.calls[0]), 2)
 
     def test_resync_unchanged_makes_no_embed_calls(self) -> None:
         self.write("a.txt", "alpha beta gamma")
@@ -603,6 +616,51 @@ class PreservationAndRetryTests(_IndexerTestCase):
 
         self.assertEqual(len(report.errors), 1)
         self.assertEqual(self.store.stats(), {"documents": 0, "chunks": 0})
+
+    def test_partial_batch_embedding_failure_isolates_failing_file(self) -> None:
+        self.write("a_good.txt", "alpha beta gamma")
+        self.write("b_poison.txt", "poison chunk text")
+        self.write("c_good.txt", "delta epsilon zeta")
+        original_embed = self.embedder.embed_documents
+
+        def guarded_embed(texts: list[str]) -> list[str]:
+            if any("poison" in text for text in texts):
+                raise RuntimeError("poison chunk failed")
+            return original_embed(texts)
+
+        with mock.patch.object(self.embedder, "embed_documents", side_effect=guarded_embed):
+            report = self.indexer.sync([self.root])
+
+        self.assertEqual(report.added, 2)
+        self.assertEqual(len(report.errors), 1)
+        self.assertIn("b_poison.txt", report.errors[0][0])
+        self.assertIsNotNone(self.stored(self.root / "a_good.txt"))
+        self.assertIsNone(self.stored(self.root / "b_poison.txt"))
+        self.assertIsNotNone(self.stored(self.root / "c_good.txt"))
+
+    def test_partial_batch_write_failure_isolates_failing_file(self) -> None:
+        self.write("a_good.txt", "alpha beta gamma")
+        bad_path = self.write("b_write_fail.txt", "delta epsilon zeta")
+        self.write("c_good.txt", "eta theta iota")
+        bad_key = str(bad_path.resolve())
+        original_upsert = self.store.upsert_document
+
+        def guarded_upsert(
+            path: str, mtime_ns: int, size: int, sha256: str, kind: str
+        ) -> int:
+            if path == bad_key:
+                raise RuntimeError("write failed for bad file")
+            return original_upsert(path, mtime_ns, size, sha256, kind)
+
+        with mock.patch.object(self.store, "upsert_document", side_effect=guarded_upsert):
+            report = self.indexer.sync([self.root])
+
+        self.assertEqual(report.added, 2)
+        self.assertEqual(len(report.errors), 1)
+        self.assertIn("b_write_fail.txt", report.errors[0][0])
+        self.assertIsNotNone(self.stored(self.root / "a_good.txt"))
+        self.assertIsNone(self.stored(bad_path))
+        self.assertIsNotNone(self.stored(self.root / "c_good.txt"))
 
     def test_transient_change_is_retried_then_indexed(self) -> None:
         self.write("churn.txt", "initial text")

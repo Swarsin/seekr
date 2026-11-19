@@ -23,7 +23,7 @@ from .chunking import ChunkingWarning, chunk
 from .config import Config
 from .extract import ExtractionError, ExtractionResult
 from .models import text_sha
-from .store import StoredChunk
+from .store import DocRow, StoredChunk
 
 if TYPE_CHECKING:
     from .embed import Embedder
@@ -36,6 +36,8 @@ IndexResult = Literal["added", "updated", "unchanged", "skipped", "removed"]
 #: Number of stat/hash/extract/re-stat rounds before a changing file is skipped.
 MAX_FILE_ATTEMPTS = 3
 _READ_BLOCK = 1024 * 1024
+_SYNC_BATCH_FILES = 64
+_SYNC_BATCH_CHUNKS = 128
 
 
 @dataclass
@@ -64,6 +66,18 @@ class _Outcome:
     result: IndexResult
     errors: list[tuple[str, str]] = field(default_factory=list)
     warnings: list[tuple[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class _PreparedFile:
+    key: str
+    path: Path
+    kind: str
+    after_stat: os.stat_result
+    sha256: str
+    existed: bool
+    chunks: list[tuple[object, str]]
+    warnings: list[tuple[str, str]]
 
 
 def _error_text(exc: BaseException) -> str:
@@ -111,6 +125,28 @@ class Indexer:
         self.cfg = cfg
         self._last_report: SyncReport | None = None
         self._last_outcome: _Outcome | None = None
+        self._ignore_cache_key: tuple[str, ...] | None = None
+        self._ignore_exact_parts: frozenset[str] = frozenset()
+        self._ignore_glob_patterns: tuple[str, ...] = ()
+        self._compile_ignore_patterns()
+
+    def _compile_ignore_patterns(self) -> None:
+        patterns = self.cfg.ignore_globs
+        if self._ignore_cache_key is patterns:
+            return
+        exact_parts: set[str] = set()
+        glob_patterns: list[str] = []
+        for raw_pattern in patterns:
+            pattern = str(raw_pattern).strip().removeprefix("./")
+            if not pattern:
+                continue
+            if not any(ch in pattern for ch in ("/", "*", "?", "[", "]")):
+                exact_parts.add(pattern)
+            else:
+                glob_patterns.append(pattern)
+        self._ignore_exact_parts = frozenset(exact_parts)
+        self._ignore_glob_patterns = tuple(glob_patterns)
+        self._ignore_cache_key = patterns
 
     # -- public API --------------------------------------------------------
 
@@ -170,9 +206,7 @@ class Indexer:
                     self._index_walked_file(root, root, seen, report)
                     healthy_roots.append(root)
                 elif stat_module.S_ISDIR(root_stat.st_mode):
-                    files, walk_ok = self._walk_root(root, report)
-                    for file_path in files:
-                        self._index_walked_file(file_path, root, seen, report)
+                    walk_ok = self._sync_dir_root(root, seen, report)
                     if walk_ok:
                         healthy_roots.append(root)
                 else:
@@ -226,6 +260,160 @@ class Indexer:
 
         files.sort(key=lambda item: str(item))
         return files, walk_ok
+
+    def _sync_dir_root(self, root: Path, seen: set[str], report: SyncReport) -> bool:
+        docs_cache: dict[str, DocRow] | None = None
+        get_meta = getattr(self.store, "get_documents_metadata", None)
+        if callable(get_meta):
+            try:
+                docs_cache = dict(get_meta(str(root)))
+            except Exception:
+                docs_cache = None
+
+        files, walk_ok = self._walk_root(root, report)
+        pending: list[_PreparedFile] = []
+        pending_chunks = 0
+
+        for file_path in files:
+            if self._is_ignored(file_path, root):
+                report.skipped += 1
+                continue
+
+            resolved, key, before_opt = self._resolve_walked_entry(
+                file_path, root, seen, report
+            )
+            if resolved is None or key is None:
+                continue
+
+            try:
+                kind = kind_for(resolved)
+                if kind is None:
+                    report.skipped += 1
+                    continue
+
+                if before_opt is not None:
+                    if before_opt.st_size > self.cfg.max_file_bytes:
+                        report.warnings.append(
+                            (
+                                key,
+                                f"file is larger than max_file_bytes ({self.cfg.max_file_bytes}); skipped",
+                            )
+                        )
+                        report.skipped += 1
+                        continue
+                    try:
+                        doc = (
+                            docs_cache.get(key)
+                            if docs_cache is not None
+                            else self.store.get_document(key)
+                        )
+                    except Exception as exc:
+                        report.errors.append(
+                            (key, f"cannot read document metadata: {_error_text(exc)}")
+                        )
+                        continue
+                    if (
+                        doc is not None
+                        and (doc.mtime_ns, doc.size) == _signature(before_opt)
+                        and doc.kind == kind
+                    ):
+                        report.unchanged += 1
+                        continue
+
+                prepared, outcome = self._prepare_resolved_path(
+                    resolved,
+                    key,
+                    kind,
+                    initial_stat=before_opt,
+                    docs_cache=docs_cache,
+                )
+            except FileNotFoundError:
+                tmp_outcome = _Outcome(result="skipped")
+                tmp_outcome.result = self._remove_vanished(resolved, tmp_outcome)
+                self._merge_outcome(report, tmp_outcome)
+                continue
+            except Exception as exc:  # Isolate every malformed or unreadable file.
+                report.skipped += 1
+                report.errors.append((key, _error_text(exc)))
+                continue
+
+            if outcome is not None:
+                self._merge_outcome(report, outcome)
+                continue
+
+            assert prepared is not None
+            pending.append(prepared)
+            pending_chunks += len(prepared.chunks)
+            if len(pending) >= _SYNC_BATCH_FILES or pending_chunks >= _SYNC_BATCH_CHUNKS:
+                self._flush_batch(pending, report, docs_cache=docs_cache)
+                pending.clear()
+                pending_chunks = 0
+
+        if pending:
+            self._flush_batch(pending, report, docs_cache=docs_cache)
+        return walk_ok
+
+    def _resolve_walked_entry(
+        self,
+        path: Path,
+        root: Path,
+        seen: set[str],
+        report: SyncReport,
+    ) -> tuple[Path | None, str | None, os.stat_result | None]:
+        try:
+            lstat_res = os.lstat(path)
+        except OSError:
+            resolved, issue = self._resolve(path)
+            if resolved is None:
+                report.skipped += 1
+                report.warnings.append((str(path), issue or "cannot resolve path"))
+                return None, None, None
+            if not _is_within(resolved, root):
+                report.skipped += 1
+                report.warnings.append(
+                    (str(path), "path resolves outside the indexed root; skipped")
+                )
+                return None, None, None
+            key = str(resolved)
+            if key in seen:
+                return None, None, None
+            seen.add(key)
+            self._merge_outcome(report, self._index_path(resolved))
+            return None, None, None
+
+        if stat_module.S_ISLNK(lstat_res.st_mode):
+            resolved, issue = self._resolve(path)
+            if resolved is None:
+                report.skipped += 1
+                report.warnings.append((str(path), issue or "cannot resolve path"))
+                return None, None, None
+            if not _is_within(resolved, root):
+                report.skipped += 1
+                report.warnings.append(
+                    (str(path), "path resolves outside the indexed root; skipped")
+                )
+                return None, None, None
+            key = str(resolved)
+            if key in seen:
+                return None, None, None
+            seen.add(key)
+            if self._is_ignored(resolved):
+                report.skipped += 1
+                return None, None, None
+            return resolved, key, None
+
+        if not stat_module.S_ISREG(lstat_res.st_mode):
+            key = str(path)
+            if key not in seen:
+                seen.add(key)
+                report.skipped += 1
+            return None, None, None
+
+        key = str(path)
+        if key in seen:
+            return None, None, None
+        seen.add(key)
+        return path, key, lstat_res
 
     def _index_walked_file(
         self, path: Path, root: Path, seen: set[str], report: SyncReport
@@ -320,25 +508,47 @@ class Indexer:
         if kind is None:
             return outcome
 
-        for _attempt in range(MAX_FILE_ATTEMPTS):
-            try:
-                before = path.stat()
-            except FileNotFoundError:
-                outcome.result = self._remove_vanished(path, outcome)
-                return outcome
-            except OSError as exc:
-                if _is_symlink_loop(exc):
-                    outcome.warnings.append(
-                        (str(path), f"symlink loop; skipped: {_error_text(exc)}")
+        prepared, early = self._prepare_resolved_path(path, key, kind, force=force)
+        if early is not None:
+            return early
+        assert prepared is not None
+        return self._commit_prepared_file(prepared)
+
+    def _prepare_resolved_path(
+        self,
+        path: Path,
+        key: str,
+        kind: str,
+        *,
+        initial_stat: os.stat_result | None = None,
+        docs_cache: dict[str, DocRow] | None = None,
+        force: bool = False,
+    ) -> tuple[_PreparedFile | None, _Outcome | None]:
+        outcome = _Outcome(result="skipped")
+        for attempt in range(MAX_FILE_ATTEMPTS):
+            if attempt == 0 and initial_stat is not None:
+                before = initial_stat
+            else:
+                try:
+                    before = path.stat()
+                except FileNotFoundError:
+                    outcome.result = self._remove_vanished(
+                        path, outcome, docs_cache=docs_cache
                     )
-                else:
-                    outcome.errors.append(
-                        (str(path), f"cannot stat file: {_error_text(exc)}")
-                    )
-                return outcome
+                    return None, outcome
+                except OSError as exc:
+                    if _is_symlink_loop(exc):
+                        outcome.warnings.append(
+                            (str(path), f"symlink loop; skipped: {_error_text(exc)}")
+                        )
+                    else:
+                        outcome.errors.append(
+                            (str(path), f"cannot stat file: {_error_text(exc)}")
+                        )
+                    return None, outcome
 
             if not stat_module.S_ISREG(before.st_mode):
-                return outcome
+                return None, outcome
             if before.st_size > self.cfg.max_file_bytes:
                 outcome.warnings.append(
                     (
@@ -346,15 +556,18 @@ class Indexer:
                         f"file is larger than max_file_bytes ({self.cfg.max_file_bytes}); skipped",
                     )
                 )
-                return outcome
+                return None, outcome
 
             try:
-                doc = self.store.get_document(key)
+                if docs_cache is not None and attempt == 0:
+                    doc = docs_cache.get(key)
+                else:
+                    doc = self.store.get_document(key)
             except Exception as exc:
                 outcome.errors.append(
                     (str(path), f"cannot read document metadata: {_error_text(exc)}")
                 )
-                return outcome
+                return None, outcome
 
             signature = _signature(before)
             if (
@@ -364,26 +577,28 @@ class Indexer:
                 and doc.kind == kind
             ):
                 outcome.result = "unchanged"
-                return outcome
+                return None, outcome
 
             try:
                 sha256 = self._sha256_file(path)
             except FileNotFoundError:
-                outcome.result = self._remove_vanished(path, outcome)
-                return outcome
+                outcome.result = self._remove_vanished(
+                    path, outcome, docs_cache=docs_cache
+                )
+                return None, outcome
             except OSError as exc:
                 self._record_read_error(path, exc, outcome, "cannot hash file")
-                return outcome
+                return None, outcome
 
             if doc is not None and doc.sha256 == sha256 and doc.kind == kind:
-                after = self._restat_after_read(path, outcome)
+                after = self._restat_after_read(path, outcome, docs_cache=docs_cache)
                 if after is None:
-                    return outcome
+                    return None, outcome
                 if signature != _signature(after):
                     continue
                 try:
                     with self.store.transaction(write=True):
-                        self.store.upsert_document(
+                        doc_id = self.store.upsert_document(
                             key,
                             before.st_mtime_ns,
                             before.st_size,
@@ -394,30 +609,41 @@ class Indexer:
                     outcome.errors.append(
                         (str(path), f"cannot update metadata: {_error_text(exc)}")
                     )
-                    return outcome
+                    return None, outcome
+                if docs_cache is not None:
+                    docs_cache[key] = DocRow(
+                        id=doc_id,
+                        path=key,
+                        mtime_ns=before.st_mtime_ns,
+                        size=before.st_size,
+                        sha256=sha256,
+                        kind=kind,
+                    )
                 outcome.result = "unchanged"
-                return outcome
+                return None, outcome
 
             try:
                 extraction = extract(path, kind)
             except FileNotFoundError:
-                outcome.result = self._remove_vanished(path, outcome)
-                return outcome
+                outcome.result = self._remove_vanished(
+                    path, outcome, docs_cache=docs_cache
+                )
+                return None, outcome
             except ExtractionError as exc:
                 outcome.errors.append((str(path), _error_text(exc)))
-                return outcome
+                return None, outcome
             except (OSError, UnicodeError) as exc:
                 self._record_read_error(path, exc, outcome, "cannot read file")
-                return outcome
+                return None, outcome
             except Exception as exc:
                 outcome.errors.append(
                     (str(path), f"extraction failed: {_error_text(exc)}")
                 )
-                return outcome
+                return None, outcome
 
-            after = self._restat_after_read(path, outcome)
+            after = self._restat_after_read(path, outcome, docs_cache=docs_cache)
             if after is None:
-                return outcome
+                return None, outcome
             if signature != _signature(after):
                 continue
             if after.st_size > self.cfg.max_file_bytes:
@@ -427,7 +653,7 @@ class Indexer:
                         f"file is larger than max_file_bytes ({self.cfg.max_file_bytes}); skipped",
                     )
                 )
-                return outcome
+                return None, outcome
 
             try:
                 specs, chunk_warnings = self._make_chunks(kind, extraction, path)
@@ -435,36 +661,29 @@ class Indexer:
                 outcome.errors.append(
                     (str(path), f"chunking failed: {_error_text(exc)}")
                 )
-                return outcome
+                return None, outcome
 
-            try:
-                stored = self._prepare_chunks(specs)
-            except Exception as exc:
-                outcome.errors.append(
-                    (str(path), f"cannot prepare chunks: {_error_text(exc)}")
-                )
-                return outcome
-
-            try:
-                with self.store.transaction(write=True):
-                    doc_id = self.store.upsert_document(
-                        key,
-                        after.st_mtime_ns,
-                        after.st_size,
-                        sha256,
-                        kind,
-                    )
-                    self.store.replace_chunks(doc_id, stored)
-            except Exception as exc:
-                outcome.errors.append(
-                    (str(path), f"cannot write document: {_error_text(exc)}")
-                )
-                return outcome
-
-            outcome.result = "updated" if doc is not None else "added"
-            outcome.warnings.extend((str(path), warning) for warning in extraction.warnings)
-            outcome.warnings.extend((str(path), warning) for warning in chunk_warnings)
-            return outcome
+            file_warnings = [
+                *((str(path), warning) for warning in extraction.warnings),
+                *((str(path), warning) for warning in chunk_warnings),
+            ]
+            chunk_pairs = [
+                (spec, text_sha(spec.text))  # type: ignore[attr-defined]
+                for spec in specs
+            ]
+            return (
+                _PreparedFile(
+                    key=key,
+                    path=path,
+                    kind=kind,
+                    after_stat=after,
+                    sha256=sha256,
+                    existed=doc is not None,
+                    chunks=chunk_pairs,
+                    warnings=file_warnings,
+                ),
+                None,
+            )
 
         outcome.errors.append(
             (
@@ -472,15 +691,149 @@ class Indexer:
                 f"file kept changing while indexing; gave up after {MAX_FILE_ATTEMPTS} attempts",
             )
         )
+        return None, outcome
+
+    def _flush_batch(
+        self,
+        batch: list[_PreparedFile],
+        report: SyncReport,
+        *,
+        docs_cache: dict[str, DocRow] | None = None,
+    ) -> None:
+        all_pairs = [pair for item in batch for pair in item.chunks]
+        try:
+            found = self._resolve_chunk_vectors(all_pairs)
+        except Exception:
+            for item in batch:
+                self._merge_outcome(
+                    report,
+                    self._commit_prepared_file(item, docs_cache=docs_cache),
+                )
+            return
+
+        prepared_writes = [
+            (
+                item,
+                [
+                    StoredChunk(spec=spec, text_sha=sha, vector=found[sha])
+                    for spec, sha in item.chunks
+                ],
+            )
+            for item in batch
+        ]
+
+        written_docs: list[tuple[str, DocRow]] = []
+        try:
+            with self.store.transaction(write=True):
+                for item, stored in prepared_writes:
+                    doc_id = self.store.upsert_document(
+                        item.key,
+                        item.after_stat.st_mtime_ns,
+                        item.after_stat.st_size,
+                        item.sha256,
+                        item.kind,
+                    )
+                    self.store.replace_chunks(doc_id, stored)
+                    written_docs.append(
+                        (
+                            item.key,
+                            DocRow(
+                                id=doc_id,
+                                path=item.key,
+                                mtime_ns=item.after_stat.st_mtime_ns,
+                                size=item.after_stat.st_size,
+                                sha256=item.sha256,
+                                kind=item.kind,
+                            ),
+                        )
+                    )
+        except Exception:
+            for item, stored in prepared_writes:
+                self._merge_outcome(
+                    report,
+                    self._write_prepared_single(item, stored, docs_cache=docs_cache),
+                )
+            return
+
+        if docs_cache is not None:
+            for key, row in written_docs:
+                docs_cache[key] = row
+        for item in batch:
+            if item.existed:
+                report.updated += 1
+            else:
+                report.added += 1
+            report.warnings.extend(item.warnings)
+
+    def _commit_prepared_file(
+        self,
+        prepared: _PreparedFile,
+        *,
+        docs_cache: dict[str, DocRow] | None = None,
+    ) -> _Outcome:
+        outcome = _Outcome(result="skipped")
+        try:
+            found = self._resolve_chunk_vectors(prepared.chunks)
+        except Exception as exc:
+            outcome.errors.append(
+                (prepared.key, f"cannot prepare chunks: {_error_text(exc)}")
+            )
+            return outcome
+        stored = [
+            StoredChunk(spec=spec, text_sha=sha, vector=found[sha])
+            for spec, sha in prepared.chunks
+        ]
+        return self._write_prepared_single(prepared, stored, docs_cache=docs_cache)
+
+    def _write_prepared_single(
+        self,
+        prepared: _PreparedFile,
+        stored: list[StoredChunk],
+        *,
+        docs_cache: dict[str, DocRow] | None = None,
+    ) -> _Outcome:
+        outcome = _Outcome(result="skipped")
+        try:
+            with self.store.transaction(write=True):
+                doc_id = self.store.upsert_document(
+                    prepared.key,
+                    prepared.after_stat.st_mtime_ns,
+                    prepared.after_stat.st_size,
+                    prepared.sha256,
+                    prepared.kind,
+                )
+                self.store.replace_chunks(doc_id, stored)
+        except Exception as exc:
+            outcome.errors.append(
+                (prepared.key, f"cannot write document: {_error_text(exc)}")
+            )
+            return outcome
+        if docs_cache is not None:
+            docs_cache[prepared.key] = DocRow(
+                id=doc_id,
+                path=prepared.key,
+                mtime_ns=prepared.after_stat.st_mtime_ns,
+                size=prepared.after_stat.st_size,
+                sha256=prepared.sha256,
+                kind=prepared.kind,
+            )
+        outcome.result = "updated" if prepared.existed else "added"
+        outcome.warnings.extend(prepared.warnings)
         return outcome
 
     def _restat_after_read(
-        self, path: Path, outcome: _Outcome
+        self,
+        path: Path,
+        outcome: _Outcome,
+        *,
+        docs_cache: dict[str, DocRow] | None = None,
     ) -> os.stat_result | None:
         try:
             return path.stat()
         except FileNotFoundError:
-            outcome.result = self._remove_vanished(path, outcome)
+            outcome.result = self._remove_vanished(
+                path, outcome, docs_cache=docs_cache
+            )
             return None
         except OSError as exc:
             self._record_read_error(path, exc, outcome, "cannot re-stat file")
@@ -496,12 +849,20 @@ class Indexer:
         else:
             outcome.errors.append((str(path), f"{action}: {_error_text(exc)}"))
 
-    def _remove_vanished(self, path: Path, outcome: _Outcome) -> IndexResult:
+    def _remove_vanished(
+        self,
+        path: Path,
+        outcome: _Outcome,
+        *,
+        docs_cache: dict[str, DocRow] | None = None,
+    ) -> IndexResult:
         resolved, issue = self._resolve(path)
         if resolved is None:
             outcome.warnings.append((str(path), issue or "cannot resolve path"))
             return "skipped"
         key = str(resolved)
+        if docs_cache is not None:
+            docs_cache.pop(key, None)
         try:
             if self.store.get_document(key) is not None:
                 self.store.delete_document(key)
@@ -530,26 +891,38 @@ class Indexer:
         ]
         return list(specs), chunk_warnings
 
-    def _prepare_chunks(self, specs: list[object]) -> list[StoredChunk]:
-        shas = [text_sha(spec.text) for spec in specs]  # type: ignore[attr-defined]
-        found: dict[str, object] = {}
-        missing_shas: list[str] = []
-        missing_texts: list[str] = []
+    def _resolve_chunk_vectors(
+        self, chunk_pairs: list[tuple[object, str]]
+    ) -> dict[str, object]:
+        ordered_shas: list[str] = []
+        sha_texts: dict[str, str] = {}
+        for spec, sha in chunk_pairs:
+            if sha not in sha_texts:
+                sha_texts[sha] = spec.text  # type: ignore[attr-defined]
+                ordered_shas.append(sha)
 
-        for spec, sha in zip(specs, shas):
-            if sha in found or sha in missing_shas:
-                continue
+        if not ordered_shas:
+            return {}
+
+        found: dict[str, object] = {}
+        find_many = getattr(self.store, "find_vectors_by_text_shas", None)
+        if callable(find_many):
             try:
-                vector = self.store.find_vector_by_text_sha(sha)
+                found = dict(find_many(ordered_shas))
             except Exception as exc:
                 raise RuntimeError(f"vector lookup failed: {_error_text(exc)}") from exc
-            if vector is not None:
-                found[sha] = vector
-            else:
-                missing_shas.append(sha)
-                missing_texts.append(spec.text)  # type: ignore[attr-defined]
+        else:
+            for sha in ordered_shas:
+                try:
+                    vector = self.store.find_vector_by_text_sha(sha)
+                except Exception as exc:
+                    raise RuntimeError(f"vector lookup failed: {_error_text(exc)}") from exc
+                if vector is not None:
+                    found[sha] = vector
 
-        if missing_texts:
+        missing_shas = [sha for sha in ordered_shas if sha not in found]
+        if missing_shas:
+            missing_texts = [sha_texts[sha] for sha in missing_shas]
             try:
                 vectors = self.embedder.embed_documents(missing_texts)
             except Exception as exc:
@@ -566,9 +939,17 @@ class Indexer:
             for index, sha in enumerate(missing_shas):
                 found[sha] = vectors[index]  # type: ignore[index]
 
+        return found
+
+    def _prepare_chunks(self, specs: list[object]) -> list[StoredChunk]:
+        chunk_pairs = [
+            (spec, text_sha(spec.text))  # type: ignore[attr-defined]
+            for spec in specs
+        ]
+        found = self._resolve_chunk_vectors(chunk_pairs)
         return [
             StoredChunk(spec=spec, text_sha=sha, vector=found[sha])
-            for spec, sha in zip(specs, shas)
+            for spec, sha in chunk_pairs
         ]
 
     @staticmethod
@@ -792,11 +1173,18 @@ class Indexer:
             return None, f"cannot resolve path: {_error_text(exc)}"
 
     def _is_ignored(self, path: Path, root: Path | None = None) -> bool:
-        patterns = self.cfg.ignore_globs
-        if not patterns:
+        self._compile_ignore_patterns()
+        if not self._ignore_exact_parts and not self._ignore_glob_patterns:
             return False
 
         candidate = Path(path)
+        if self._ignore_exact_parts and any(
+            part in self._ignore_exact_parts for part in candidate.parts if part
+        ):
+            return True
+        if not self._ignore_glob_patterns:
+            return False
+
         relatives: list[str] = []
         if root is not None:
             try:
@@ -805,11 +1193,7 @@ class Indexer:
                 pass
         relatives.append(candidate.as_posix())
 
-        for raw_pattern in patterns:
-            pattern = str(raw_pattern).strip()
-            pattern = pattern.removeprefix("./")
-            if not pattern:
-                continue
+        for pattern in self._ignore_glob_patterns:
             if any(
                 fnmatch.fnmatchcase(part, pattern)
                 for part in candidate.parts
