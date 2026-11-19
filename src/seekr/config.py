@@ -87,7 +87,9 @@ class Config:
             or self.vector_quant not in VALID_VECTOR_QUANTS
         ):
             choices = ", ".join(sorted(VALID_VECTOR_QUANTS))
-            raise ConfigError(f"vector_quant must be one of {choices}")
+            raise ConfigError(
+                f"vector_quant must be one of {choices}; update vector_quant in config.toml"
+            )
         if not isinstance(self.max_file_bytes, int) or isinstance(self.max_file_bytes, bool):
             raise ConfigError("max_file_bytes must be an integer")
         if self.max_file_bytes <= 0:
@@ -117,7 +119,7 @@ def _read_toml(path: Path) -> dict[str, Any]:
     try:
         data = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        raise ConfigError(f"invalid TOML in {path}: {exc}") from exc
+        raise ConfigError(f"invalid TOML in {path}: {exc}; fix the syntax in {path} and retry") from exc
     return data
 
 
@@ -154,7 +156,11 @@ def load_config(path: Path | None = None) -> Config:
     known = {item.name for item in fields(Config)}
     unknown = sorted(set(data) - known)
     if unknown:
-        raise ConfigError(f"unknown config key(s) in {config_path}: {', '.join(unknown)}")
+        valid = ", ".join(sorted(known))
+        raise ConfigError(
+            f"unknown config key(s) in {config_path}: {', '.join(unknown)}; "
+            f"valid keys are: {valid}"
+        )
 
     values: dict[str, Any] = {}
     if "roots" in data:

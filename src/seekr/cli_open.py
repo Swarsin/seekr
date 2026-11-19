@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from .cli_search import SearchError, get_hits
+from .client import DaemonError
 from .extract import kind_for
 from .lifecycle import LifecycleError
 from .opener import format_pick_line, open_command, parse_pick_line
@@ -31,6 +32,7 @@ _SEARCH_ERRORS = (
     ModelMismatchError,
     SchemaVersionError,
     LifecycleError,
+    DaemonError,
     ValueError,
 )
 
@@ -74,7 +76,10 @@ def _build_pick_command(typer_module: Any) -> Any:
         except ImportError as exc:
             _exit_error("pick", f"search backend is unavailable: {exc}; run `seekr doctor`")
         except (OSError, sqlite3.Error) as exc:
-            _exit_error("pick", f"cannot read the index: {exc}")
+            _exit_error(
+                "pick",
+                f"cannot read the index: {exc}; run `seekr doctor` or `seekr reindex`",
+            )
 
         for hit in hits:
             typer_module.echo(format_pick_line(hit))
@@ -96,7 +101,10 @@ def _build_open_command(typer_module: Any) -> Any:
         try:
             result = subprocess.run(argv, check=False)
         except FileNotFoundError:
-            _exit_error("open", f"cannot run {argv[0]!r}: executable not found")
+            _exit_error(
+                "open",
+                f"cannot run {argv[0]!r}: executable not found; install it or set $EDITOR / $SEEKR_OPENER",
+            )
         except (OSError, ValueError) as exc:
             _exit_error("open", f"cannot run {argv[0]!r}: {exc}")
         if result.returncode:

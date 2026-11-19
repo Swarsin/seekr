@@ -58,7 +58,9 @@ def _connect(path: Path, timeout: float) -> socket.socket | None:
         return None
     except TimeoutError as exc:
         connection.close()
-        raise DaemonError(f"timed out connecting to seekr daemon at {path}") from exc
+        raise DaemonError(
+            f"timed out connecting to seekr daemon at {path}; check or restart `seekr daemon`"
+        ) from exc
     except OSError as exc:
         connection.close()
         if exc.errno in _NO_LISTENER_ERRNOS:
@@ -202,7 +204,9 @@ def try_daemon_search(
             reader = connection.makefile("rb")
             line = reader.readline(MAX_RESPONSE_BYTES + 1)
         except TimeoutError as exc:
-            raise DaemonError(f"seekr daemon at {path} timed out") from exc
+            raise DaemonError(
+                f"seekr daemon at {path} timed out; check daemon health or restart `seekr daemon`"
+            ) from exc
         except OSError as exc:
             raise DaemonError(
                 f"cannot read from seekr daemon at {path}: {exc}"
@@ -215,7 +219,9 @@ def try_daemon_search(
                     pass
 
     if not line:
-        raise DaemonError("seekr daemon closed the connection without a response")
+        raise DaemonError(
+            "seekr daemon closed the connection without a response; restart `seekr daemon`"
+        )
     if len(line) > MAX_RESPONSE_BYTES:
         raise DaemonError("seekr daemon response is too large")
     if not line.endswith(b"\n"):

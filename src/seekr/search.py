@@ -9,11 +9,16 @@ is released, so neither model can block a concurrent writer.
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Literal
 
+from .logging_config import log_event
 from .models import Hit
+
+_LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -323,11 +328,45 @@ class Searcher:
             )
         if rerank and self.reranker is None:
             raise ValueError("rerank=True requires a reranker")
+        started = time.monotonic()
         if k <= 0 or per_file <= 0:
+            log_event(
+                _LOGGER,
+                logging.DEBUG,
+                "search.query",
+                mode=mode,
+                k=k,
+                per_file=per_file,
+                rerank=rerank,
+                hits=0,
+                elapsed_ms=0.0,
+            )
             return []
         if not isinstance(query, str) or not query.strip():
+            log_event(
+                _LOGGER,
+                logging.DEBUG,
+                "search.query",
+                mode=mode,
+                k=k,
+                per_file=per_file,
+                rerank=rerank,
+                hits=0,
+                elapsed_ms=round((time.monotonic() - started) * 1000.0, 2),
+            )
             return []
         if not _store_has_chunks(self.store):
+            log_event(
+                _LOGGER,
+                logging.DEBUG,
+                "search.query",
+                mode=mode,
+                k=k,
+                per_file=per_file,
+                rerank=rerank,
+                hits=0,
+                elapsed_ms=round((time.monotonic() - started) * 1000.0, 2),
+            )
             return []
 
         prefix = _normalise_path_prefix(path_prefix)
@@ -340,6 +379,17 @@ class Searcher:
 
         match_query = fts_query(query) if mode in ("keyword", "hybrid") else ""
         if mode == "keyword" and not match_query:
+            log_event(
+                _LOGGER,
+                logging.DEBUG,
+                "search.query",
+                mode=mode,
+                k=k,
+                per_file=per_file,
+                rerank=rerank,
+                hits=0,
+                elapsed_ms=round((time.monotonic() - started) * 1000.0, 2),
+            )
             return []
 
         limit = max(_MIN_CANDIDATES, _CANDIDATES_PER_K * k)
@@ -362,7 +412,19 @@ class Searcher:
             assert self.reranker is not None
             selected = _rerank_candidates(self.reranker, query, selected, chunks)
 
-        return _build_hits(selected, chunks, query, per_file, k)
+        hits = _build_hits(selected, chunks, query, per_file, k)
+        log_event(
+            _LOGGER,
+            logging.DEBUG,
+            "search.query",
+            mode=mode,
+            k=k,
+            per_file=per_file,
+            rerank=rerank,
+            hits=len(hits),
+            elapsed_ms=round((time.monotonic() - started) * 1000.0, 2),
+        )
+        return hits
 
 
 __all__ = [

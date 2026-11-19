@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import sqlite3
 import threading
@@ -11,7 +12,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .logging_config import log_event
 from .models import ChunkSpec
+
+_LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -316,6 +320,16 @@ class Store:
             raise
 
         self._conn = conn
+        log_event(
+            _LOGGER,
+            logging.DEBUG,
+            "store.open",
+            db_path=self._db_path,
+            model=self._embed_model,
+            dim=self._dim,
+            quant=self._vector_quant,
+            schema_version=self._schema_version,
+        )
 
     @property
     def vector_quant(self) -> str:
@@ -423,6 +437,13 @@ class Store:
     def _migrate_schema(
         conn: sqlite3.Connection, current_version: int, target_version: int
     ) -> None:
+        log_event(
+            _LOGGER,
+            logging.INFO,
+            "store.migrate",
+            from_version=current_version,
+            to_version=target_version,
+        )
         conn.execute("BEGIN IMMEDIATE")
         try:
             for version in range(current_version, target_version):

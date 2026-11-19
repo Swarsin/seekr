@@ -9,6 +9,7 @@ daemon fast path lives inside ``get_hits`` without touching
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
@@ -17,6 +18,7 @@ from .client import DaemonError, DaemonMismatchError, try_daemon_search
 from .config import Config, load_config
 from .embed import build_embedder
 from .lifecycle import LifecycleError, lifecycle_lock
+from .logging_config import log_event
 from .models import Hit
 from .search import SEARCH_MODES, Searcher, SearchMode
 from .store import (
@@ -26,6 +28,8 @@ from .store import (
     Store,
     validate_schema_version,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import typer
@@ -46,7 +50,10 @@ def _read_only_connection(db_path: Path) -> sqlite3.Connection:
             timeout=5.0,
         )
     except sqlite3.Error as exc:
-        raise SearchError(f"cannot open index database {db_path}: {exc}") from exc
+        raise SearchError(
+            f"cannot open index database {db_path}: {exc}; verify the file is readable "
+            "or run `seekr reindex` to rebuild it"
+        ) from exc
 
 
 def _inspect_db(db_path: Path) -> tuple[dict[str, str] | None, bool]:
@@ -63,9 +70,15 @@ def _inspect_db(db_path: Path) -> tuple[dict[str, str] | None, bool]:
             if "no such table" in str(exc).lower():
                 meta = None
             else:
-                raise SearchError(f"cannot read index metadata from {db_path}: {exc}") from exc
+                raise SearchError(
+                    f"cannot read index metadata from {db_path}: {exc}; verify the file "
+                    "is readable or run `seekr reindex` to rebuild it"
+                ) from exc
         except sqlite3.DatabaseError as exc:
-            raise SearchError(f"cannot read index metadata from {db_path}: {exc}") from exc
+            raise SearchError(
+                f"cannot read index metadata from {db_path}: {exc}; verify the file "
+                "is readable or run `seekr reindex` to rebuild it"
+            ) from exc
 
         try:
             row = conn.execute(
@@ -76,9 +89,15 @@ def _inspect_db(db_path: Path) -> tuple[dict[str, str] | None, bool]:
             if "no such table" in str(exc).lower():
                 has_data = False
             else:
-                raise SearchError(f"cannot read index database {db_path}: {exc}") from exc
+                raise SearchError(
+                    f"cannot read index database {db_path}: {exc}; verify the file "
+                    "is readable or run `seekr reindex` to rebuild it"
+                ) from exc
         except sqlite3.DatabaseError as exc:
-            raise SearchError(f"cannot read index database {db_path}: {exc}") from exc
+            raise SearchError(
+                f"cannot read index database {db_path}: {exc}; verify the file "
+                "is readable or run `seekr reindex` to rebuild it"
+            ) from exc
     finally:
         conn.close()
     return meta, has_data
@@ -107,7 +126,8 @@ def _build_reranker(cfg: Config) -> Reranker:
         from .rerank import build_reranker
     except ImportError as exc:
         raise SearchError(
-            "reranking is not available in this build; omit --rerank"
+            "reranking is not available in this build; omit --rerank or install "
+            "sentence-transformers"
         ) from exc
     return build_reranker(cfg)
 
@@ -235,9 +255,26 @@ def _daemon_search(
         "path_prefix": path_prefix,
     }
     try:
-        return try_daemon_search(params, expected=expected)
+        hits = try_daemon_search(params, expected=expected)
     except DaemonMismatchError:
+        log_event(
+            _LOGGER,
+            logging.INFO,
+            "cli_search.daemon_mismatch",
+            db_path=cfg.db_path,
+            embed_model=cfg.embed_model,
+        )
         return None
+    if hits is not None:
+        log_event(
+            _LOGGER,
+            logging.DEBUG,
+            "cli_search.daemon_hit",
+            mode=mode,
+            k=k,
+            hits=len(hits),
+        )
+    return hits
 
 
 def get_hits(
@@ -297,6 +334,13 @@ def get_hits(
 
     # The lock covers the whole Store lifetime, so a concurrent reindex cannot
     # swap the database out from under an in-process search.
+    log_event(
+        _LOGGER,
+        logging.DEBUG,
+        "cli_search.local_open",
+        db_path=selected_cfg.db_path,
+        mode=mode,
+    )
     with lifecycle_lock(selected_cfg.db_path, shared=True):
         selected = _build_searcher(selected_cfg, mode, rerank)
         if selected is None:
@@ -364,7 +408,7 @@ def _build_search_command(typer_module: Any) -> Any:
         except ImportError as exc:
             _exit_error(f"search backend is unavailable: {exc}; run `seekr doctor`")
         except (OSError, sqlite3.Error) as exc:
-            _exit_error(f"cannot read the index: {exc}")
+            _exit_error(f"cannot read the index: {exc}; run `seekr doctor` or `seekr reindex`")
 
         if not hits:
             typer_module.echo("No results.")

@@ -11,8 +11,10 @@ from __future__ import annotations
 import errno
 import fnmatch
 import hashlib
+import logging
 import os
 import stat as stat_module
+import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -22,8 +24,11 @@ from . import extract as _extract_module
 from .chunking import ChunkingWarning, chunk
 from .config import Config
 from .extract import ExtractionError, ExtractionResult
+from .logging_config import log_event
 from .models import text_sha
 from .store import DocRow, StoredChunk
+
+_LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .embed import Embedder
@@ -179,6 +184,8 @@ class Indexer:
 
     def sync(self, roots: list[Path]) -> SyncReport:
         """Index every supported file below *roots*, then prune vanished files."""
+        started = time.monotonic()
+        log_event(_LOGGER, logging.INFO, "indexer.sync.start", roots=len(roots))
         report = SyncReport()
         seen: set[str] = set()
         healthy_roots: list[Path] = []
@@ -227,6 +234,19 @@ class Indexer:
                         f"could not persist last error count: {_error_text(exc)}",
                     )
                 )
+            log_event(
+                _LOGGER,
+                logging.INFO,
+                "indexer.sync.done",
+                added=report.added,
+                updated=report.updated,
+                unchanged=report.unchanged,
+                removed=report.removed,
+                skipped=report.skipped,
+                errors=len(report.errors),
+                warnings=len(report.warnings),
+                elapsed_ms=round((time.monotonic() - started) * 1000.0, 2),
+            )
         return report
 
     # -- scanning ----------------------------------------------------------

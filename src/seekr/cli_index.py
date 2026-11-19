@@ -73,7 +73,7 @@ def _stored_dim(cfg: Config) -> int | None:
 
 
 def _fatal(message: str) -> None:
-    typer.echo(f"seekr: {message}")
+    typer.echo(f"seekr: {message}", err=True)
     raise typer.Exit(code=1)
 
 
@@ -104,7 +104,10 @@ def index(
         raw_paths = paths if isinstance(paths, (list, tuple)) else None
         targets = [Path(item) for item in raw_paths] if raw_paths else list(cfg.roots)
         if not targets:
-            _fatal("no index roots configured; set roots in config or pass PATH")
+            _fatal(
+                "no index roots configured; add `roots = [...]` to config.toml "
+                "or pass PATH to `seekr index PATH`"
+            )
 
         embedder = _build_embedder(cfg)
         with lifecycle_lock(cfg.db_path, shared=True):

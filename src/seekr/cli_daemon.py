@@ -9,6 +9,7 @@ single watcher thread keeps the index current.
 
 from __future__ import annotations
 
+import logging
 import signal
 import sqlite3
 import threading
@@ -22,9 +23,12 @@ from .daemon import serve, socket_path
 from .embed import Embedder, build_embedder
 from .indexer import Indexer
 from .lifecycle import lifecycle_lock
+from .logging_config import log_event
 from .search import Searcher
 from .store import Store
 from .watcher import Watcher
+
+_LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import typer
@@ -150,13 +154,35 @@ def run_daemon(
                 # Start the observer first but hold the writer until the initial
                 # scan has finished, so events during startup are buffered and
                 # there is never more than one writer at a time.
+                log_event(
+                    _LOGGER,
+                    logging.INFO,
+                    "daemon.start",
+                    db_path=selected_cfg.db_path,
+                    socket=selected_socket,
+                    debounce_s=debounce_s,
+                    quant=selected_cfg.vector_quant,
+                )
                 watcher = Watcher(
                     indexer,
                     list(selected_cfg.roots),
                     debounce_s,
                 )
                 watcher.start(paused=True)
-                indexer.sync(list(selected_cfg.roots))
+                sync_report = indexer.sync(list(selected_cfg.roots))
+                if sync_report is not None:
+                    log_event(
+                        _LOGGER,
+                        logging.INFO,
+                        "daemon.sync_done",
+                        added=sync_report.added,
+                        updated=sync_report.updated,
+                        unchanged=sync_report.unchanged,
+                        removed=sync_report.removed,
+                        errors=len(sync_report.errors),
+                    )
+                else:
+                    log_event(_LOGGER, logging.INFO, "daemon.sync_done")
                 watcher.resume()
 
                 if embedder is None:
@@ -187,6 +213,7 @@ def run_daemon(
                     store.close()
                     store = None
     finally:
+        log_event(_LOGGER, logging.INFO, "daemon.stop", socket=selected_socket)
         restore_signals()
 
 

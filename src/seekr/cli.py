@@ -12,6 +12,7 @@ from . import (
     cli_open,
     cli_search,
 )
+from .logging_config import configure_logging
 
 app = typer.Typer(
     help="Local semantic search over your own files.",
@@ -34,8 +35,15 @@ def main(
         is_eager=True,
         help="Show the version and exit.",
     ),
+    verbose: bool = typer.Option(
+        False,
+        "-v",
+        "--verbose",
+        help="Enable structured diagnostic logs on stderr.",
+    ),
 ) -> None:
     """Local semantic search over your own files."""
+    configure_logging(verbose=verbose)
 
 
 @app.command()
