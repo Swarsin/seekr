@@ -13,8 +13,9 @@ import logging
 import re
 import time
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
+from .filters import normalise_kind
 from .logging_config import log_event
 from .models import Hit, HitExplain
 
@@ -151,10 +152,17 @@ def _keyword_search(
     match_query: str,
     limit: int,
     path_prefix: str | None,
+    kind: str | None = None,
+    since_mtime_ns: int | None = None,
 ) -> list[tuple[int, float]]:
-    if path_prefix is None:
-        return list(store.keyword_search(match_query, limit))
-    return list(store.keyword_search(match_query, limit, path_prefix=path_prefix))
+    kwargs: dict[str, Any] = {}
+    if path_prefix is not None:
+        kwargs["path_prefix"] = path_prefix
+    if kind is not None:
+        kwargs["kind"] = kind
+    if since_mtime_ns is not None:
+        kwargs["since_mtime_ns"] = since_mtime_ns
+    return list(store.keyword_search(match_query, limit, **kwargs))
 
 
 def _vector_search(
@@ -162,10 +170,17 @@ def _vector_search(
     query_vector: np.ndarray,
     limit: int,
     path_prefix: str | None,
+    kind: str | None = None,
+    since_mtime_ns: int | None = None,
 ) -> list[tuple[int, float]]:
-    if path_prefix is None:
-        return list(store.vector_search(query_vector, limit))
-    return list(store.vector_search(query_vector, limit, path_prefix=path_prefix))
+    kwargs: dict[str, Any] = {}
+    if path_prefix is not None:
+        kwargs["path_prefix"] = path_prefix
+    if kind is not None:
+        kwargs["kind"] = kind
+    if since_mtime_ns is not None:
+        kwargs["since_mtime_ns"] = since_mtime_ns
+    return list(store.vector_search(query_vector, limit, **kwargs))
 
 
 def _ranked_candidates(
@@ -175,6 +190,8 @@ def _ranked_candidates(
     query_vector: np.ndarray | None,
     limit: int,
     path_prefix: str | None,
+    kind: str | None = None,
+    since_mtime_ns: int | None = None,
 ) -> tuple[
     list[tuple[int, float]],
     dict[int, tuple[int, float]],
@@ -183,21 +200,23 @@ def _ranked_candidates(
 ]:
     """Return candidates plus per-retriever rank/score metadata.
 
-    Non-null ``path_prefix`` is forwarded to both store retrievers, which apply
-    exact component-aware filtering before their limit.  The Searcher therefore
-    never re-scopes or grows a global candidate window itself.
+    Document filters (``path_prefix``, ``kind``, ``since_mtime_ns``) are
+    forwarded to both store retrievers, which apply them before their limit.
+    The Searcher therefore never re-scopes or grows a global candidate window.
     """
     keyword_pairs: list[tuple[int, float]] = []
     vector_pairs: list[tuple[int, float]] = []
 
     if mode in ("keyword", "hybrid") and match_query:
         keyword_pairs = _keyword_search(
-            store, match_query, limit, path_prefix
+            store, match_query, limit, path_prefix, kind, since_mtime_ns
         )
 
     if mode in ("vector", "hybrid"):
         assert query_vector is not None
-        vector_pairs = _vector_search(store, query_vector, limit, path_prefix)
+        vector_pairs = _vector_search(
+            store, query_vector, limit, path_prefix, kind, since_mtime_ns
+        )
 
     keyword_info: dict[int, tuple[int, float]] = {}
     for rank, (raw_id, raw_score) in enumerate(keyword_pairs, start=1):
@@ -357,8 +376,10 @@ class Searcher:
         path_prefix: str | None = None,
         *,
         explain: bool = False,
+        kind: str | None = None,
+        since_mtime_ns: int | None = None,
     ) -> list[Hit]:
-        """Return up to ``k`` hits, capped per file and optionally path-scoped."""
+        """Return up to ``k`` hits, capped per file and optionally filtered."""
         return self.get_hits(
             query,
             k=k,
@@ -367,6 +388,8 @@ class Searcher:
             rerank=rerank,
             path_prefix=path_prefix,
             explain=explain,
+            kind=kind,
+            since_mtime_ns=since_mtime_ns,
         )
 
     def get_hits(
@@ -379,6 +402,8 @@ class Searcher:
         path_prefix: str | None = None,
         *,
         explain: bool = False,
+        kind: str | None = None,
+        since_mtime_ns: int | None = None,
     ) -> list[Hit]:
         """Pure retrieval entry point shared by the CLI and future ``pick``."""
         if mode not in SEARCH_MODES:
@@ -388,6 +413,11 @@ class Searcher:
             )
         if rerank and self.reranker is None:
             raise ValueError("rerank=True requires a reranker")
+        kind_val = normalise_kind(kind)
+        if since_mtime_ns is not None and (
+            isinstance(since_mtime_ns, bool) or not isinstance(since_mtime_ns, int)
+        ):
+            raise ValueError("since_mtime_ns must be an integer or None")
         started = time.monotonic()
         if k <= 0 or per_file <= 0:
             log_event(
@@ -456,7 +486,14 @@ class Searcher:
 
         with _snapshot(self.store):
             candidates, keyword_info, vector_info, rrf_scores = _ranked_candidates(
-                self.store, mode, match_query, query_vector, limit, prefix
+                self.store,
+                mode,
+                match_query,
+                query_vector,
+                limit,
+                prefix,
+                kind_val,
+                since_mtime_ns,
             )
             chunks = self.store.fetch_chunks(
                 [chunk_id for chunk_id, _ in candidates]

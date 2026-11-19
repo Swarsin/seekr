@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, NoReturn
 from .client import DaemonError, DaemonMismatchError, try_daemon_search
 from .config import Config, load_config
 from .embed import build_embedder
+from .filters import normalise_kind, parse_since
 from .lifecycle import LifecycleError, lifecycle_lock
 from .logging_config import log_event
 from .models import Hit, HitExplain
@@ -233,6 +234,8 @@ def _daemon_search(
     path_prefix: str | None,
     *,
     explain: bool = False,
+    kind: str | None = None,
+    since_mtime_ns: int | None = None,
 ) -> list[Hit] | None:
     """Try the warm daemon without opening a Store or loading any model.
 
@@ -260,6 +263,10 @@ def _daemon_search(
     }
     if explain:
         params["explain"] = True
+    if kind is not None:
+        params["kind"] = kind
+    if since_mtime_ns is not None:
+        params["since_mtime_ns"] = since_mtime_ns
     try:
         hits = try_daemon_search(params, expected=expected)
     except DaemonMismatchError:
@@ -292,6 +299,8 @@ def get_hits(
     path_prefix: str | None = None,
     *,
     explain: bool = False,
+    kind: str | None = None,
+    since: str | None = None,
     cfg: Config | None = None,
     searcher: Searcher | None = None,
 ) -> list[Hit]:
@@ -310,13 +319,21 @@ def get_hits(
         raise SearchError("k must be a positive integer")
     if per_file <= 0:
         raise SearchError("per-file must be a positive integer")
+    kind_val = normalise_kind(kind)
+    since_mtime_ns = parse_since(since)
     if not query.strip():
         # An empty or whitespace-only query can never match.  Short-circuit
         # before the daemon, config load or any embedder/store construction so
         # `seekr search ""` prints "No results." even on a model-less host.
         return []
 
-    searcher_kwargs: dict[str, Any] = {"explain": True} if explain else {}
+    searcher_kwargs: dict[str, Any] = {}
+    if explain:
+        searcher_kwargs["explain"] = True
+    if kind_val is not None:
+        searcher_kwargs["kind"] = kind_val
+    if since_mtime_ns is not None:
+        searcher_kwargs["since_mtime_ns"] = since_mtime_ns
     if searcher is not None:
         return searcher.get_hits(
             query,
@@ -338,6 +355,8 @@ def get_hits(
         rerank,
         path_prefix,
         explain=explain,
+        kind=kind_val,
+        since_mtime_ns=since_mtime_ns,
     )
     if daemon_hits is not None:
         return daemon_hits
@@ -419,6 +438,14 @@ def _build_search_command(typer_module: Any) -> Any:
         path_prefix: str | None = typer_module.Option(
             None, "--path", help="Only search under this path prefix."
         ),
+        kind: str | None = typer_module.Option(
+            None, "--kind", help="Filter by kind: pdf, code, markdown, transcript or text."
+        ),
+        since: str | None = typer_module.Option(
+            None,
+            "--since",
+            help="Only include files modified since duration (e.g. 7d, 12h) or ISO date.",
+        ),
         as_json: bool = typer_module.Option(
             False, "--json", help="Emit results as JSON."
         ),
@@ -430,6 +457,10 @@ def _build_search_command(typer_module: Any) -> Any:
         extra: dict[str, Any] = {}
         if explain:
             extra["explain"] = True
+        if kind is not None:
+            extra["kind"] = kind
+        if since is not None:
+            extra["since"] = since
         try:
             hits = get_hits(
                 query,

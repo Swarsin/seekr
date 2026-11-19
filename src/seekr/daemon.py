@@ -26,6 +26,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from .filters import normalise_kind
 from .models import Hit
 from .search import SEARCH_MODES
 
@@ -173,6 +174,15 @@ def _search_arguments(request: Mapping[str, Any]) -> dict[str, Any]:
     path_prefix = request.get("path_prefix")
     if path_prefix is not None and not isinstance(path_prefix, str):
         raise TypeError("path_prefix must be a string or null")
+    raw_kind = request.get("kind")
+    if raw_kind is not None and not isinstance(raw_kind, str):
+        raise TypeError("kind must be a string or null")
+    kind = normalise_kind(raw_kind)
+    since_mtime_ns = request.get("since_mtime_ns")
+    if since_mtime_ns is not None and (
+        isinstance(since_mtime_ns, bool) or not isinstance(since_mtime_ns, int)
+    ):
+        raise TypeError("since_mtime_ns must be an integer or null")
     arguments: dict[str, Any] = {
         "query": query,
         "k": _positive_int(request.get("k", 10), "k"),
@@ -183,6 +193,10 @@ def _search_arguments(request: Mapping[str, Any]) -> dict[str, Any]:
     }
     if explain:
         arguments["explain"] = True
+    if kind is not None:
+        arguments["kind"] = kind
+    if since_mtime_ns is not None:
+        arguments["since_mtime_ns"] = since_mtime_ns
     return arguments
 
 

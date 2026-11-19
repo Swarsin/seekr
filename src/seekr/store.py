@@ -242,6 +242,33 @@ def _path_prefix_clause(
     )
 
 
+def _document_filter_clause(
+    *,
+    path_prefix: str | None = None,
+    kind: str | None = None,
+    since_mtime_ns: int | None = None,
+    exclude_path: str | None = None,
+    alias: str = "d",
+) -> tuple[str, tuple[object, ...]]:
+    """Combine document-level path, kind, mtime and exclusion SQL predicates."""
+    clauses: list[str] = []
+    params: list[object] = []
+    prefix_sql, prefix_params = _path_prefix_clause(path_prefix, column=f"{alias}.path")
+    if prefix_sql:
+        clauses.append(prefix_sql)
+        params.extend(prefix_params)
+    if kind is not None:
+        clauses.append(f"{alias}.kind = ?")
+        params.append(str(kind))
+    if since_mtime_ns is not None:
+        clauses.append(f"{alias}.mtime_ns >= ?")
+        params.append(int(since_mtime_ns))
+    if exclude_path is not None:
+        clauses.append(f"{alias}.path != ?")
+        params.append(str(exclude_path))
+    return " AND ".join(clauses), tuple(params)
+
+
 def _rollback(conn: sqlite3.Connection) -> None:
     try:
         conn.execute("ROLLBACK")
@@ -776,16 +803,23 @@ class Store:
         limit: int,
         *,
         path_prefix: str | None = None,
+        kind: str | None = None,
+        since_mtime_ns: int | None = None,
     ) -> list[tuple[int, float]]:
         """Return ``(chunk_id, bm25)`` pairs, best (lowest bm25) first.
 
-        ``path_prefix`` is applied before the SQL limit, so the returned rows are
-        the best in-prefix matches rather than the best global matches filtered
-        afterwards.
+        Document filters (``path_prefix``, ``kind``, ``since_mtime_ns``) are
+        applied before the SQL limit, so returned rows are the best matching
+        hits rather than global hits filtered afterwards.
         """
         if limit <= 0 or not isinstance(match_query, str) or not match_query.strip():
             return []
-        clause, prefix_params = _path_prefix_clause(path_prefix, column="d.path")
+        clause, filter_params = _document_filter_clause(
+            path_prefix=path_prefix,
+            kind=kind,
+            since_mtime_ns=since_mtime_ns,
+            alias="d",
+        )
         with self._lock:
             conn = self._connection()
             try:
@@ -800,7 +834,7 @@ class Store:
                         ORDER BY score ASC, chunks_fts.rowid ASC
                         LIMIT ?
                         """,
-                        (match_query, *prefix_params, int(limit)),
+                        (match_query, *filter_params, int(limit)),
                     ).fetchall()
                 else:
                     rows = conn.execute(
@@ -835,10 +869,19 @@ class Store:
         limit: int,
         path_prefix: str | None,
         *,
+        kind: str | None = None,
+        since_mtime_ns: int | None = None,
+        exclude_path: str | None = None,
         value_expr: str = "?",
     ) -> list[tuple[object, ...]]:
         """Exact vector search using sqlite-vec's scalar L2 distance."""
-        clause, prefix_params = _path_prefix_clause(path_prefix, column="d.path")
+        clause, filter_params = _document_filter_clause(
+            path_prefix=path_prefix,
+            kind=kind,
+            since_mtime_ns=since_mtime_ns,
+            exclude_path=exclude_path,
+            alias="d",
+        )
         if clause:
             return conn.execute(
                 f"""
@@ -850,7 +893,7 @@ class Store:
                 ORDER BY distance ASC, v.rowid ASC
                 LIMIT ?
                 """,
-                (blob, *prefix_params, limit),
+                (blob, *filter_params, limit),
             ).fetchall()
         return conn.execute(
             f"""
@@ -869,11 +912,14 @@ class Store:
         limit: int,
         *,
         path_prefix: str | None = None,
+        kind: str | None = None,
+        since_mtime_ns: int | None = None,
+        exclude_path: str | None = None,
     ) -> list[tuple[int, float]]:
         """Return ``(chunk_id, distance)`` pairs, nearest first.
 
-        The canonical unfiltered path uses a vec0 KNN ``MATCH`` query.  A path
-        prefix, or a limit above sqlite-vec's KNN cap, uses the real
+        The canonical unfiltered path uses a vec0 KNN ``MATCH`` query.  Any
+        document filter, or a limit above sqlite-vec's KNN cap, uses the real
         ``vec_distance_L2`` scalar over the joined chunk/document rows so the
         filter is applied before top-k selection.
         """
@@ -886,11 +932,24 @@ class Store:
             raise ValueError(f"expected a {self._dim}-dimensional vector, got {array.shape}")
         blob = self._serialize(array)
         value_expr = "vec_int8(?)" if self._use_int8_sql else "?"
+        has_filter = (
+            path_prefix is not None
+            or kind is not None
+            or since_mtime_ns is not None
+            or exclude_path is not None
+        )
         with self._lock:
             conn = self._connection()
-            if path_prefix is not None or int(limit) > _VEC0_MAX_K:
+            if has_filter or int(limit) > _VEC0_MAX_K:
                 rows = self._vector_scalar_search(
-                    conn, blob, int(limit), path_prefix, value_expr=value_expr
+                    conn,
+                    blob,
+                    int(limit),
+                    path_prefix,
+                    kind=kind,
+                    since_mtime_ns=since_mtime_ns,
+                    exclude_path=exclude_path,
+                    value_expr=value_expr,
                 )
             else:
                 rows = conn.execute(

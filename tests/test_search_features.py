@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -11,13 +12,15 @@ import time
 import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
-from seekr import client, daemon
+from seekr import cli_search, client, daemon
 from seekr.cli import app
 from seekr.config import Config
 from seekr.embed import FakeEmbedder
+from seekr.filters import normalise_kind, parse_since
 from seekr.indexer import Indexer
 from seekr.models import Hit, HitExplain
 from seekr.search import Searcher
@@ -239,3 +242,155 @@ class CliJsonAndExplainTests(unittest.TestCase):
         self.assertIn("keyword=#1 (bm25=-3.5000)", text_res.output)
         self.assertIn("vector=#2 (dist=0.4100)", text_res.output)
         self.assertIn("rrf=0.0325", text_res.output)
+
+
+class FilterParsingTests(unittest.TestCase):
+    def test_normalise_kind_and_rejects_unknown(self) -> None:
+        self.assertIsNone(normalise_kind(None))
+        self.assertIsNone(normalise_kind("   "))
+        self.assertEqual(normalise_kind(" Code "), "code")
+        self.assertEqual(normalise_kind("PDF"), "pdf")
+        with self.assertRaises(ValueError) as raised:
+            normalise_kind("image")
+        self.assertIn("expected one of", str(raised.exception))
+
+    def test_parse_since_durations_and_iso_dates(self) -> None:
+        now = 1_700_000_000.0
+        self.assertIsNone(parse_since(None, now=now))
+        self.assertIsNone(parse_since("  ", now=now))
+        self.assertEqual(parse_since("30m", now=now), int((now - 1800) * 1_000_000_000))
+        self.assertEqual(parse_since("12h", now=now), int((now - 12 * 3600) * 1_000_000_000))
+        self.assertEqual(parse_since("7d", now=now), int((now - 7 * 86400) * 1_000_000_000))
+        self.assertEqual(parse_since("2w", now=now), int((now - 14 * 86400) * 1_000_000_000))
+
+        expected_iso = int(datetime.fromisoformat("2026-01-15").timestamp() * 1_000_000_000)
+        self.assertEqual(parse_since("2026-01-15"), expected_iso)
+
+        for bad in ("0d", "-3d", "yesterday", "2026-99-99"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                parse_since(bad, now=now)
+
+
+@unittest.skipUnless(_NEEDS_REAL_STORE, "numpy, sqlite-vec and FTS5 are required")
+class RealStoreFilterTests(unittest.TestCase):
+    def test_kind_and_since_filters_apply_before_topk_across_modes_and_daemon(self) -> None:
+        now = time.time()
+        recent_mtime = now - 600
+        old_mtime = now - 30 * 86400
+
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="seekr-flt-") as tmp:
+            base = Path(tmp)
+            root = base / "repo"
+            root.mkdir()
+            # Create > 50 (default candidate depth) markdown docs with higher term frequency
+            # so a post-limit filter would miss the code file completely.
+            for idx in range(55):
+                md_file = root / f"note_{idx:02d}.md"
+                md_file.write_text("zephyr signal " * 5, encoding="utf-8")
+                os.utime(md_file, (recent_mtime, recent_mtime))
+
+            code_recent = root / "solver.py"
+            code_recent.write_text("def solve():\n    return 'zephyr'\n", encoding="utf-8")
+            os.utime(code_recent, (recent_mtime, recent_mtime))
+
+            code_old = root / "legacy.py"
+            code_old.write_text("def legacy():\n    return 'zephyr'\n", encoding="utf-8")
+            os.utime(code_old, (old_mtime, old_mtime))
+
+            cfg = Config(roots=(root,), db_path=base / "index.db", embed_model="fake")
+            embedder = FakeEmbedder(dim=8)
+            store = Store(cfg.db_path, "fake", 8, vector_quant="int8")
+            try:
+                Indexer(store, embedder, cfg).sync([root])
+                searcher = Searcher(store, embedder)
+                recent_ns = int((now - 7 * 86400) * 1_000_000_000)
+
+                for mode in ("keyword", "vector", "hybrid"):
+                    with self.subTest(mode=mode):
+                        code_hits = searcher.get_hits(
+                            "zephyr",
+                            k=5,
+                            mode=mode,
+                            kind="code",
+                            since_mtime_ns=recent_ns,
+                        )
+                        self.assertEqual(
+                            [hit.path for hit in code_hits],
+                            [str(code_recent.resolve())],
+                        )
+
+                        all_code_hits = searcher.get_hits(
+                            "zephyr",
+                            k=5,
+                            mode=mode,
+                            kind="code",
+                        )
+                        self.assertEqual(
+                            {hit.path for hit in all_code_hits},
+                            {str(code_recent.resolve()), str(code_old.resolve())},
+                        )
+
+                with DaemonExplainRoundtripTests._running(searcher, base) as sock_path:
+                    daemon_hits = client.try_daemon_search(
+                        {
+                            "op": "search",
+                            "query": "zephyr",
+                            "k": 5,
+                            "mode": "hybrid",
+                            "per_file": 2,
+                            "rerank": False,
+                            "path_prefix": None,
+                            "kind": "code",
+                            "since_mtime_ns": recent_ns,
+                        },
+                        sock_path=sock_path,
+                    )
+                assert daemon_hits is not None
+                self.assertEqual([hit.path for hit in daemon_hits], [str(code_recent.resolve())])
+
+                with (
+                    mock.patch("seekr.cli_search._daemon_search", return_value=None),
+                    mock.patch("seekr.cli_search._build_searcher", return_value=searcher),
+                ):
+                    cli_hits = cli_search.get_hits(
+                        "zephyr",
+                        k=5,
+                        mode="keyword",
+                        kind="code",
+                        since="7d",
+                        cfg=cfg,
+                    )
+                    # Note: searcher was already closed by get_hits finally block above.
+                    self.assertEqual([hit.path for hit in cli_hits], [str(code_recent.resolve())])
+            finally:
+                store.close()
+
+
+@unittest.skipUnless(_HAS_TYPER, "typer is not installed")
+class CliFilterTests(unittest.TestCase):
+    def test_search_forwards_kind_and_since_and_rejects_bad_values(self) -> None:
+        from typer.testing import CliRunner
+
+        with mock.patch("seekr.cli_search.get_hits", return_value=[]) as get_hits:
+            ok = CliRunner().invoke(
+                app, ["search", "zephyr", "--kind", "code", "--since", "7d", "--json"]
+            )
+        self.assertEqual(ok.exit_code, 0, ok.output)
+        get_hits.assert_called_once_with(
+            "zephyr",
+            k=10,
+            mode="hybrid",
+            per_file=2,
+            rerank=False,
+            path_prefix=None,
+            kind="code",
+            since="7d",
+        )
+
+        bad_kind = CliRunner().invoke(app, ["search", "zephyr", "--kind", "audio"])
+        self.assertEqual(bad_kind.exit_code, 1)
+        self.assertIn("--kind", bad_kind.output)
+
+        bad_since = CliRunner().invoke(app, ["search", "zephyr", "--since", "notadate"])
+        self.assertEqual(bad_since.exit_code, 1)
+        self.assertIn("--since", bad_since.output)

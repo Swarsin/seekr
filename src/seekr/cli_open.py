@@ -60,8 +60,21 @@ def _build_pick_command(typer_module: Any) -> Any:
         path_prefix: str | None = typer_module.Option(
             None, "--path", help="Only search under this path prefix."
         ),
+        kind: str | None = typer_module.Option(
+            None, "--kind", help="Filter by kind: pdf, code, markdown, transcript or text."
+        ),
+        since: str | None = typer_module.Option(
+            None,
+            "--since",
+            help="Only include files modified since duration (e.g. 7d, 12h) or ISO date.",
+        ),
     ) -> None:
         """Print one pick line per hit, ready for dmenu or rofi."""
+        extra: dict[str, Any] = {}
+        if kind is not None:
+            extra["kind"] = kind
+        if since is not None:
+            extra["since"] = since
         try:
             hits = get_hits(
                 query,
@@ -70,6 +83,7 @@ def _build_pick_command(typer_module: Any) -> Any:
                 per_file=per_file,
                 rerank=rerank,
                 path_prefix=path_prefix,
+                **extra,
             )
         except _SEARCH_ERRORS as exc:
             _exit_error("pick", str(exc))
