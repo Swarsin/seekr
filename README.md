@@ -1,28 +1,20 @@
 # seekr
 
-seekr is a local-first search tool for your own notes, PDFs, code, and lecture
-transcripts. It combines exact keyword matching with semantic retrieval: FTS5
-finds error codes, function names, and module codes, while local sentence
-embeddings find passages that mean the same thing without sharing words. All
-text, vectors, and rankings stay in one SQLite file on your machine. After the
-one-time model download, indexing and querying make no network calls, and an
-optional warm daemon keeps the models loaded so repeated searches stay fast.
+seekr is a local-first search tool for your own notes, PDFs, code, and lecture transcripts. It combines exact keyword matching with semantic retrieval: FTS5 finds error codes, function names, and identifiers, while local sentence embeddings find passages that mean the same thing without sharing words. All text, vectors, and rankings live in one SQLite file on your machine. After one-time local model caching, indexing and querying make no network calls, and seekr ships with a warm Unix-socket query daemon plus a stdio MCP server (`seekr mcp`) for coding agents.
 
 ## Quickstart
 
-Requires Python 3.11+ on Linux with SQLite extension support.
+Requires Python 3.11+ on Linux with SQLite loadable extension support.
 
 ```bash
 # Install the CLI and its runtime dependencies.
 pipx install .
 
 # One-time model provisioning, outside seekr. seekr itself never downloads
-# models implicitly; this step needs network access and populates the Hugging
-# Face cache used by the local loader. This uses the interpreter in pipx's app
-# venv; adjust the path if PIPX_HOME is set.
+# models implicitly; this populates the local Hugging Face cache.
 ~/.local/pipx/venvs/seekr/bin/python -c 'from sentence_transformers import SentenceTransformer; SentenceTransformer("BAAI/bge-small-en-v1.5")'
 
-# Tell seekr where your files live.
+# Configure your roots in ~/.config/seekr/config.toml.
 mkdir -p ~/.config/seekr
 cat > ~/.config/seekr/config.toml <<'EOF'
 roots = ["~/notes", "~/Documents/coursework"]
@@ -30,16 +22,35 @@ EOF
 
 seekr doctor
 seekr index
+seekr status
 seekr search "how do I checkpoint a WAL database?"
 ```
 
-`seekr doctor` checks FTS5 and sqlite-vec before you build an index. `seekr
-index` defaults to the configured `roots`; you can also pass paths explicitly.
-`seekr search` prints the path, locator, score, and a short snippet for each
-hit.
+Useful search, inspection, and discovery workflows:
 
-The optional cross-encoder reranker needs its own cached model. It is only used
-with `--rerank` or in the `hybrid+rerank` evaluation mode:
+```bash
+# Filter by mode, path prefix, document kind, or modification recency
+seekr search "migration" --kind code --since 7d --path ~/projects/app
+
+# Machine-readable JSON output + per-retriever rank/score attribution
+seekr search "checkpoint" --json --explain
+
+# Find indexed files semantically related to a file (reuses stored vectors if indexed)
+seekr similar ~/notes/sqlite-wal.md -k 5 --kind markdown
+
+# Rich index/model/daemon status (or --json) and structured stderr diagnostics
+seekr status --json
+seekr --verbose search "wal"
+
+# Interactive picker/opener (PDFs open in zathura; code/Markdown open in $EDITOR)
+seekr pick "database locking"
+seekr open "/home/me/notes/sqlite.md:L42"
+
+# Shell completions
+seekr completion bash   # also: zsh, fish
+```
+
+The optional cross-encoder reranker requires its own cached model and is invoked with `--rerank` or in `seekr eval`:
 
 ```bash
 ~/.local/pipx/venvs/seekr/bin/python -c 'from sentence_transformers import CrossEncoder; CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")'
@@ -49,46 +60,43 @@ seekr search "gradient descent" --rerank
 ## Architecture
 
 ```text
-PDF / Markdown / text / code / transcripts
+PDF / Markdown / text / code / transcripts (UTF-8, UTF-8/UTF-16 BOM, latin-1 fallback)
                   │
                   ▼
         extract text units + locators
                   │
                   ▼
-  chunk: word windows, heading sections,
+  chunk: word windows (300/450/50), heading sections,
   tree-sitter AST chunks, transcript cues
                   │
                   ▼
-  embed chunks locally (BAAI/bge-small-en-v1.5,
-  384-d float32, L2-normalised)
+  batched embed locally (BAAI/bge-small-en-v1.5, 384-d L2-normalised,
+  int8 quantized by default in sqlite-vec)
                   │
                   ▼
-        one SQLite index file
-        ├── documents + chunks + metadata
-        ├── chunks_fts (FTS5, porter unicode61)
-        └── chunks_vec (sqlite-vec vec0 KNN)
+        one SQLite WAL index (schema v2)
+        ├── documents (indexed on kind, mtime_ns) + chunks + meta
+        ├── chunks_fts (external-content FTS5, porter unicode61)
+        └── chunks_vec (sqlite-vec vec0 KNN + scalar filters)
                   ▲
                   │
-query ──► add query prefix, embed locally
-          ├──► FTS5 BM25 top-k ──────┐
-          └──► vec0 L2 KNN top-k ────┴──► reciprocal rank fusion
-                                             │
-                                             ▼
-                                  optional cross-encoder rerank
-                                             │
-                                             ▼
-                                  hits with page / line / heading
+query ──► BGE query prefix + embed locally
+          ├──► FTS5 BM25 (path/kind/since SQL filters) ──┐
+          └──► vec0 KNN or filtered scalar L2 search ────┴──► RRF (k=60)
+                                                                 │
+                                                                 ▼
+                                                      optional cross-encoder rerank
+                                                                 │
+                                                                 ▼
+                                         CLI (text / --json / --explain),
+                                         warm Unix daemon, or `seekr mcp`
 ```
 
-The index is incremental. Each chunk is keyed by a hash of its normalised text,
-so unchanged chunks are never re-embedded. A relocated file keeps its chunk
-IDs and vectors when its content is unchanged. The watcher and daemon reuse the
-same `Store`/`Searcher` code as the CLI.
+Indexing is incremental and batched (up to 64 files / 128 chunks per transaction): each chunk is keyed by a SHA-256 of its normalised text, so unchanged chunks reuse stored vectors across edits and renames. Schema version tracking (`schema_version = 2`) migrates legacy `float32` databases safely inside an atomic transaction.
 
 ## Configuration
 
-The config file is `$XDG_CONFIG_HOME/seekr/config.toml` (usually
-`~/.config/seekr/config.toml`). Missing keys use the defaults shown here:
+The config file lives at `$XDG_CONFIG_HOME/seekr/config.toml` (usually `~/.config/seekr/config.toml`). Missing keys use these defaults:
 
 ```toml
 roots = ["~/notes", "~/Documents/coursework"]
@@ -97,146 +105,131 @@ roots = ["~/notes", "~/Documents/coursework"]
 # max_file_bytes = 20000000
 # embed_model = "BAAI/bge-small-en-v1.5"
 # rerank_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+# vector_quant = "int8"          # or "float32"
 # chunk_target_words = 300
 # chunk_max_words = 450
 # chunk_overlap_words = 50
 ```
 
-`seekr index PATH...` indexes specific paths; `seekr status` reports document
-and chunk counts. Search modes are `keyword`, `vector`, and `hybrid` (the
-default). Useful flags include `--mode`, `--k`, `--per-file`, `--path`, and
-`--rerank`.
+Existing `float32` databases remain readable after upgrading; switching `vector_quant` on an existing DB prompts you to run `seekr reindex`.
 
-To open a result at its location, use `pick` and `open`:
+## MCP Server for Coding Agents (`seekr mcp`)
 
-```bash
-seekr pick "database locking"
-seekr open "/home/me/notes/sqlite.md:L42"
+`seekr mcp` runs a newline-delimited JSON-RPC 2.0 MCP server over `stdin`/`stdout` with zero model downloads and clean stderr-only diagnostics. It exposes two tools:
+
+- `search` — `query` (required), `k`, `mode` (`keyword`/`vector`/`hybrid`), `per_file`, `rerank`, `path`, `kind`, `since`, `explain`
+- `similar` — `path` (required), `k`, `per_file`, `path_prefix`, `kind`, `since`
+
+Example MCP client configuration (Claude Desktop, Cursor, or any stdio MCP host):
+
+```json
+{
+  "mcpServers": {
+    "seekr": {
+      "command": "seekr",
+      "args": ["mcp"]
+    }
+  }
+}
 ```
 
-PDFs open in zathura at the page when available; code and Markdown open in
-`$EDITOR` at the line (nvim by default); other results use `xdg-open`.
+If seekr is installed inside a dedicated virtualenv (such as pipx), set `"command"` to `~/.local/bin/seekr` or that environment's `seekr` binary.
 
-## Evaluation
+## Benchmarks & Ablations
 
-All benchmark numbers below were measured on an AMD Ryzen 9 3900X (24 logical CPUs), 31 GiB RAM, and NVIDIA GeForce RTX 3070 (CUDA, PyTorch 2.15.0+cu132, Python 3.12.15, SQLite 3.53.1, sqlite-vec v0.1.9).
+All numbers below were measured on an AMD Ryzen 9 3900X (24 logical CPUs), 31 GiB RAM, NVIDIA GeForce RTX 3070 (8 GiB, CUDA), Python 3.12.15, SQLite 3.53.1, `sqlite-vec v0.1.9`, PyTorch 2.15.0+cu132, and `sentence-transformers 6.3.0`. Full experiment logs live in [`docs/experiments.md`](docs/experiments.md).
 
-### Retrieval quality (BEIR SciFact & NFCorpus)
+### Retrieval quality (BEIR SciFact, NFCorpus, and FiQA)
 
-Download and convert the datasets once, then run all four retrieval modes:
+Reproduce the dataset evaluations (converters download only when invoked without `--no-download`):
 
 ```bash
-python eval/beir_scifact.py
-seekr eval \
-  --root eval/data/scifact/corpus \
-  --queries eval/data/scifact/queries.jsonl \
-  --modes keyword,vector,hybrid,hybrid+rerank \
-  --out bench/scifact-results.md
-
-python eval/beir_nfcorpus.py
-seekr eval \
-  --root eval/data/nfcorpus/corpus \
-  --queries eval/data/nfcorpus/queries.jsonl \
-  --modes keyword,vector,hybrid,hybrid+rerank \
-  --out bench/nfcorpus-results.md
+python eval/beir_scifact.py && seekr eval --root eval/data/scifact/corpus --queries eval/data/scifact/queries.jsonl --out bench/scifact-results.md
+python eval/beir_nfcorpus.py && seekr eval --root eval/data/nfcorpus/corpus --queries eval/data/nfcorpus/queries.jsonl --out bench/nfcorpus-results.md
+python eval/beir_fiqa.py && seekr eval --root eval/data/fiqa/corpus --queries eval/data/fiqa/queries.jsonl --out bench/fiqa-results.md
 ```
 
-**BEIR SciFact** (5,183 documents, 300 queries; `BAAI/bge-small-en-v1.5`, `cross-encoder/ms-marco-MiniLM-L-6-v2`):
+Measured with the current `int8` default (`BAAI/bge-small-en-v1.5`, `cross-encoder/ms-marco-MiniLM-L-6-v2` on top 30):
 
-| mode | recall@5 | recall@10 | mrr@10 | ndcg@10 | p50_ms |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| keyword | 0.7387 | 0.8078 | 0.6547 | 0.6866 | 14.21 |
-| vector | 0.7590 | 0.8379 | 0.6853 | 0.7159 | 23.94 |
-| **hybrid** | **0.7806** | **0.8701** | **0.6962** | **0.7318** | **32.54** |
-| hybrid+rerank | 0.7499 | 0.8322 | 0.6669 | 0.7010 | 119.88 |
+| Dataset | Mode | recall@5 | recall@10 | mrr@10 | ndcg@10 | p50_ms | Wall Time |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SciFact (`5,183` docs, `300` q) | keyword | 0.7387 | 0.8078 | 0.6547 | 0.6866 | 14.20 | 91.38 s |
+| SciFact | vector | 0.7623 | 0.8262 | 0.6822 | 0.7109 | 23.77 | 91.38 s |
+| SciFact | **hybrid** | **0.7872** | **0.8712** | **0.6960** | **0.7320** | **31.26** | 91.38 s |
+| SciFact | hybrid+rerank | 0.7532 | 0.8356 | 0.6673 | 0.7020 | 118.78 | 91.38 s |
+| NFCorpus (`3,633` docs, `323` q) | keyword | 0.1228 | 0.1553 | 0.5224 | 0.3214 | 3.28 | 76.59 s |
+| NFCorpus | vector | 0.1266 | 0.1626 | 0.5253 | 0.3410 | 20.87 | 76.59 s |
+| NFCorpus | **hybrid** | **0.1372** | **0.1744** | **0.5666** | **0.3632** | **17.45** | 76.59 s |
+| NFCorpus | hybrid+rerank | 0.1393 | 0.1693 | 0.5842 | 0.3570 | 105.20 | 76.59 s |
+| FiQA (`57,638` docs, `648` q) | keyword | 0.2384 | 0.3044 | 0.3000 | 0.2447 | 72.13 | 501.65 s |
+| FiQA | **vector** | **0.3771** | **0.4536** | **0.4818** | **0.3963** | **46.83** | 501.65 s |
+| FiQA | hybrid | 0.3513 | 0.4412 | 0.4285 | 0.3589 | 118.78 | 501.65 s |
+| FiQA | hybrid+rerank | 0.3780 | 0.4482 | 0.4446 | 0.3761 | 187.93 | 501.65 s |
 
-**BEIR NFCorpus** (3,633 documents, 323 queries; same models):
+3-dataset macro-average `ndcg@10`: `keyword 0.4176`, `vector 0.4827`, `hybrid 0.4847`, `hybrid+rerank 0.4784`. To evaluate your own workspace files, see [`docs/eval.md`](docs/eval.md) and the sample fixture under `eval/example/`.
 
-| mode | recall@5 | recall@10 | mrr@10 | ndcg@10 | p50_ms |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| keyword | 0.1228 | 0.1553 | 0.5224 | 0.3214 | 3.26 |
-| vector | 0.1267 | 0.1614 | 0.5316 | 0.3427 | 22.35 |
-| **hybrid** | **0.1376** | **0.1733** | **0.5694** | **0.3642** | **24.48** |
-| hybrid+rerank | 0.1389 | 0.1695 | 0.5842 | 0.3569 | 106.30 |
+### Retrieval ablations (single-variable)
 
-### Retrieval ablations
+Controlled single-variable sweeps on SciFact + NFCorpus (`hybrid` baseline: `0.7318` / `0.3642`, macro-avg `0.5480` on `float32`; keep threshold: `+1.00` pt macro-avg gain without `> 0.50` pt loss on either dataset):
 
-Controlled single-variable ablations against the default `hybrid` baseline (`0.7318` SciFact, `0.3642` NFCorpus, macro-avg `0.5480`; full tables in [`docs/experiments.md`](docs/experiments.md)):
-
-| Experiment | Variant | SciFact ndcg@10 | NFCorpus ndcg@10 | Avg ndcg@10 | ΔAvg (pts) | Decision |
+| Variable | Variant | SciFact ndcg@10 | NFCorpus ndcg@10 | Macro-Avg | ΔAvg (pts) | Outcome |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| Baseline | `bge-small-en-v1.5`, 300/50 chunks, RRF k=60, `porter unicode61` | 0.7318 | 0.3642 | 0.5480 | 0.00 | Default |
+| Baseline | `bge-small-en-v1.5`, 300/50, RRF k=60, `porter unicode61` | 0.7318 | 0.3642 | 0.5480 | 0.00 | Kept default |
 | Chunking | 150 words / 50 overlap | 0.7223 | 0.3686 | 0.5455 | -0.25 | Reverted |
-| Chunking | 300 words / 0 overlap | 0.7349 | 0.3655 | 0.5502 | +0.22 | Reverted (< +1.0 pt) |
+| Chunking | 300 words / 0 overlap | 0.7349 | 0.3655 | 0.5502 | +0.22 | Not adopted (< +1.0 pt) |
 | Chunking | 450 words / 50 overlap | 0.7305 | 0.3649 | 0.5477 | -0.03 | Reverted |
 | Headers | Prepend filename + heading path (BEIR IDs) | 0.7232 | 0.3635 | 0.5433 | -0.47 | Reverted |
-| Fusion | RRF `k=10` | 0.7362 | 0.3662 | 0.5512 | +0.32 | Reverted (< +1.0 pt) |
-| Fusion | Min-max score linear fusion (`alpha_kw=0.5`) | 0.7357 | 0.3640 | 0.5499 | +0.19 | Reverted (< +1.0 pt) |
-| Rerank | Direct cross-encoder replacement (top 30) | 0.7010 | 0.3569 | 0.5289 | -1.91 | Opt-in only (`--rerank`) |
+| Fusion | RRF `k=10` | 0.7362 | 0.3662 | 0.5512 | +0.32 | Not adopted (< +1.0 pt) |
+| Fusion | Min-max score linear fusion (`alpha_kw=0.5`) | 0.7357 | 0.3640 | 0.5499 | +0.19 | Not adopted (< +1.0 pt) |
+| Rerank | Direct cross-encoder replacement (top 30) | 0.7010 | 0.3569 | 0.5289 | -1.91 | Opt-in (`--rerank`) |
 | Rerank | RRF blend (first-stage hybrid + CE, top 30) | 0.7297 | 0.3641 | 0.5469 | -0.11 | Logged |
-| Prefix | BGE query prefix OFF | 0.7414 | 0.3626 | 0.5520 | +0.40 | Reverted (vector NF -0.53) |
+| Prefix | BGE query prefix OFF | 0.7414 | 0.3626 | 0.5520 | +0.40 | Reverted (NF vec -0.53) |
 | FTS5 | `unicode61` without Porter stemmer | 0.7107 | 0.3555 | 0.5331 | -1.49 | Reverted |
+| BM25 cols | `(header, body)` weights `2.0, 1.0` | 0.7340 | 0.3643 | 0.5492 | +0.12 | Not adopted (< +1.0 pt) |
 | Model | `BAAI/bge-base-en-v1.5` (768-d, 102.9 chunks/s) | 0.7411 | 0.3745 | 0.5578 | +0.98 | Opt-in config |
-| Model | `sentence-transformers/all-MiniLM-L6-v2` (384-d, 878.8 chunks/s) | 0.7185 | 0.3530 | 0.5357 | -1.23 | Rejected |
-| Model | `intfloat/e5-small-v2` (`query:`/`passage:`, 256.4 chunks/s) | 0.7321 | 0.3510 | 0.5415 | -0.65 | Rejected |
+| Model | `sentence-transformers/all-MiniLM-L6-v2` (384-d) | 0.7185 | 0.3530 | 0.5357 | -1.23 | Rejected |
+| Model | `intfloat/e5-small-v2` (`query:`/`passage:`) | 0.7321 | 0.3510 | 0.5415 | -0.65 | Rejected |
 
-To evaluate your own notes instead, see [`docs/eval.md`](docs/eval.md) for the query JSONL format and guidance on writing roughly 50 file-level queries. A small versioned example corpus lives at `eval/example/`.
-
-### Retrieval latency
+### Latency, indexing throughput, quantization, and 100k scale
 
 ```bash
 python bench/latency.py --chunks 20000
 ```
 
-Measured on 20,000 synthetic chunks (500 documents, 384-d float32, 50 queries per mode after warm-up; [`bench/latency-results.md`](bench/latency-results.md)):
+**Before vs. after performance engineering & `int8` quantization:**
 
-| Measurement | p50 | p95 | Notes |
+| Benchmark | Baseline (`float32`) | Current (`int8`, batched) | Change |
 | --- | ---: | ---: | --- |
-| Keyword retrieval (FTS5 BM25) | 1.41 ms | 1.54 ms | Excludes embedding |
-| Vector retrieval (sqlite-vec float32) | 12.04 ms | 13.05 ms | Excludes embedding |
-| Hybrid retrieval (RRF k=60) | 14.12 ms | 14.53 ms | Excludes embedding |
-| Query embedding (`BAAI/bge-small-en-v1.5`, CUDA) | 10.17 ms | 11.02 ms | Measured separately |
+| SciFact fresh `Indexer.sync` (5,183 docs / 5,820 chunks, CUDA) | 86.555 s (67.2 chunks/s) | **26.432 s** (220.2 chunks/s) | **3.27x faster** |
+| SciFact unchanged re-sync (5,183 files) | 2.269 s | **0.122 s** | **18.6x faster** |
+| Cold `seekr daemon` time to `ping` ready | 7.282 s | **0.349 s** | **20.9x faster** |
+| SciFact index DB size | 24.17 MiB | **17.41 MiB** | **-28.0%** |
+| 20k synthetic `keyword` p50 / p95 (excl. embed) | 1.41 / 1.54 ms | **1.35 / 1.51 ms** | — |
+| 20k synthetic `vector` p50 / p95 (excl. embed) | 12.04 / 13.05 ms | **8.48 / 8.98 ms** | **1.42x / 1.45x faster** |
+| 20k synthetic `hybrid` p50 / p95 (excl. embed) | 14.12 / 14.53 ms | **10.96 / 11.39 ms** | **1.29x / 1.28x faster** |
+| 20k synthetic populate time / DB size (`bench/latency.py`) | 2.09 s / 44.88 MiB (`float32` opt.) | **1.83 s / 22.35 MiB** | **2.01x smaller DB** |
+| 20k peak process RSS (incl. CUDA model) | 1327.5 MiB | **1330.5 MiB** | Flat |
 
-Real end-to-end indexing of BEIR SciFact (5,183 files / 5,820 chunks) with `BAAI/bge-small-en-v1.5` on CUDA took 86.555 s (`59.88 docs/sec`, `67.24 chunks/sec`), producing a 24.17 MiB SQLite index at 1411.4 MiB peak RSS.
+Query embedding latency (`BAAI/bge-small-en-v1.5`, CUDA, 50 warm queries) measured `10.17 / 11.02 ms` (`bench/latency-results.md` Phase 0) and `18.32 / 19.65 ms` (Phase 2 run; higher tail variance across isolated runs).
 
-## Design decisions
+**100,000-chunk scale test (`tests/test_scale_100k.py`, `@pytest.mark.slow`, `int8`):** `2,500` documents × `40` chunks (`100,000` chunks) populated in `9.11 s` (`10,977 chunks/sec`), producing a `110.45 MiB` database with warm query latencies `keyword 4.35 / 5.00 ms`, `vector 41.39 / 42.55 ms`, and `hybrid 44.37 / 46.38 ms` (p50 / p95 over 30 queries).
 
-- **Hybrid retrieval with reciprocal rank fusion (RRF).** Keyword search gives
-  exactness for identifiers, error strings, and code names; vector search gives
-  recall for paraphrases. Fusing ranked lists with `1 / (60 + rank)` avoids
-  calibrating BM25 and L2 scores against each other and is stable when one
-  retriever returns a shorter list. The reranker is optional and sees the top
-  30 fused candidates, so it cannot dominate normal query latency.
-- **SQLite with FTS5 and sqlite-vec.** One owned file replaces a database
-  server, a keyword engine, and a vector service. Transactions keep documents,
-  chunks, FTS rows, and vectors consistent; WAL allows the daemon and a reindex
-  to coordinate through the lifecycle lock. FTS5 is an external-content table,
-  so chunk text is stored once. sqlite-vec's `vec0` table provides the KNN
-  path. There is intentionally no silent vector fallback: `seekr doctor`
-  reports a missing extension before indexing.
-- **Chunk-level embedding reuse.** A SHA-256 of normalised chunk text identifies
-  unchanged content. Reindexing only embeds new or changed chunks; renames and
-  moves reuse the existing vectors. Chunk IDs (and their vectors) survive
-  explicit `move_path` calls and live watcher move events; a rename discovered
-  only by a bulk scan reuses content-addressed vectors but may assign new
-  document and chunk IDs. This is the difference between a useful incremental
-  tool and re-embedding the entire corpus after every edit.
-- **Asymmetric query prefix.** Documents are embedded as-is; queries get the
-  exact prefix `Represent this sentence for searching relevant passages: `.
-  The model and dimension are recorded in the index metadata. A mismatch stops
-  the search and tells you to run `seekr reindex`, so vectors from different
-  models are never mixed.
-- **Chunking.** Prose uses a 300-word target, 450-word maximum, and 50-word
-  overlap so passages remain focused without losing cross-boundary context.
-  Markdown chunks carry heading paths (`§A > B`); code uses tree-sitter
-  function/class chunks with a 60-line fallback; transcripts group cues and
-  keep the first timestamp. Every hit carries a locator suitable for opening
-  the source at the right place.
+## Design Decisions & What Did Not Work
 
-## Daemon and desktop integration
+### What works well
+- **RRF (`k=60`) over FTS5 + `sqlite-vec`:** Calibrates unbounded BM25 scores and L2 vector distances without score-scale fitting, lifting macro-average `ndcg@10` on SciFact+NFCorpus from `0.5040` (keyword) / `0.5293` (vector) to `0.5480`.
+- **`int8` vector quantization by default (`min(500, max(127, 25*sqrt(dim)))`):** Cuts 20k DB size in half (`44.88 -> 22.35 MiB`), speeds vector queries by ~`1.67x` over post-opt `float32`, and loses only `0.06` pts macro-avg `ndcg@10` on SciFact+NFCorpus (`0.5480 -> 0.5474`, and `0.5476` in full post-Phase-2 `seekr eval`).
+- **Batched indexing + deferred daemon prewarm:** Batching GPU embedding and SQLite commits across 64 files / 128 chunks cut SciFact cold sync from `86.555 s` to `26.432 s`; precomputing stat/ignore fast paths cut no-op syncs by `18.6x`; binding the daemon socket before background embedder warmup cut cold daemon readiness by `20.9x` (`7.282 s -> 0.349 s`).
+- **Chunk-hash vector reuse + zero-model `seekr similar`:** Identical chunk text never re-embeds across edits or renames, and `seekr similar` on an indexed file pools stored DB vectors without loading PyTorch.
 
-A warm daemon keeps the embedding model and SQLite page cache loaded and
-watches the configured roots:
+### What did not work (and was reverted or kept opt-in)
+- **Binary (`bit`) quantization:** Regressed hybrid `ndcg@10` by `-1.93` pts macro-avg (`0.5287`) and vector-only by `-7.41` pts (`0.4552`), failing the `< 1` pt loss gate.
+- **Replacing RRF order directly with `ms-marco-MiniLM-L-6-v2`:** Hurt `ndcg@10` on scientific/medical corpora (SciFact `-3.08` pts, NFCorpus `-0.73` pts) due to domain mismatch, though it helped FiQA (`+1.72` pts over `hybrid`). Remains opt-in via `--rerank`.
+- **Prepending filename/heading headers unconditionally:** Regressed SciFact+NFCorpus (`-0.47` pts macro-avg) because ID-style filenames add lexical noise and break path-independent `text_sha` deduplication.
+- **Dropping Porter stemming in FTS5:** Dropped macro-avg `hybrid` `ndcg@10` by `-1.49` pts (`0.5480 -> 0.5331`).
+- **Heavier defaults (`bge-base-en-v1.5`) or lighter models (`all-MiniLM-L6-v2`, `e5-small-v2`):** `bge-base-en-v1.5` gained `+0.98` pts hybrid at `2.5x` slower indexing and `+37%` DB size (kept configurable); `MiniLM` (`-1.23` pts) and `e5-small-v2` (`-0.65` pts) trailed `bge-small-en-v1.5`.
+
+## Daemon and Desktop Integration
 
 ```bash
 seekr daemon
@@ -244,17 +237,13 @@ seekr daemon
 seekr search "lecture 4 backpropagation"
 ```
 
-The CLI tries the daemon first and falls back to a one-shot local search when no
-daemon is listening. The socket is `$XDG_RUNTIME_DIR/seekr.sock` (or
-`/tmp/seekr-<uid>.sock`), mode `0600`. Configured roots are watched for
-creates, edits, deletes, and renames with per-path debounce.
+The CLI uses `$XDG_RUNTIME_DIR/seekr.sock` (or `/tmp/seekr-<uid>.sock`, mode `0600`, bound atomically via sibling temp socket + `link`) when listening and falls back to one-shot local search otherwise. Configured roots are watched for creates, edits, deletes, and renames with per-path debounce.
 
 ### systemd user unit
 
 ```bash
 mkdir -p ~/.config/systemd/user
 cp contrib/seekr.service ~/.config/systemd/user/seekr.service
-# Edit ExecStart if pipx installed seekr somewhere other than ~/.local/bin.
 systemctl --user daemon-reload
 systemctl --user enable --now seekr.service
 journalctl --user -u seekr -f
@@ -262,35 +251,15 @@ journalctl --user -u seekr -f
 
 ### Hyprland rofi popup
 
-`contrib/seekr-popup.sh` asks rofi for a query, asks rofi to choose one pick line,
-and opens the result at its locator:
-
 ```bash
 install -m 755 contrib/seekr-popup.sh ~/.local/bin/seekr-popup
 ```
 
-Add a binding to `~/.config/hypr/hyprland.conf`:
+Add `bind = $mainMod, S, exec, ~/.local/bin/seekr-popup` to `~/.config/hypr/hyprland.conf` (requires `rofi`; opens PDFs in `zathura`, code/Markdown in `$EDITOR`, other files via `xdg-open`).
 
-```ini
-bind = $mainMod, S, exec, ~/.local/bin/seekr-popup
-```
+## Offline Guarantee
 
-It requires `rofi`; PDF page opening uses `zathura` when present, code and
-Markdown use `$EDITOR`, and other files use `xdg-open`. The popup script's
-interactive rofi flow is verified manually; automated tests cover the pick/open
-wiring and locator parsing.
-
-## Offline guarantee
-
-After the models are cached, seekr has no reason and no path to the network at
-index or query time. Model loading is centralised in `seekr.offline`, which sets
-`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, disables telemetry, and passes
-`local_files_only=True`; a missing cache entry raises an actionable error rather
-than downloading. Indexing, searching, the daemon, and the latency benchmark
-only read local files and the local SQLite database. The one intentional
-network operation is the explicit, opt-in `eval/beir_scifact.py` dataset
-download; `--no-download` forbids even that and fails with instructions if the
-source files are absent.
+After models are cached, seekr never accesses the network at index, query, daemon, or MCP time. `seekr.offline` sets `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, disables telemetry, passes `local_files_only=True`, and rejects `trust_remote_code`. Missing local caches fail with explicit remediation steps. Network access is strictly limited to the explicit BEIR downloaders in `eval/beir_*.py` (which accept `--no-download`).
 
 ## Development
 
@@ -298,31 +267,19 @@ source files are absent.
 pip install -e ".[dev]"
 ruff check .
 pytest -m "not slow"
-pytest -m slow          # real models, sqlite-vec, and longer benchmarks
+pytest -m slow          # real cached models, sqlite-vec int8, and 100k scale test
 ```
 
-The default suite is offline and uses fake embedders/rerankers. CI runs Python
-3.11 and 3.12 on Ubuntu with the same lint and non-slow test commands. The
-performance smoke test uses a real sqlite-vec index and skips with an explicit
-reason when the vector backend is unavailable rather than passing without
-measuring.
+CI (`.github/workflows/ci.yml`) runs `ruff check .` and `pytest -m "not slow"` on Python 3.11 and 3.12 on Ubuntu.
 
 ## Limitations
 
-These are deliberate v1 non-goals:
-
-- No OCR for scanned PDFs.
-- No web UI, cloud sync, or multi-user mode.
-- Linux only; Windows and macOS are not supported.
-- No LLM answer generation: seekr finds passages, it does not write answers.
-- No image or screenshot search.
-- No MCP server (planned post-v1).
-
-Also note that a Python/SQLite build with loadable extension support is
-required. If `seekr doctor` reports a missing extension feature, use a Python
-build that includes it (for example a uv-managed CPython). Transcript search
-does not yet jump to video timestamps; that and the other post-v1 ideas are
-tracked in the implementation plan.
+- No OCR for scanned image PDFs (extracts embedded text only).
+- Linux only (`AF_UNIX`, `SO_PEERCRED`, and `fcntl.flock` lifecycle locks); Windows and macOS are not supported.
+- No LLM answer generation — seekr retrieves and locates source passages rather than synthesizing prose answers.
+- `OR`-joined multi-term FTS5 queries scan long posting lists on large conversational corpora (e.g., FiQA `keyword p50 = 72.13 ms`).
+- Filtered vector queries (`--path`, `--kind`, `--since`, `seekr similar`) use sqlite-vec's exact `vec_distance_L2` scalar scan so filters apply before top-k selection, scaling linearly with matching chunk count.
+- Transcript locators format timestamps in `open` links as labels without seeking external media players.
 
 ## License
 
