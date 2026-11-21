@@ -78,6 +78,10 @@ def _is_busy_error(exc: BaseException) -> bool:
 
 
 def _socket_is_live(path: Path) -> bool:
+    from .daemon import socket_path_problem
+
+    if socket_path_problem(path) is not None:
+        return False
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     probe.settimeout(_DAEMON_PROBE_TIMEOUT)
     try:

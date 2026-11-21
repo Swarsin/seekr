@@ -974,6 +974,24 @@ def test_daemon_socket_liveness_is_a_real_unix_probe(tmp_path: Path) -> None:
         listener.close()
 
 
+def test_socket_is_live_returns_false_for_long_path(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    config_path = _write_config(tmp_path, roots=[root])
+    deep = tmp_path / ("d" * 120)
+    deep.mkdir()
+    long_sock = deep / "seekr.sock"
+    assert _socket_is_live(long_sock) is False
+    with _service(
+        config_path,
+        tmp_path,
+        daemon_socket_path=long_sock,
+        daemon_probe=_socket_is_live,
+    ) as service:
+        assert service.daemon_present() is False
+        assert service.status().daemon["present"] is False
+        assert service.search(SearchRequest("alpha", mode="keyword")).hits == ()
+
+
 def test_search_corrupt_mismatched_and_older_schema_codes(tmp_path: Path) -> None:
     corrupt_db = tmp_path / "corrupt.db"
     corrupt_db.write_bytes(b"not sqlite")

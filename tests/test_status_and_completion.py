@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -129,3 +130,67 @@ class PolishedStatusTests(unittest.TestCase):
         self.assertEqual(parsed["chunks"], 0)
         self.assertEqual(parsed["last_error_count"], 0)
         self.assertFalse(parsed["daemon"]["running"])
+
+    def test_status_reports_stopped_for_long_socket_path(self) -> None:
+        from typer.testing import CliRunner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            runtime_dir = base / ("r" * 120)
+            runtime_dir.mkdir()
+            cfg = Config(db_path=base / "missing.db", embed_model="fake")
+            env = {
+                "XDG_RUNTIME_DIR": str(runtime_dir),
+                "XDG_CONFIG_HOME": str(base / "config"),
+                "XDG_DATA_HOME": str(base / "data"),
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch("seekr.cli_index._load_config", return_value=cfg),
+            ):
+                runner = CliRunner()
+                result = runner.invoke(app, ["status"])
+                json_result = runner.invoke(app, ["status", "--json"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("daemon: stopped", result.output)
+        self.assertIn("socket path too long", result.output)
+        self.assertIn(str(runtime_dir / "seekr.sock"), result.output)
+
+        self.assertEqual(json_result.exit_code, 0, json_result.output)
+        parsed = json.loads(json_result.stdout)
+        self.assertFalse(parsed["daemon"]["running"])
+
+    def test_status_existing_db_reports_stopped_for_long_socket_path(self) -> None:
+        from typer.testing import CliRunner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "repo"
+            root.mkdir()
+            (root / "notes.md").write_text("# Doc\n\nhello world", encoding="utf-8")
+            db_path = base / "index.db"
+            cfg = Config(roots=(root,), db_path=db_path, embed_model="fake")
+            store = Store(db_path, "fake", 8)
+            try:
+                Indexer(store, FakeEmbedder(dim=8), cfg).sync([root])
+            finally:
+                store.close()
+
+            runtime_dir = base / ("r" * 120)
+            runtime_dir.mkdir()
+            env = {
+                "XDG_RUNTIME_DIR": str(runtime_dir),
+                "XDG_CONFIG_HOME": str(base / "config"),
+                "XDG_DATA_HOME": str(base / "data"),
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch("seekr.cli_index._load_config", return_value=cfg),
+            ):
+                result = CliRunner().invoke(app, ["status"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("daemon: stopped", result.output)
+        self.assertIn("socket path too long", result.output)
+        self.assertIn(str(runtime_dir / "seekr.sock"), result.output)

@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .daemon import MAX_RESPONSE_BYTES, socket_path
+from .daemon import MAX_RESPONSE_BYTES, socket_path, socket_path_problem
 from .models import Hit, HitExplain
 
 __all__ = ["DaemonError", "DaemonMismatchError", "try_daemon_search"]
@@ -48,6 +48,9 @@ def _connect(path: Path, timeout: float) -> socket.socket | None:
         raise DaemonError("daemon timeout must be a number") from exc
     if not math.isfinite(timeout_value) or timeout_value < 0:
         raise DaemonError("daemon timeout must be a non-negative finite number")
+
+    if socket_path_problem(path) is not None:
+        return None
 
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     connection.settimeout(timeout_value)

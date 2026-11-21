@@ -1096,5 +1096,86 @@ class ConfigFastPathUnitTests(unittest.TestCase):
         load.assert_called_once_with()
 
 
+class SocketPathLimitTests(unittest.TestCase):
+    def _long_path(self, tmp: str | Path) -> Path:
+        deep = Path(tmp) / ("d" * 120)
+        deep.mkdir()
+        return deep / "seekr.sock"
+
+    def test_problem_reported_for_long_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            msg = daemon.socket_path_problem(self._long_path(tmp))
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertIn("socket path too long", msg)
+
+    def test_short_path_has_no_problem(self) -> None:
+        self.assertIsNone(daemon.socket_path_problem(Path("/tmp/seekr.sock")))
+
+    def test_exact_length_boundary_matches_af_unix_limit(self) -> None:
+        at_limit = Path("/" + "a" * (daemon.AF_UNIX_PATH_MAX - 1))
+        over_limit = Path("/" + "a" * daemon.AF_UNIX_PATH_MAX)
+        self.assertEqual(len(os.fsencode(str(at_limit))), daemon.AF_UNIX_PATH_MAX)
+        self.assertIsNone(daemon.socket_path_problem(at_limit))
+        self.assertIsNone(daemon.socket_path_problem(str(at_limit)))
+        problem = daemon.socket_path_problem(over_limit)
+        self.assertEqual(
+            problem,
+            f"socket path too long ({daemon.AF_UNIX_PATH_MAX + 1} bytes, "
+            f"limit {daemon.AF_UNIX_PATH_MAX})",
+        )
+        # Byte length, not character count, determines AF_UNIX sun_path overflow.
+        multibyte = Path("/" + "é" * 54)
+        encoded_len = len(os.fsencode(str(multibyte)))
+        if encoded_len > daemon.AF_UNIX_PATH_MAX:
+            self.assertEqual(
+                daemon.socket_path_problem(multibyte),
+                f"socket path too long ({encoded_len} bytes, limit {daemon.AF_UNIX_PATH_MAX})",
+            )
+
+    def test_socket_is_active_false_for_long_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(daemon._socket_is_active(self._long_path(tmp)))
+
+    def test_try_daemon_search_returns_none_for_long_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(
+                client.try_daemon_search({"query": "x"}, sock_path=self._long_path(tmp))
+            )
+
+    def test_serve_refuses_long_path(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            self.assertRaises(daemon.DaemonError) as raised,
+        ):
+            daemon._bind_listener(self._long_path(tmp))
+        message = str(raised.exception)
+        self.assertIn("socket path too long", message)
+        self.assertIn("XDG_RUNTIME_DIR", message)
+
+    def test_search_falls_back_to_local_when_xdg_runtime_dir_is_long(self) -> None:
+        expected = [_hit("/notes/local.md")]
+        searcher = mock.Mock()
+        searcher.store = mock.Mock()
+        searcher.get_hits.return_value = expected
+        with tempfile.TemporaryDirectory() as tmp:
+            long_runtime_dir = Path(tmp) / ("r" * 120)
+            long_runtime_dir.mkdir()
+            cfg = Config(db_path=Path(tmp) / "index.db", embed_model="fake")
+            with (
+                mock.patch.dict(
+                    os.environ, {"XDG_RUNTIME_DIR": str(long_runtime_dir)}, clear=False
+                ),
+                mock.patch("seekr.cli_search.lifecycle_lock"),
+                mock.patch(
+                    "seekr.cli_search._build_searcher", return_value=searcher
+                ) as build_searcher,
+            ):
+                hits = cli_search.get_hits("alpha", mode="keyword", cfg=cfg)
+        self.assertEqual(hits, expected)
+        build_searcher.assert_called_once_with(cfg, "keyword", False)
+        searcher.store.close.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()

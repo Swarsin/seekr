@@ -31,13 +31,17 @@ from .models import Hit
 from .search import SEARCH_MODES
 
 __all__ = [
+    "AF_UNIX_PATH_MAX",
     "MAX_REQUEST_BYTES",
     "MAX_RESPONSE_BYTES",
     "DaemonError",
     "serve",
     "socket_path",
+    "socket_path_problem",
 ]
 
+# Usable bytes of sockaddr_un.sun_path on Linux (108 bytes minus trailing NUL).
+AF_UNIX_PATH_MAX: int = 107
 _SOCKET_MODE = 0o600
 _ACCEPT_TIMEOUT = 0.2
 _PROBE_TIMEOUT = 0.2
@@ -58,6 +62,14 @@ def socket_path() -> Path:
     if runtime_dir:
         return Path(runtime_dir).expanduser() / "seekr.sock"
     return Path("/tmp") / f"seekr-{os.getuid()}.sock"
+
+
+def socket_path_problem(path: Path | str) -> str | None:
+    """Return a problem description if *path* exceeds ``AF_UNIX_PATH_MAX`` bytes."""
+    length = len(os.fsencode(os.fspath(path)))
+    if length > AF_UNIX_PATH_MAX:
+        return f"socket path too long ({length} bytes, limit {AF_UNIX_PATH_MAX})"
+    return None
 
 
 def _error_text(exc: BaseException) -> str:
@@ -366,6 +378,8 @@ def _serve_connection(
 
 
 def _socket_is_active(path: Path) -> bool:
+    if socket_path_problem(path) is not None:
+        return False
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     probe.settimeout(_PROBE_TIMEOUT)
     try:
@@ -398,6 +412,9 @@ def _remove_owned_socket(path: Path, identity: tuple[int, int] | None) -> None:
 
 
 def _bind_listener(path: Path) -> tuple[socket.socket, tuple[int, int]]:
+    problem = socket_path_problem(path)
+    if problem is not None:
+        raise DaemonError(f"{problem}; set XDG_RUNTIME_DIR to a shorter directory")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:

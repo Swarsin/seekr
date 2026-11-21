@@ -160,13 +160,25 @@ def reindex(
 
 
 def _daemon_status() -> tuple[bool, Path]:
-    from .daemon import _socket_is_active, socket_path
+    from .daemon import _socket_is_active, socket_path, socket_path_problem
 
     sock = socket_path()
+    if socket_path_problem(sock) is not None:
+        return False, sock
     try:
         return _socket_is_active(sock), sock
     except OSError:
         return False, sock
+
+
+def _format_daemon_status(daemon_running: bool, sock: Path) -> str:
+    if daemon_running:
+        return f"daemon: running ({sock})"
+    from .daemon import socket_path_problem
+
+    if socket_path_problem(sock) is not None:
+        return f"daemon: stopped (socket path too long: {sock})"
+    return f"daemon: stopped ({sock})"
 
 
 def _db_size_bytes(db_path: Path) -> int:
@@ -230,9 +242,7 @@ def status(
                     typer.echo("last error count: 0")
                     typer.echo(f"database: {db_path} (not initialized)")
                     typer.echo(f"model: {cfg.embed_model} (quant={cfg.vector_quant})")
-                    typer.echo(
-                        f"daemon: {'running' if daemon_running else 'stopped'} ({sock})"
-                    )
+                    typer.echo(_format_daemon_status(daemon_running, sock))
                     return
                 dim = _build_embedder(cfg).dim
 
@@ -292,7 +302,7 @@ def status(
     if isinstance(kinds, dict) and kinds:
         summary = ", ".join(f"{name}={count}" for name, count in kinds.items())
         typer.echo(f"by kind: {summary}")
-    typer.echo(f"daemon: {'running' if daemon_running else 'stopped'} ({sock})")
+    typer.echo(_format_daemon_status(daemon_running, sock))
 
 
 def register(app: typer.Typer) -> None:
