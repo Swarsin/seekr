@@ -3,13 +3,13 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "seekr"
-version = "0.1.0"
+name = "seekr-search"
+version = "0.1.1"
 description = "Offline hybrid semantic and keyword search over your own files"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
-authors = [{ name = "seekr contributors" }]
+authors = [{ name = "Swarsin" }]
 keywords = [
     "local-first",
     "offline",
@@ -49,19 +49,21 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "build>=1.2",
     "hypothesis>=6.100",
     "pytest>=7",
     "ruff>=0.5",
+    "twine>=5",
 ]
 
 [project.scripts]
 seekr = "seekr.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/seekr/seekr"
-Repository = "https://github.com/seekr/seekr"
-Issues = "https://github.com/seekr/seekr/issues"
-Documentation = "https://github.com/seekr/seekr#readme"
+Homepage = "https://github.com/Swarsin/seekr"
+Repository = "https://github.com/Swarsin/seekr"
+Issues = "https://github.com/Swarsin/seekr/issues"
+Documentation = "https://github.com/Swarsin/seekr#readme"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
