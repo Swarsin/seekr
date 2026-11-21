@@ -290,6 +290,7 @@ class Store:
         dim: int,
         *,
         vector_quant: str | None = None,
+        read_only: bool = False,
     ) -> None:
         if not isinstance(embed_model, str) or not embed_model.strip():
             raise ValueError("embed_model must be a non-empty string")
@@ -304,6 +305,7 @@ class Store:
         self._db_path = Path(db_path)
         self._embed_model = embed_model
         self._dim = dim
+        self._read_only = bool(read_only)
         self._stubbed_backend = (
             _load_vector_extension is not _DEFAULT_LOAD_VECTOR_EXTENSION
             or _create_vector_table is not _DEFAULT_CREATE_VECTOR_TABLE
@@ -315,6 +317,24 @@ class Store:
         self._conn: sqlite3.Connection | None = None
         self._tx_depth = 0
 
+        if self._read_only:
+            self._open_read_only()
+        else:
+            self._open_writable(dim)
+
+        log_event(
+            _LOGGER,
+            logging.DEBUG,
+            "store.open",
+            db_path=self._db_path,
+            model=self._embed_model,
+            dim=self._dim,
+            quant=self._vector_quant,
+            schema_version=self._schema_version,
+            read_only=self._read_only,
+        )
+
+    def _open_writable(self, dim: int) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(
             str(self._db_path),
@@ -345,18 +365,99 @@ class Store:
         except BaseException:
             conn.close()
             raise
-
         self._conn = conn
-        log_event(
-            _LOGGER,
-            logging.DEBUG,
-            "store.open",
-            db_path=self._db_path,
-            model=self._embed_model,
-            dim=self._dim,
-            quant=self._vector_quant,
-            schema_version=self._schema_version,
+
+    def _open_read_only(self) -> None:
+        """Open an existing index without writing, migrating or loading vectors."""
+        uri = f"{self._db_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=2.0,
+            isolation_level=None,
+            check_same_thread=False,
         )
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("PRAGMA busy_timeout=2000")
+            self._validate_read_only_metadata(conn)
+        except BaseException:
+            conn.close()
+            raise
+        self._conn = conn
+
+    def _validate_read_only_metadata(self, conn: sqlite3.Connection) -> None:
+        """Validate schema/metadata with SELECTs only; never migrate."""
+        names = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        required = {"documents", "chunks", "chunks_fts", "meta"}
+        missing = sorted(required - names)
+        if missing:
+            raise sqlite3.OperationalError(
+                "index database is missing required table(s): " + ", ".join(missing)
+            )
+
+        rows = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+        stored_version = validate_schema_version(rows)
+        if stored_version < SCHEMA_VERSION:
+            raise SchemaVersionError(
+                f"index database uses schema version {stored_version}, which is older "
+                f"than supported version {SCHEMA_VERSION}; run `seekr reindex` to "
+                "rebuild it (read-only mode does not migrate)"
+            )
+
+        stored_model = rows.get("embed_model")
+        stored_dim = rows.get("dim")
+        if stored_model is None and stored_dim is None:
+            if self._has_indexed_data(conn):
+                raise ModelMismatchError(
+                    "index database has no recorded embedding model; "
+                    "run `seekr reindex` to rebuild it"
+                )
+        elif stored_model is None or stored_dim is None:
+            raise ModelMismatchError(
+                "index database has incomplete embedding metadata; "
+                "run `seekr reindex` to rebuild it"
+            )
+        else:
+            try:
+                stored_dim_value = int(stored_dim)
+            except (TypeError, ValueError):
+                stored_dim_value = 0
+            if stored_model != self._embed_model or stored_dim_value != self._dim:
+                raise ModelMismatchError(
+                    "index database was built with embedding model "
+                    f"{stored_model!r} (dim {stored_dim}), but this configuration uses "
+                    f"{self._embed_model!r} (dim {self._dim}); "
+                    "run `seekr reindex` to rebuild it"
+                )
+            stored_quant = rows.get("vector_quant", "float32")
+            if stored_quant not in VECTOR_QUANTS:
+                raise ModelMismatchError(
+                    f"index database has unsupported vector quantization {stored_quant!r}; "
+                    "run `seekr reindex` to rebuild it"
+                )
+            if self._requested_vector_quant is None:
+                self._vector_quant = stored_quant
+            elif self._requested_vector_quant != stored_quant:
+                raise ModelMismatchError(
+                    f"index database uses vector quantization {stored_quant!r}, but "
+                    f"this configuration uses {self._requested_vector_quant!r}; "
+                    "run `seekr reindex` to rebuild it"
+                )
+
+        self._schema_version = stored_version
+
+    @property
+    def read_only(self) -> bool:
+        """Return whether this Store was opened in read-only mode."""
+        return self._read_only
+
+    def _reject_write(self) -> None:
+        if self._read_only:
+            raise RuntimeError("store is read-only")
 
     @property
     def vector_quant(self) -> str:
@@ -408,6 +509,8 @@ class Store:
         be rolled back without discarding successful outer work, and an outer
         failure discards everything.
         """
+        if write:
+            self._reject_write()
         with self._lock:
             conn = self._connection()
             depth = self._tx_depth
@@ -576,6 +679,7 @@ class Store:
         kind: str,
     ) -> int:
         """Insert a document or update its metadata, returning its stable id."""
+        self._reject_write()
         with self._lock:
             conn = self._connection()
             with self.transaction(write=True):
@@ -645,6 +749,7 @@ class Store:
         to have verified that the file content is unchanged.  A missing source
         raises ``KeyError``; an already indexed destination raises ``ValueError``.
         """
+        self._reject_write()
         source = str(src)
         destination = str(dst)
         with self._lock:
@@ -670,6 +775,7 @@ class Store:
 
     def replace_chunks(self, doc_id: int, chunks: list[StoredChunk]) -> None:
         """Atomically replace every chunk, FTS row and vector for a document."""
+        self._reject_write()
         items = list(chunks)
         with self._lock:
             conn = self._connection()
@@ -712,6 +818,7 @@ class Store:
 
     def delete_document(self, path: str) -> None:
         """Delete a document and explicitly purge its chunks, FTS and vector rows."""
+        self._reject_write()
         with self._lock:
             conn = self._connection()
             with self.transaction(write=True):
@@ -923,6 +1030,8 @@ class Store:
         ``vec_distance_L2`` scalar over the joined chunk/document rows so the
         filter is applied before top-k selection.
         """
+        if self._read_only:
+            raise RuntimeError("store is read-only: vector search unavailable")
         if limit <= 0:
             return []
         import numpy as np
@@ -1054,6 +1163,7 @@ class Store:
 
     def set_last_error_count(self, n: int) -> None:
         """Persist the number of errors from the most recent indexing run."""
+        self._reject_write()
         count = int(n)
         if count < 0:
             raise ValueError("last error count must be non-negative")

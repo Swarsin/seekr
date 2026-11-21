@@ -728,6 +728,53 @@ class CliFastPathTests(unittest.TestCase):
         self.assertEqual(hits, [])
         build_searcher.assert_not_called()
 
+    def test_try_daemon_hits_roundtrips_without_opening_local_backends(self) -> None:
+        searcher = _FakeSearcher(
+            metadata={
+                "db_path": str(self.cfg.db_path.resolve()),
+                "embed_model": self.cfg.embed_model,
+            }
+        )
+
+        def daemon_call(params, expected=None):
+            return client.try_daemon_search(
+                params, sock_path=sock_path, expected=expected
+            )
+
+        with (
+            _running_server(searcher, self.tmp) as (sock_path, *_),
+            mock.patch(
+                "seekr.cli_search.try_daemon_search", side_effect=daemon_call
+            ),
+            mock.patch("seekr.cli_search.build_embedder") as build_embedder,
+            mock.patch("seekr.cli_search.Store") as store,
+            mock.patch("seekr.cli_search.lifecycle_lock") as lock,
+        ):
+            hits = cli_search.try_daemon_hits("alpha", mode="keyword", cfg=self.cfg)
+
+        self.assertEqual(hits, searcher.hits)
+        build_embedder.assert_not_called()
+        store.assert_not_called()
+        lock.assert_not_called()
+        self.assertEqual(searcher.calls[0]["query"], "alpha")
+
+    def test_try_daemon_hits_returns_none_without_a_listener(self) -> None:
+        missing = self.tmp / "missing.sock"
+
+        def daemon_call(params, expected=None):
+            return client.try_daemon_search(
+                params, sock_path=missing, expected=expected
+            )
+
+        with (
+            mock.patch("seekr.cli_search.try_daemon_search", side_effect=daemon_call),
+            mock.patch("seekr.cli_search._build_searcher") as build_searcher,
+        ):
+            hits = cli_search.try_daemon_hits("alpha", cfg=self.cfg)
+
+        self.assertIsNone(hits)
+        build_searcher.assert_not_called()
+
 
 class DaemonRunnerTests(unittest.TestCase):
     def test_run_daemon_holds_the_shared_lock_for_store_and_watcher(self) -> None:

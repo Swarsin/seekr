@@ -57,6 +57,38 @@ The optional cross-encoder reranker requires its own cached model and is invoked
 seekr search "gradient descent" --rerank
 ```
 
+## Local web interface
+
+A browser workspace is available for folder setup, indexing, and search without
+the terminal syntax:
+
+```bash
+seekr web                    # http://127.0.0.1:8000
+seekr web --port 8000        # choose the port explicitly
+seekr web --open-browser     # also open a browser tab
+```
+
+Open `http://127.0.0.1:8000` if `--open-browser` was not used; press Ctrl+C in
+the terminal to stop the server, which waits for an active index run to finish.
+The page adds an existing folder by local path, checks local model readiness,
+starts an asynchronous incremental index update, and searches with folder,
+file-type, recency, and result-count filters. Each result offers **Copy
+location**. Adding a folder only saves it to the config; use **Update index** to
+read its files.
+
+The server listens only on `127.0.0.1`, emits no CORS headers, and collects no
+telemetry. Local browser-to-server HTTP traffic is permitted and is the only
+network activity the web interface adds; outbound network calls remain absent,
+and neither the web app nor the browser downloads models. If a
+`seekr daemon` is running, it owns indexing: the page disables **Update index**,
+so stop the daemon before a web-initiated scan. A newly added folder is saved
+immediately, but a running daemon must be restarted before daemon-backed
+searches see it. This release does not support removing roots, native
+opening/preview, or uploads, and remains Linux-only.
+
+See [`docs/web.md`](docs/web.md) for the novice walkthrough and
+[`docs/web-api.md`](docs/web-api.md) for the local API contract.
+
 ## Architecture
 
 ```text

@@ -1120,6 +1120,129 @@ class RealSqliteVecTests(unittest.TestCase):
         self.assertIn("seekr reindex", str(raised.exception))
 
 
+@unittest.skipUnless(_HAS_NUMPY, "numpy is required for the vector store tests")
+class ReadOnlyStoreTests(_FakeBackendTestCase):
+    def _ready(self) -> Store:
+        store = self.open_store()
+        _add_document(
+            store,
+            "/notes/a.md",
+            _stored_chunk("readonlyword", 1, locator="L1", loc_start=1.0),
+        )
+        store.close()
+        return store
+
+    def _open_read_only(self, *, model: str = "test/model", dim: int = 8) -> Store:
+        store = Store(self.db_path, model, dim, read_only=True)
+        self.addCleanup(store.close)
+        return store
+
+    def test_read_only_opens_and_reads_without_writes(self) -> None:
+        self._ready()
+        store = self._open_read_only()
+
+        self.assertTrue(store.read_only)
+        self.assertEqual(store.stats(), {"documents": 1, "chunks": 1})
+        self.assertTrue(store.has_chunks())
+        self.assertEqual(store.get_document("/notes/a.md").id, 1)
+        self.assertEqual(store.list_paths(), ["/notes/a.md"])
+        self.assertEqual(store.get_last_error_count(), 0)
+        hits = store.keyword_search("readonlyword", 10)
+        self.assertEqual(len(hits), 1)
+        chunk = store.fetch_chunks([hits[0][0]])[hits[0][0]]
+        self.assertEqual(chunk.text, "readonlyword")
+        with store.transaction():
+            self.assertEqual(store.stats()["chunks"], 1)
+
+        query_only = store._conn.execute("PRAGMA query_only").fetchone()
+        busy_timeout = store._conn.execute("PRAGMA busy_timeout").fetchone()
+        self.assertEqual(int(query_only[0]), 1)
+        self.assertEqual(int(busy_timeout[0]), 2000)
+
+    def test_every_write_path_raises_before_sql(self) -> None:
+        self._ready()
+        store = self._open_read_only()
+
+        with (
+            self.assertRaisesRegex(RuntimeError, "store is read-only"),
+            store.transaction(write=True),
+        ):
+            pass
+        with self.assertRaisesRegex(RuntimeError, "store is read-only"):
+            store.upsert_document("/notes/b.md", 1, 1, "b" * 64, "text")
+        with self.assertRaisesRegex(RuntimeError, "store is read-only"):
+            store.move_document("/notes/a.md", "/notes/b.md", mtime_ns=1, size=1)
+        with self.assertRaisesRegex(RuntimeError, "store is read-only"):
+            store.replace_chunks(1, [])
+        with self.assertRaisesRegex(RuntimeError, "store is read-only"):
+            store.delete_document("/notes/a.md")
+        with self.assertRaisesRegex(RuntimeError, "store is read-only"):
+            store.set_last_error_count(1)
+
+        self.assertEqual(store.stats(), {"documents": 1, "chunks": 1})
+        self.assertEqual(len(store.keyword_search("readonlyword", 10)), 1)
+
+    def test_vector_search_is_explicitly_unavailable(self) -> None:
+        self._ready()
+        store = self._open_read_only()
+
+        with self.assertRaisesRegex(
+            RuntimeError, "store is read-only: vector search unavailable"
+        ):
+            store.vector_search([0.0] * 8, 5)
+
+    def test_missing_database_never_creates_parent_or_file(self) -> None:
+        missing = Path(self._tmp.name) / "nested" / "missing.db"
+
+        with self.assertRaises(sqlite3.Error):
+            Store(missing, "test/model", 8, read_only=True)
+
+        self.assertFalse(missing.parent.exists())
+
+    def test_corrupt_database_raises_sqlite_error(self) -> None:
+        self.db_path.write_bytes(b"this is not a sqlite database")
+
+        with self.assertRaises(sqlite3.DatabaseError):
+            Store(self.db_path, "test/model", 8, read_only=True)
+
+    def test_older_schema_raises_without_migrating(self) -> None:
+        self._ready()
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(SchemaVersionError):
+            Store(self.db_path, "test/model", 8, read_only=True)
+
+        connection = sqlite3.connect(self.db_path)
+        try:
+            version = connection.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(version, ("1",))
+
+    def test_model_mismatch_raises_and_leaves_database_untouched(self) -> None:
+        self._ready()
+
+        with self.assertRaises(ModelMismatchError):
+            Store(self.db_path, "other/model", 8, read_only=True)
+
+        store = self._open_read_only()
+        self.assertEqual(store.stats(), {"documents": 1, "chunks": 1})
+
+    def test_normal_mode_still_writes_and_migrates(self) -> None:
+        writable = self.open_store()
+        doc_id = writable.upsert_document("/notes/new.md", 1, 1, "c" * 64, "text")
+        self.assertGreater(doc_id, 0)
+        self.assertFalse(writable.read_only)
+        self.assertEqual(writable.stats()["documents"], 1)
+
+
 class VectorExtensionLoaderTests(unittest.TestCase):
     def test_loader_enables_and_disables_extension_loading(self) -> None:
         events: list[object] = []

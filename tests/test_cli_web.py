@@ -1,0 +1,295 @@
+"""Tests for the ``seekr web`` launcher without requiring the web service."""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import socket
+import subprocess
+import sys
+import threading
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from seekr import cli_web
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+_HAS_TYPER = importlib.util.find_spec("typer") is not None
+
+pytestmark = pytest.mark.skipif(not _HAS_TYPER, reason="typer is not installed")
+
+
+class CleanupBackend:
+    """Minimal backend used only to observe lifecycle cleanup."""
+
+    def __init__(self) -> None:
+        self.shutdown_calls = 0
+        self.close_calls = 0
+
+    def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class RecordingRun:
+    def __init__(self, *, url: str = "http://127.0.0.1:54321", code: int = 0) -> None:
+        self.url = url
+        self.code = code
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(
+        self,
+        backend: Any,
+        *,
+        port: int,
+        open_browser: bool,
+        stop_event: threading.Event,
+        on_listen: Any,
+        on_browser_error: Any,
+    ) -> int:
+        self.calls.append(
+            {
+                "backend": backend,
+                "port": port,
+                "open_browser": open_browser,
+                "stop_event": stop_event,
+                "on_listen": on_listen,
+                "on_browser_error": on_browser_error,
+            }
+        )
+        on_listen(self.url)
+        return self.code
+
+
+def _runner() -> Any:
+    from typer.testing import CliRunner
+
+    return CliRunner()
+
+
+def _invoke(args: list[str]) -> Any:
+    from seekr.cli import app
+
+    return _runner().invoke(app, args)
+
+
+def test_register_adds_web_with_frozen_options() -> None:
+    import typer
+
+    fresh = typer.Typer()
+    cli_web.register(fresh)
+
+    result = _runner().invoke(fresh, ["web", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--port" in result.output
+    assert "--open-browser" in result.output
+    assert "8000" in result.output
+    assert "ephemeral" in result.output
+
+
+def test_help_does_not_create_backend_or_run_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli_web,
+        "_create_backend",
+        lambda: pytest.fail("help must not initialize the backend"),
+    )
+    monkeypatch.setattr(
+        cli_web,
+        "_run_server",
+        lambda *args, **kwargs: pytest.fail("help must not start a server"),
+    )
+
+    result = _invoke(["web", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--port" in result.output
+    assert "--open-browser" in result.output
+
+
+def test_port_zero_and_open_browser_pass_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = CleanupBackend()
+    recording = RecordingRun()
+    monkeypatch.setattr(cli_web, "_create_backend", lambda: backend)
+    monkeypatch.setattr(cli_web, "_run_server", recording)
+
+    result = _invoke(["web", "--port", "0", "--open-browser"])
+
+    assert result.exit_code == 0, result.output
+    assert "http://127.0.0.1:54321" in result.output
+    assert "Ctrl+C" in result.output
+    assert len(recording.calls) == 1
+    call = recording.calls[0]
+    assert call["backend"] is backend
+    assert call["port"] == 0
+    assert call["open_browser"] is True
+    assert isinstance(call["stop_event"], threading.Event)
+    assert not call["stop_event"].is_set()
+
+
+def test_default_port_and_browser_are_forwarded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recording = RecordingRun()
+    monkeypatch.setattr(cli_web, "_create_backend", CleanupBackend)
+    monkeypatch.setattr(cli_web, "_run_server", recording)
+
+    result = _invoke(["web"])
+
+    assert result.exit_code == 0, result.output
+    assert recording.calls[0]["port"] == 8000
+    assert recording.calls[0]["open_browser"] is False
+
+
+def test_invalid_port_rejected_before_backend_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli_web,
+        "_create_backend",
+        lambda: pytest.fail("invalid port must not create a backend"),
+    )
+    for value in ("-1", "65536"):
+        result = _invoke(["web", "--port", value])
+        assert result.exit_code == 2, result.output
+        assert "between 0 and 65535" in result.output
+
+
+def test_occupied_port_reports_clear_error_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    backend = CleanupBackend()
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        monkeypatch.setattr(cli_web, "_create_backend", lambda: backend)
+
+        result = _invoke(["web", "--port", str(port)])
+    finally:
+        listener.close()
+
+    assert result.exit_code == 1, result.output
+    assert "already in use" in result.output
+    assert backend.shutdown_calls == 1
+    assert backend.close_calls == 1
+
+
+def test_backend_factory_failure_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail() -> Any:
+        raise RuntimeError("fixture factory failure")
+
+    monkeypatch.setattr(cli_web, "_create_backend", fail)
+
+    result = _invoke(["web"])
+
+    assert result.exit_code == 1
+    assert "could not initialize the web service" in result.output
+    assert "fixture factory failure" in result.output
+
+
+def test_run_server_unexpected_failure_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_web, "_create_backend", CleanupBackend)
+
+    def fail(*args: Any, **kwargs: Any) -> int:
+        raise RuntimeError("fixture server failure")
+
+    monkeypatch.setattr(cli_web, "_run_server", fail)
+
+    result = _invoke(["web"])
+
+    assert result.exit_code == 1
+    assert "stopped unexpectedly" in result.output
+
+
+def test_keyboard_interrupt_exits_zero_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_web, "_create_backend", CleanupBackend)
+
+    def interrupt(*args: Any, **kwargs: Any) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_web, "_run_server", interrupt)
+
+    result = _invoke(["web"])
+
+    assert result.exit_code == 0, result.output
+
+
+def test_nonzero_server_exit_is_propagated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_web, "_create_backend", CleanupBackend)
+    monkeypatch.setattr(cli_web, "_run_server", RecordingRun(code=1))
+
+    result = _invoke(["web"])
+
+    assert result.exit_code == 1
+
+
+def test_browser_failure_message_does_not_fail_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_web, "_create_backend", CleanupBackend)
+
+    def run_with_browser_warning(
+        backend: Any,
+        *,
+        port: int,
+        open_browser: bool,
+        stop_event: threading.Event,
+        on_listen: Any,
+        on_browser_error: Any,
+    ) -> int:
+        on_listen("http://127.0.0.1:54321")
+        on_browser_error("could not open a browser (fixture); open the URL manually")
+        return 0
+
+    monkeypatch.setattr(cli_web, "_run_server", run_with_browser_warning)
+
+    result = _invoke(["web", "--open-browser"])
+
+    assert result.exit_code == 0, result.output
+    assert "could not open a browser" in result.output
+
+
+def test_importing_cli_is_lightweight() -> None:
+    script = (
+        "import sys\n"
+        "import seekr.cli\n"
+        "import seekr.cli_web\n"
+        "heavy = ('http.server', 'seekr.web_server', 'seekr.web_service', "
+        "'numpy', 'sentence_transformers', 'sqlite_vec', 'torch')\n"
+        "print(' '.join(name for name in heavy if name in sys.modules))\n"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([str(SRC), env.get("PYTHONPATH", "")]).rstrip(
+        os.pathsep
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == ""

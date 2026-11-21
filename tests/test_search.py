@@ -21,6 +21,7 @@ from unittest import mock
 
 from seekr import cli_search
 from seekr.config import Config
+from seekr.embed import FakeEmbedder
 from seekr.models import ChunkSpec, Hit, text_sha
 from seekr.search import Searcher, fts_query, rrf
 from seekr.store import (
@@ -1312,6 +1313,166 @@ class _FixedEmbedder:
 
     def embed_query(self, text: str) -> Any:
         return self.vector
+
+
+class SearchHookTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cfg = Config(db_path=Path("/tmp/seekr-search-hook/index.db"), embed_model="fake")
+
+    def test_use_daemon_false_skips_daemon_and_forwards_embedder(self) -> None:
+        hits = [Hit(1, "/notes/a.md", "L1", 1.0, "alpha", 1.0, "text")]
+        searcher = mock.Mock()
+        searcher.get_hits.return_value = hits
+        embedder = FakeEmbedder(dim=8)
+
+        with (
+            mock.patch(
+                "seekr.cli_search.try_daemon_search",
+                side_effect=AssertionError("daemon must be skipped"),
+            ) as try_daemon,
+            mock.patch(
+                "seekr.cli_search._build_searcher", return_value=searcher
+            ) as build_searcher,
+            mock.patch("seekr.cli_search.lifecycle_lock"),
+        ):
+            result = cli_search.get_hits(
+                "alpha",
+                k=3,
+                mode="hybrid",
+                cfg=self.cfg,
+                embedder=embedder,
+                use_daemon=False,
+            )
+
+        self.assertEqual(result, hits)
+        try_daemon.assert_not_called()
+        build_searcher.assert_called_once_with(
+            self.cfg, "hybrid", False, embedder=embedder
+        )
+        searcher.get_hits.assert_called_once()
+        searcher.store.close.assert_called_once_with()
+
+    def test_existing_build_searcher_call_shape_is_unchanged(self) -> None:
+        searcher = mock.Mock()
+        searcher.get_hits.return_value = []
+        with (
+            mock.patch(
+                "seekr.cli_search.try_daemon_search", return_value=None
+            ),
+            mock.patch(
+                "seekr.cli_search._build_searcher", return_value=searcher
+            ) as build_searcher,
+            mock.patch("seekr.cli_search.lifecycle_lock"),
+        ):
+            cli_search.get_hits("alpha", mode="keyword", cfg=self.cfg)
+
+        build_searcher.assert_called_once_with(self.cfg, "keyword", False)
+
+    def test_searcher_wins_over_a_mismatched_injected_embedder(self) -> None:
+        expected = [Hit(1, "/notes/a.md", "L1", 1.0, "alpha", 1.0, "text")]
+        searcher = mock.Mock()
+        searcher.get_hits.return_value = expected
+        embedder = FakeEmbedder(dim=8)
+        embedder.model_name = "different/model"
+
+        with (
+            mock.patch("seekr.cli_search._daemon_search") as daemon,
+            mock.patch("seekr.cli_search._build_searcher") as build_searcher,
+        ):
+            hits = cli_search.get_hits(
+                "alpha", cfg=self.cfg, searcher=searcher, embedder=embedder
+            )
+
+        self.assertEqual(hits, expected)
+        daemon.assert_not_called()
+        build_searcher.assert_not_called()
+
+    def test_try_daemon_hits_returns_list_none_and_propagates_errors(self) -> None:
+        expected = [Hit(1, "/notes/a.md", "L1", 1.0, "alpha", 1.0, "text")]
+        with mock.patch(
+            "seekr.cli_search.try_daemon_search", return_value=expected
+        ) as try_daemon:
+            self.assertEqual(
+                cli_search.try_daemon_hits("alpha", cfg=self.cfg), expected
+            )
+        self.assertEqual(try_daemon.call_args.args[0]["query"], "alpha")
+
+        with mock.patch(
+            "seekr.cli_search.try_daemon_search",
+            side_effect=cli_search.DaemonMismatchError("config mismatch"),
+        ):
+            self.assertIsNone(cli_search.try_daemon_hits("alpha", cfg=self.cfg))
+
+        with (
+            mock.patch(
+                "seekr.cli_search.try_daemon_search",
+                side_effect=cli_search.DaemonError("daemon timed out"),
+            ),
+            self.assertRaises(cli_search.DaemonError),
+        ):
+            cli_search.try_daemon_hits("alpha", cfg=self.cfg)
+
+    def test_try_daemon_hits_empty_query_short_circuits(self) -> None:
+        with mock.patch("seekr.cli_search.try_daemon_search") as try_daemon:
+            self.assertEqual(cli_search.try_daemon_hits("   ", cfg=self.cfg), [])
+        try_daemon.assert_not_called()
+
+        with self.assertRaises(cli_search.SearchError):
+            cli_search.try_daemon_hits("alpha", mode="nonsense", cfg=self.cfg)  # type: ignore[arg-type]
+
+    def test_try_daemon_hits_shares_normalised_filters(self) -> None:
+        with mock.patch("seekr.cli_search._daemon_search", return_value=[]) as daemon:
+            cli_search.try_daemon_hits(
+                "alpha", kind="CODE", since="1d", explain=True, cfg=self.cfg
+            )
+
+        kwargs = daemon.call_args.kwargs
+        self.assertEqual(kwargs["kind"], "code")
+        self.assertIsInstance(kwargs["since_mtime_ns"], int)
+        self.assertTrue(kwargs["explain"])
+
+    def test_injected_embedder_model_mismatch_is_a_search_error(self) -> None:
+        embedder = FakeEmbedder(dim=8)
+        embedder.model_name = "other/model"
+        with (
+            mock.patch(
+                "seekr.cli_search._validated_store_info",
+                return_value=(Path("/tmp/seekr-search-hook/index.db"), 8, "float32"),
+            ),
+            mock.patch("seekr.cli_search.Store") as store,
+            self.assertRaises(cli_search.SearchError),
+        ):
+            cli_search._build_searcher(self.cfg, "keyword", False, embedder=embedder)
+        store.assert_not_called()
+
+    def test_keyword_build_searcher_does_not_touch_dim(self) -> None:
+        class NoDimEmbedder:
+            model_name = "fake"
+
+            @property
+            def dim(self) -> int:
+                raise AssertionError("keyword mode must not read dim")
+
+            def embed_documents(self, texts: list[str]) -> Any:
+                raise AssertionError("keyword mode must not embed documents")
+
+            def embed_query(self, text: str) -> Any:
+                raise AssertionError("keyword mode must not embed the query")
+
+        fake_store = object()
+        with (
+            mock.patch(
+                "seekr.cli_search._validated_store_info",
+                return_value=(Path("/tmp/seekr-search-hook/index.db"), 8, "float32"),
+            ),
+            mock.patch("seekr.cli_search.Store", return_value=fake_store),
+            mock.patch("seekr.cli_search.Searcher") as searcher_cls,
+        ):
+            cli_search._build_searcher(
+                self.cfg, "keyword", False, embedder=NoDimEmbedder()  # type: ignore[arg-type]
+            )
+
+        searcher_cls.assert_called_once_with(fake_store, mock.ANY, None)
 
 
 @_slow

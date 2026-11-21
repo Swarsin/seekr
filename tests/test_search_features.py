@@ -448,6 +448,70 @@ class RealStoreSimilarTests(unittest.TestCase):
                 cli_search.get_similar_hits(base / "missing.md", cfg=cfg)
 
 
+class DaemonHelperFeatureTests(unittest.TestCase):
+    def test_try_daemon_hits_forwards_explain_and_normalised_filters(self) -> None:
+        hit = Hit(
+            chunk_id=1,
+            path="/notes/a.md",
+            locator="L1",
+            loc_start=1.0,
+            snippet="alpha",
+            score=1.0,
+            kind="text",
+        )
+        cfg = Config(
+            db_path=Path("/tmp/seekr-daemon-helper/index.db"),
+            embed_model="test/embed",
+            rerank_model="test/rerank",
+        )
+
+        with mock.patch(
+            "seekr.cli_search.try_daemon_search", return_value=[hit]
+        ) as try_daemon:
+            hits = cli_search.try_daemon_hits(
+                "alpha",
+                k=4,
+                mode="keyword",
+                per_file=1,
+                path_prefix="/notes",
+                explain=True,
+                kind="CODE",
+                since="7d",
+                cfg=cfg,
+            )
+
+        self.assertEqual(hits, [hit])
+        params = try_daemon.call_args.args[0]
+        self.assertEqual(params["op"], "search")
+        self.assertEqual(params["query"], "alpha")
+        self.assertEqual(params["k"], 4)
+        self.assertEqual(params["mode"], "keyword")
+        self.assertEqual(params["per_file"], 1)
+        self.assertEqual(params["path_prefix"], "/notes")
+        self.assertTrue(params["explain"])
+        self.assertEqual(params["kind"], "code")
+        self.assertIsInstance(params["since_mtime_ns"], int)
+
+    def test_get_hits_use_daemon_false_never_calls_the_daemon(self) -> None:
+        searcher = mock.Mock()
+        searcher.get_hits.return_value = []
+        cfg = Config(db_path=Path("/tmp/seekr-daemon-helper/index.db"))
+
+        with (
+            mock.patch(
+                "seekr.cli_search.try_daemon_search",
+                side_effect=AssertionError("use_daemon=False must not probe"),
+            ) as try_daemon,
+            mock.patch(
+                "seekr.cli_search._build_searcher", return_value=searcher
+            ),
+            mock.patch("seekr.cli_search.lifecycle_lock"),
+        ):
+            cli_search.get_hits("alpha", cfg=cfg, use_daemon=False)
+
+        try_daemon.assert_not_called()
+
+
 @unittest.skipUnless(_HAS_TYPER, "typer is not installed")
 class CliSimilarTests(unittest.TestCase):
     def test_similar_command_forwards_args_and_formats_json_and_text(self) -> None:

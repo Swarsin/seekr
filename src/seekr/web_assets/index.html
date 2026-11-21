@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light">
+<title>Seekr</title>
+<link rel="stylesheet" href="/styles.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#query">Skip to search</a>
+
+<header class="masthead">
+  <div class="masthead-inner">
+    <p class="wordmark">Seekr</p>
+    <nav class="views" aria-label="Views">
+      <button type="button" class="view-tab" id="tab-search" data-view="search" aria-controls="view-search" aria-current="page">Search</button>
+      <button type="button" class="view-tab" id="tab-folders" data-view="folders" aria-controls="view-folders">Folders</button>
+    </nav>
+    <p class="masthead-note">Runs on this computer only</p>
+  </div>
+</header>
+
+<div class="banner" id="connection-banner" role="alert" hidden>
+  <div class="banner-inner">
+    <p class="banner-text" id="connection-text">Seekr isn’t responding. Check that <code>seekr web</code> is still running in your terminal.</p>
+    <button type="button" class="button button-quiet" id="reconnect">Reconnect</button>
+  </div>
+</div>
+
+<div class="layout">
+  <main class="workspace" id="main">
+
+    <section class="view" id="view-search" aria-labelledby="search-heading">
+      <h1 class="view-heading" id="search-heading" tabindex="-1">Search files</h1>
+
+      <form class="search-form" id="search-form" novalidate>
+        <div class="query-row">
+          <label class="visually-hidden" for="query">Search for</label>
+          <input class="query-input" id="query" name="query" type="search" autocomplete="off" spellcheck="false" maxlength="2000" placeholder="Words, a phrase, or a description of what you need" aria-describedby="query-hint">
+          <button type="submit" class="button button-primary" id="search-submit">Search</button>
+        </div>
+        <p class="field-hint" id="query-hint">Press Enter to search. Results show the passages that matched and where to find them.</p>
+
+        <fieldset class="modes" id="mode-fieldset">
+          <legend class="modes-legend">Match by</legend>
+          <div class="mode-options">
+            <label class="mode-option"><input type="radio" name="mode" value="hybrid" checked> Words and meaning</label>
+            <label class="mode-option"><input type="radio" name="mode" value="keyword"> Exact words</label>
+            <label class="mode-option"><input type="radio" name="mode" value="vector"> Meaning only</label>
+          </div>
+          <p class="field-hint mode-note" id="mode-note" hidden></p>
+        </fieldset>
+
+        <details class="filters" id="filters">
+          <summary class="filters-summary">Filters <span class="filters-count" id="filters-count"></span></summary>
+          <div class="filters-grid">
+            <div class="field">
+              <label for="filter-path">Folder or path starts with</label>
+              <input id="filter-path" name="path" type="text" autocomplete="off" spellcheck="false" aria-describedby="filter-path-hint">
+              <p class="field-hint" id="filter-path-hint">Use a full path, for example one of your folders.</p>
+            </div>
+            <div class="field">
+              <label for="filter-kind">File type</label>
+              <select id="filter-kind" name="kind">
+                <option value="">Any type</option>
+                <option value="pdf">PDF</option>
+                <option value="markdown">Markdown</option>
+                <option value="text">Plain text</option>
+                <option value="code">Source code</option>
+                <option value="transcript">Transcript</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="filter-since">Changed</label>
+              <select id="filter-since" name="since">
+                <option value="">Any time</option>
+                <option value="1d">In the last day</option>
+                <option value="7d">In the last week</option>
+                <option value="30d">In the last 30 days</option>
+                <option value="365d">In the last year</option>
+                <option value="date">Since a date…</option>
+              </select>
+            </div>
+            <div class="field" id="since-date-field" hidden>
+              <label for="filter-since-date">Since date</label>
+              <input id="filter-since-date" name="since_date" type="date">
+            </div>
+            <div class="field field-narrow">
+              <label for="filter-k">Most results</label>
+              <input id="filter-k" name="k" type="number" inputmode="numeric" min="1" max="50" step="1" value="10">
+            </div>
+            <div class="field field-narrow">
+              <label for="filter-per-file">Passages per file</label>
+              <input id="filter-per-file" name="per_file" type="number" inputmode="numeric" min="1" max="10" step="1" value="2">
+            </div>
+          </div>
+          <div class="filters-actions">
+            <button type="button" class="button button-quiet" id="filters-clear">Clear filters</button>
+          </div>
+        </details>
+      </form>
+
+      <section class="results" id="results" aria-labelledby="results-heading" aria-busy="false">
+        <h2 class="visually-hidden" id="results-heading">Results</h2>
+        <div class="results-state" id="results-state"></div>
+        <p class="results-meta" id="results-meta" hidden></p>
+        <ol class="hit-list" id="hit-list" hidden></ol>
+      </section>
+    </section>
+
+    <section class="view" id="view-folders" aria-labelledby="folders-heading" hidden>
+      <h1 class="view-heading" id="folders-heading" tabindex="-1">Folders</h1>
+      <p class="lede">Seekr searches the folders listed here. Adding a folder only saves it to your settings; choose <strong>Update index</strong> afterwards to read its files. Files are never changed or uploaded.</p>
+
+      <div class="folders-state" id="folders-state"></div>
+
+      <h2 class="section-heading">Folders Seekr searches</h2>
+      <p class="empty-note" id="roots-empty" hidden>No folders yet. Add one below.</p>
+      <ul class="root-list" id="root-list" hidden></ul>
+      <p class="config-path" id="config-path" hidden></p>
+
+      <form class="add-folder" id="add-folder-form" novalidate>
+        <h2 class="section-heading" id="add-folder-heading">Add folder</h2>
+        <div class="field">
+          <label for="folder-path">Folder path</label>
+          <div class="query-row">
+            <input class="path-input" id="folder-path" name="path" type="text" autocomplete="off" spellcheck="false" maxlength="4096" aria-describedby="folder-path-hint folder-path-error">
+            <button type="submit" class="button button-primary" id="add-folder-submit">Add folder</button>
+          </div>
+          <p class="field-hint" id="folder-path-hint">Type the full path of a folder on this computer. A path starting with ~ means your home folder.</p>
+          <p class="field-error" id="folder-path-error" hidden></p>
+        </div>
+        <div class="add-result" id="add-result" tabindex="-1" hidden></div>
+      </form>
+    </section>
+  </main>
+
+  <aside class="status-panel" id="status-panel" aria-labelledby="status-heading">
+    <div class="status-head">
+      <h2 class="panel-heading" id="status-heading">Index status</h2>
+      <button type="button" class="button button-link" id="status-refresh">Refresh</button>
+    </div>
+
+    <div class="status-block" id="config-block" hidden></div>
+
+    <div class="status-block">
+      <h3 class="status-label">Index</h3>
+      <p class="status-value" id="index-state">Loading…</p>
+      <dl class="facts" id="index-facts" hidden></dl>
+      <p class="status-detail" id="index-detail" hidden></p>
+      <button type="button" class="button button-secondary" id="update-index" disabled>Update index</button>
+      <p class="status-detail" id="update-note" hidden></p>
+    </div>
+
+    <div class="status-block">
+      <h3 class="status-label">Local model</h3>
+      <p class="status-value" id="model-state">Loading…</p>
+      <p class="status-detail path-text" id="model-name" hidden></p>
+      <p class="status-detail" id="model-detail" hidden></p>
+      <button type="button" class="button button-secondary" id="check-model" disabled>Check model</button>
+    </div>
+
+    <div class="status-block">
+      <h3 class="status-label">Background service</h3>
+      <p class="status-value" id="daemon-state">Loading…</p>
+      <p class="status-detail" id="daemon-detail" hidden></p>
+    </div>
+
+    <div class="job" id="job" hidden>
+      <h3 class="status-label" id="job-heading">Current task</h3>
+      <div class="job-body" id="job-body"></div>
+    </div>
+  </aside>
+</div>
+
+<div class="visually-hidden" id="announcer" role="status" aria-live="polite" aria-atomic="true"></div>
+</body>
+</html>

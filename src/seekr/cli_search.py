@@ -204,16 +204,33 @@ def _validated_store_info(cfg: Config) -> tuple[Path, int, str] | None:
     return db_path, stored_dim, stored_quant
 
 
-def _build_searcher(cfg: Config, mode: str, rerank: bool) -> Searcher | None:
-    """Open exactly the backends this query needs."""
+def _build_searcher(
+    cfg: Config,
+    mode: str,
+    rerank: bool,
+    *,
+    embedder: Embedder | None = None,
+) -> Searcher | None:
+    """Open exactly the backends this query needs.
+
+    ``embedder`` is an optional injection point for a caller that already owns
+    a warm model.  It must belong to the active ``cfg.embed_model``; the
+    keyword path never reads ``.dim`` from it.
+    """
+    if embedder is not None and embedder.model_name != cfg.embed_model:
+        raise SearchError(
+            f"injected embedding model {embedder.model_name!r} does not match the "
+            f"configured model {cfg.embed_model!r}"
+        )
+
     info = _validated_store_info(cfg)
     if info is None:
         return None
     db_path, stored_dim, stored_quant = info
 
-    embedder = build_embedder(cfg)
+    active_embedder = embedder if embedder is not None else build_embedder(cfg)
     if mode in ("vector", "hybrid"):
-        actual_dim = _embedder_dim(embedder)
+        actual_dim = _embedder_dim(active_embedder)
         if actual_dim != stored_dim:
             raise ModelMismatchError(
                 f"embedding model {cfg.embed_model!r} produces {actual_dim}-dimensional "
@@ -223,7 +240,7 @@ def _build_searcher(cfg: Config, mode: str, rerank: bool) -> Searcher | None:
 
     reranker = _build_reranker(cfg) if rerank else None
     store = Store(db_path, cfg.embed_model, stored_dim, vector_quant=stored_quant)
-    return Searcher(store, embedder, reranker)
+    return Searcher(store, active_embedder, reranker)
 
 
 def _daemon_search(
@@ -292,6 +309,26 @@ def _daemon_search(
     return hits
 
 
+def _validate_query(
+    query: str,
+    k: int,
+    mode: SearchMode,
+    per_file: int,
+    kind: str | None,
+    since: str | None,
+) -> tuple[str | None, int | None]:
+    """Apply the shared query/filter validation used by both entry points."""
+    if mode not in SEARCH_MODES:
+        raise SearchError(
+            f"unknown search mode {mode!r}; expected 'keyword', 'vector' or 'hybrid'"
+        )
+    if k <= 0:
+        raise SearchError("k must be a positive integer")
+    if per_file <= 0:
+        raise SearchError("per-file must be a positive integer")
+    return normalise_kind(kind), parse_since(since)
+
+
 def get_hits(
     query: str,
     k: int = 10,
@@ -305,24 +342,18 @@ def get_hits(
     since: str | None = None,
     cfg: Config | None = None,
     searcher: Searcher | None = None,
+    embedder: Embedder | None = None,
+    use_daemon: bool = True,
 ) -> list[Hit]:
     """Return hits for a standalone query, preferring a warm daemon.
 
     This is the pure shared point for ``seekr search`` and ``seekr pick``.
-    ``cfg`` and ``searcher`` are injection hooks for tests and for a caller
-    that already owns a live search stack; ordinary CLI calls leave both unset
-    and try the daemon before opening the configured database.
+    ``cfg``, ``searcher`` and ``embedder`` are injection hooks for tests and
+    for a caller that already owns a live search stack.  ``searcher`` wins over
+    ``embedder``; ordinary CLI calls leave both unset.  ``use_daemon=False``
+    forces the local configured index even when a daemon is listening.
     """
-    if mode not in SEARCH_MODES:
-        raise SearchError(
-            f"unknown search mode {mode!r}; expected 'keyword', 'vector' or 'hybrid'"
-        )
-    if k <= 0:
-        raise SearchError("k must be a positive integer")
-    if per_file <= 0:
-        raise SearchError("per-file must be a positive integer")
-    kind_val = normalise_kind(kind)
-    since_mtime_ns = parse_since(since)
+    kind_val, since_mtime_ns = _validate_query(query, k, mode, per_file, kind, since)
     if not query.strip():
         # An empty or whitespace-only query can never match.  Short-circuit
         # before the daemon, config load or any embedder/store construction so
@@ -348,20 +379,21 @@ def get_hits(
         )
 
     selected_cfg = cfg if cfg is not None else load_config()
-    daemon_hits = _daemon_search(
-        selected_cfg,
-        query,
-        k,
-        mode,
-        per_file,
-        rerank,
-        path_prefix,
-        explain=explain,
-        kind=kind_val,
-        since_mtime_ns=since_mtime_ns,
-    )
-    if daemon_hits is not None:
-        return daemon_hits
+    if use_daemon:
+        daemon_hits = _daemon_search(
+            selected_cfg,
+            query,
+            k,
+            mode,
+            per_file,
+            rerank,
+            path_prefix,
+            explain=explain,
+            kind=kind_val,
+            since_mtime_ns=since_mtime_ns,
+        )
+        if daemon_hits is not None:
+            return daemon_hits
 
     # The lock covers the whole Store lifetime, so a concurrent reindex cannot
     # swap the database out from under an in-process search.
@@ -373,7 +405,11 @@ def get_hits(
         mode=mode,
     )
     with lifecycle_lock(selected_cfg.db_path, shared=True):
-        selected = _build_searcher(selected_cfg, mode, rerank)
+        selected = (
+            _build_searcher(selected_cfg, mode, rerank)
+            if embedder is None
+            else _build_searcher(selected_cfg, mode, rerank, embedder=embedder)
+        )
         if selected is None:
             return []
         try:
@@ -388,6 +424,45 @@ def get_hits(
             )
         finally:
             selected.store.close()
+
+
+def try_daemon_hits(
+    query: str,
+    k: int = 10,
+    mode: SearchMode = "hybrid",
+    per_file: int = 2,
+    rerank: bool = False,
+    path_prefix: str | None = None,
+    *,
+    explain: bool = False,
+    kind: str | None = None,
+    since: str | None = None,
+    cfg: Config | None = None,
+) -> list[Hit] | None:
+    """Ask the daemon for hits, or return ``None`` when it cannot be used.
+
+    This shares the query/filter validation with :func:`get_hits` and never
+    opens a Store or embedder.  A missing listener and a
+    :class:`DaemonMismatchError` both return ``None``; every other
+    :class:`DaemonError` propagates so a reachable broken daemon is never
+    silently replaced by a local search.
+    """
+    kind_val, since_mtime_ns = _validate_query(query, k, mode, per_file, kind, since)
+    if not query.strip():
+        return []
+    selected_cfg = cfg if cfg is not None else load_config()
+    return _daemon_search(
+        selected_cfg,
+        query,
+        k,
+        mode,
+        per_file,
+        rerank,
+        path_prefix,
+        explain=explain,
+        kind=kind_val,
+        since_mtime_ns=since_mtime_ns,
+    )
 
 
 def _vectors_for_target(
@@ -707,4 +782,5 @@ __all__ = [
     "get_hits",
     "get_similar_hits",
     "register",
+    "try_daemon_hits",
 ]

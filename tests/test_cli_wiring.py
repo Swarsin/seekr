@@ -15,7 +15,14 @@ SRC = ROOT / "src"
 CLI_PATH = SRC / "seekr" / "cli.py"
 _HAS_TYPER = importlib.util.find_spec("typer") is not None
 
-COMMAND_MODULES = ("cli_daemon", "cli_eval", "cli_index", "cli_open", "cli_search")
+COMMAND_MODULES = (
+    "cli_daemon",
+    "cli_eval",
+    "cli_index",
+    "cli_open",
+    "cli_search",
+    "cli_web",
+)
 MODULE_COMMANDS = (
     "daemon",
     "eval",
@@ -25,6 +32,7 @@ MODULE_COMMANDS = (
     "pick",
     "open",
     "search",
+    "web",
 )
 
 
@@ -113,6 +121,7 @@ class CliRegistrationTests(unittest.TestCase):
             "reindex": ("--force", "--allow-empty"),
             "status": ("Print",),
             "search": ("QUERY", "--mode", "--per-file", "--rerank", "--path"),
+            "web": ("--port", "--open-browser"),
         }
         for command, options in expected_options.items():
             with self.subTest(command=command):
@@ -125,7 +134,8 @@ class CliRegistrationTests(unittest.TestCase):
         script = (
             "import sys\n"
             "import seekr.cli\n"
-            "heavy = ('numpy', 'sentence_transformers', 'sqlite_vec', 'torch')\n"
+            "heavy = ('http.server', 'seekr.web_server', 'numpy', "
+            "'sentence_transformers', 'sqlite_vec', 'torch')\n"
             "print(' '.join(name for name in heavy if name in sys.modules))\n"
         )
         env = dict(os.environ)

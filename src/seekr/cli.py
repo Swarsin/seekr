@@ -11,6 +11,7 @@ from . import (
     cli_index,
     cli_open,
     cli_search,
+    cli_web,
 )
 from .logging_config import configure_logging
 
@@ -96,6 +97,7 @@ cli_eval.register(app)
 cli_index.register(app)
 cli_open.register(app)
 cli_search.register(app)
+cli_web.register(app)
 
 
 if __name__ == "__main__":
