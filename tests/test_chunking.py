@@ -6,8 +6,10 @@ import itertools
 import sys
 import types
 import unittest
+import warnings
 from unittest import mock
 
+from seekr import chunking
 from seekr.chunking import (
     ChunkingWarning,
     _ast_chunks,
@@ -513,6 +515,97 @@ class EmptyInputTests(unittest.TestCase):
         for kind in ("text", "pdf", "markdown", "code", "transcript"):
             with self.subTest(kind=kind):
                 self.assertEqual(chunk(kind, [], Config(), language="python"), [])
+
+
+class MissingGrammarWarningTests(unittest.TestCase):
+    def test_missing_grammar_emits_missing_grammar_warning(self) -> None:
+        source = "def alpha():\n    return 1\n"
+        with mock.patch(
+            "seekr.chunking._load_parser",
+            return_value=(None, "no cached 'python' parser"),
+        ), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            chunks = chunk("code", [_unit(source)], Config(), language="python")
+
+        self.assertEqual([item.locator for item in chunks], ["L1-2"])
+        self.assertEqual(len(caught), 1)
+        warning = caught[0].message
+        self.assertIsInstance(warning, chunking.MissingGrammarWarning)
+        self.assertIsInstance(warning, ChunkingWarning)
+        self.assertEqual(warning.language, "python")  # type: ignore[attr-defined]
+        self.assertIn("no cached 'python' parser", str(warning))
+
+    def test_missing_grammar_warns_once_across_multiple_units(self) -> None:
+        units = [_unit("   "), _unit("a = 1\n"), _unit("b = 2\n")]
+        with mock.patch(
+            "seekr.chunking._load_parser",
+            return_value=(None, "missing grammar"),
+        ), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            chunks = chunk("code", units, Config(), language="py")
+
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(len(caught), 1)
+        warning = caught[0].message
+        self.assertIsInstance(warning, chunking.MissingGrammarWarning)
+        self.assertEqual(warning.language, "python")  # type: ignore[attr-defined]
+
+    def test_non_missing_grammar_failures_stay_plain_chunking_warning(self) -> None:
+        details = [
+            (
+                "tree-sitter-language-pack is not installed or could not be imported, "
+                "so seekr cannot build AST chunks for 'python' (No module). "
+                "1.x requires parsers to be pre-downloaded into its local cache."
+            ),
+            "tree-sitter-language-pack 2.0.0 reports unsupported major version 2.",
+            "cannot determine the installed tree-sitter-language-pack version.",
+            "tree-sitter-language-pack 1.25.2 could not inspect its local parser cache.",
+            "tree-sitter-language-pack 1.25.2 exposes neither API.",
+            "tree-sitter-language-pack 1.25.2 could not load the 'python' parser: err.",
+        ]
+        for detail in details:
+            with self.subTest(detail=detail), mock.patch(
+                "seekr.chunking._load_parser",
+                return_value=(None, detail),
+            ), warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                chunk("code", [_unit("x = 1\n")], Config(), language="python")
+
+            self.assertEqual(len(caught), 1)
+            self.assertIsInstance(caught[0].message, ChunkingWarning)
+            self.assertNotIsInstance(caught[0].message, chunking.MissingGrammarWarning)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            chunk("code", [_unit("++++")], Config(), language="brainfuck")
+        self.assertEqual(len(caught), 1)
+        self.assertIsInstance(caught[0].message, ChunkingWarning)
+        self.assertNotIsInstance(caught[0].message, chunking.MissingGrammarWarning)
+
+    def test_registry_missing_cached_grammar_emits_missing_grammar_warning(self) -> None:
+        module = types.ModuleType("tree_sitter_language_pack")
+        module.__version__ = "1.25.2"  # type: ignore[attr-defined]
+        module.get_parser = lambda name: None  # type: ignore[attr-defined]
+
+        class EmptyRegistry:
+            @staticmethod
+            def new() -> EmptyRegistry:
+                return EmptyRegistry()
+
+            def has_parser(self, name: str) -> bool:
+                del name
+                return False
+
+        module.LanguageRegistry = EmptyRegistry  # type: ignore[attr-defined]
+        with mock.patch.dict(
+            sys.modules, {"tree_sitter_language_pack": module}
+        ), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            chunk("code", [_unit("x = 1\n")], Config(), language="python")
+
+        self.assertEqual(len(caught), 1)
+        self.assertIsInstance(caught[0].message, chunking.MissingGrammarWarning)
+        self.assertEqual(caught[0].message.language, "python")  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
+from seekr import indexer as indexer_module
 from seekr.config import Config
 from seekr.extract import ExtractionError
 from seekr.indexer import Indexer
@@ -932,6 +933,133 @@ class MovePathTests(_IndexerTestCase):
         doc = self.stored(dst)
         assert doc is not None
         self.assertEqual(doc.kind, "code")
+
+
+class GrammarSummaryTests(_IndexerTestCase):
+    def test_sync_reports_one_summary_for_many_files(self) -> None:
+        for index in range(5):
+            self.write(f"pkg/mod_{index}.py", f"def fn_{index}():\n    return {index}\n")
+        self.write("web/app.js", "function hello() {\n  return 1;\n}\n")
+
+        with mock.patch(
+            "seekr.chunking._load_parser",
+            return_value=(None, "missing grammar"),
+        ):
+            report = self.indexer.sync([self.root])
+
+        self.assertEqual(report.added, 6)
+        grammar_warnings = [m for _, m in report.warnings if "tree-sitter grammars" in m]
+        self.assertEqual(len(grammar_warnings), 1)
+        self.assertEqual(report.missing_grammars, {"javascript": 1, "python": 5})
+        self.assertEqual(list(report.missing_grammars), ["javascript", "python"])
+        self.assertIn("6 code file(s)", grammar_warnings[0])
+        expected_message = (
+            "6 code file(s) used 60-line windows because tree-sitter grammars "
+            "are not installed (javascript: 1, python: 5); install them with: "
+            "python -c \"from tree_sitter_language_pack import download; "
+            "download(['javascript', 'python'])\""
+        )
+        self.assertEqual(
+            report.warnings,
+            [(str(self.root.resolve()), expected_message)],
+        )
+
+    def test_sync_reports_one_summary_for_30_python_files(self) -> None:
+        paths = [
+            self.write(f"tree/file_{index:02d}.py", f"def f_{index}():\n    return {index}\n")
+            for index in range(30)
+        ]
+
+        with mock.patch(
+            "seekr.chunking._load_parser",
+            return_value=(
+                None,
+                "tree-sitter-language-pack 1.25.2 has no locally cached 'python' parser.",
+            ),
+        ):
+            report = self.indexer.sync([self.root])
+
+            self.assertEqual(report.added, 30)
+            self.assertEqual(report.missing_grammars, {"python": 30})
+            self.assertEqual(len(report.warnings), 1)
+            self.assertIn("30 code file(s)", report.warnings[0][1])
+            self.assertIn("(python: 30)", report.warnings[0][1])
+
+            for index, path in enumerate(paths):
+                path.write_text(
+                    f"def f_{index}_v2():\n    return {index + 100}\n",
+                    encoding="utf-8",
+                )
+            resync = self.indexer.sync([self.root])
+
+        self.assertEqual(resync.updated, 30)
+        self.assertEqual(resync.missing_grammars, {"python": 30})
+        self.assertEqual(len(resync.warnings), 1)
+        self.assertIn("30 code file(s)", resync.warnings[0][1])
+
+    def test_other_chunking_warnings_stay_per_file(self) -> None:
+        class FakeNode:
+            def __init__(self, size: int) -> None:
+                self.type = "module"
+                self.start_byte = 0
+                self.end_byte = size
+                self.start_point = (0, 0)
+                self.end_point = (0, 1)
+                self.named_children: list[object] = []
+                self.has_error = True
+
+        class FakeTree:
+            def __init__(self, size: int) -> None:
+                self.root_node = FakeNode(size)
+
+        class FakeParser:
+            def parse(self, source: bytes) -> FakeTree:
+                return FakeTree(len(source))
+
+        p1 = self.write("broken_a.py", "def broken_a(:\n    pass\n")
+        p2 = self.write("broken_b.py", "def broken_b(:\n    pass\n")
+
+        with mock.patch(
+            "seekr.chunking._load_parser",
+            return_value=(FakeParser(), "controlled local parser"),
+        ):
+            report = self.indexer.sync([self.root])
+
+        self.assertEqual(report.added, 2)
+        self.assertEqual(report.missing_grammars, {})
+        self.assertEqual(len(report.warnings), 2)
+        self.assertEqual(
+            {path for path, _ in report.warnings},
+            {str(p1.resolve()), str(p2.resolve())},
+        )
+        self.assertTrue(all("parse errors" in msg.lower() for _, msg in report.warnings))
+        self.assertFalse(any("tree-sitter grammars" in msg for _, msg in report.warnings))
+
+    def test_grammar_summary_message_formats_and_sorts_alphabetically(self) -> None:
+        message = indexer_module.grammar_summary_message(
+            {"rust": 2, "go": 4, "python": 10}
+        )
+        self.assertEqual(
+            message,
+            "16 code file(s) used 60-line windows because tree-sitter grammars are not "
+            "installed (go: 4, python: 10, rust: 2); install them with: "
+            "python -c \"from tree_sitter_language_pack import download; "
+            "download(['go', 'python', 'rust'])\"",
+        )
+
+    def test_single_file_root_records_one_grammar_summary(self) -> None:
+        py_file = self.write("single.py", "def one():\n    return 1\n")
+        with mock.patch(
+            "seekr.chunking._load_parser",
+            return_value=(None, "no cached 'python' parser"),
+        ):
+            report = self.indexer.sync([py_file])
+
+        self.assertEqual(report.added, 1)
+        self.assertEqual(report.missing_grammars, {"python": 1})
+        self.assertEqual(len(report.warnings), 1)
+        self.assertEqual(report.warnings[0][0], str(py_file.resolve()))
+        self.assertIn("1 code file(s)", report.warnings[0][1])
 
 
 @unittest.skipUnless(_HAS_FTS5, "FTS5 is required for the SQLite Store harness")

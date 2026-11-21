@@ -16,12 +16,13 @@ import os
 import stat as stat_module
 import time
 import warnings
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
 from . import extract as _extract_module
-from .chunking import ChunkingWarning, chunk
+from .chunking import ChunkingWarning, MissingGrammarWarning, chunk
 from .config import Config
 from .extract import ExtractionError, ExtractionResult
 from .logging_config import log_event
@@ -34,7 +35,13 @@ if TYPE_CHECKING:
     from .embed import Embedder
     from .store import Store
 
-__all__ = ["MAX_FILE_ATTEMPTS", "IndexResult", "Indexer", "SyncReport"]
+__all__ = [
+    "MAX_FILE_ATTEMPTS",
+    "IndexResult",
+    "Indexer",
+    "SyncReport",
+    "grammar_summary_message",
+]
 
 IndexResult = Literal["added", "updated", "unchanged", "skipped", "removed"]
 
@@ -56,6 +63,7 @@ class SyncReport:
     skipped: int = 0
     errors: list[tuple[str, str]] = field(default_factory=list)
     warnings: list[tuple[str, str]] = field(default_factory=list)
+    missing_grammars: dict[str, int] = field(default_factory=dict)
 
     @property
     def error_count(self) -> int:
@@ -66,11 +74,32 @@ class SyncReport:
         return len(self.warnings)
 
 
+def grammar_summary_message(counts: dict[str, int]) -> str:
+    """Format one summary warning for files missing cached tree-sitter grammars."""
+    langs = sorted(lang for lang, count in counts.items() if count > 0)
+    total = sum(counts[lang] for lang in langs)
+    breakdown = ", ".join(f"{lang}: {counts[lang]}" for lang in langs)
+    quoted = ", ".join(f"'{lang}'" for lang in langs)
+    return (
+        f"{total} code file(s) used 60-line windows because tree-sitter grammars are "
+        f"not installed ({breakdown}); install them with: "
+        f'python -c "from tree_sitter_language_pack import download; download([{quoted}])"'
+    )
+
+
+def _record_missing_grammars(
+    counts: dict[str, int], languages: Iterable[str]
+) -> None:
+    for lang in languages:
+        counts[lang] = counts.get(lang, 0) + 1
+
+
 @dataclass
 class _Outcome:
     result: IndexResult
     errors: list[tuple[str, str]] = field(default_factory=list)
     warnings: list[tuple[str, str]] = field(default_factory=list)
+    missing_grammars: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -83,6 +112,7 @@ class _PreparedFile:
     existed: bool
     chunks: list[tuple[object, str]]
     warnings: list[tuple[str, str]]
+    missing_grammars: tuple[str, ...] = ()
 
 
 def _error_text(exc: BaseException) -> str:
@@ -224,6 +254,19 @@ class Indexer:
             for root in self._unique_roots(healthy_roots):
                 self._prune_root(root, seen, report)
         finally:
+            if report.missing_grammars:
+                report.missing_grammars = dict(sorted(report.missing_grammars.items()))
+                first_root = (
+                    healthy_roots[0]
+                    if healthy_roots
+                    else (roots[0] if roots else "")
+                )
+                report.warnings.append(
+                    (
+                        str(first_root),
+                        grammar_summary_message(report.missing_grammars),
+                    )
+                )
             self._last_report = report
             try:
                 self.store.set_last_error_count(len(report.errors))
@@ -676,7 +719,9 @@ class Indexer:
                 return None, outcome
 
             try:
-                specs, chunk_warnings = self._make_chunks(kind, extraction, path)
+                specs, chunk_warnings, missing_grammars = self._make_chunks(
+                    kind, extraction, path
+                )
             except Exception as exc:
                 outcome.errors.append(
                     (str(path), f"chunking failed: {_error_text(exc)}")
@@ -701,6 +746,7 @@ class Indexer:
                     existed=doc is not None,
                     chunks=chunk_pairs,
                     warnings=file_warnings,
+                    missing_grammars=missing_grammars,
                 ),
                 None,
             )
@@ -784,6 +830,7 @@ class Indexer:
             else:
                 report.added += 1
             report.warnings.extend(item.warnings)
+            _record_missing_grammars(report.missing_grammars, item.missing_grammars)
 
     def _commit_prepared_file(
         self,
@@ -839,6 +886,7 @@ class Indexer:
             )
         outcome.result = "updated" if prepared.existed else "added"
         outcome.warnings.extend(prepared.warnings)
+        outcome.missing_grammars.extend(prepared.missing_grammars)
         return outcome
 
     def _restat_after_read(
@@ -895,7 +943,7 @@ class Indexer:
 
     def _make_chunks(
         self, kind: str, extraction: object, path: Path
-    ) -> tuple[list[object], list[str]]:
+    ) -> tuple[list[object], list[str], tuple[str, ...]]:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             specs = chunk(
@@ -904,12 +952,18 @@ class Indexer:
                 self.cfg,
                 language=language_for(path) if kind == "code" else None,
             )
-        chunk_warnings = [
-            str(item.message)
-            for item in caught
-            if issubclass(item.category, ChunkingWarning)
-        ]
-        return list(specs), chunk_warnings
+        chunk_warnings: list[str] = []
+        missing_languages: list[str] = []
+        seen_languages: set[str] = set()
+        for item in caught:
+            if isinstance(item.message, MissingGrammarWarning):
+                lang = item.message.language
+                if lang not in seen_languages:
+                    seen_languages.add(lang)
+                    missing_languages.append(lang)
+            elif issubclass(item.category, ChunkingWarning):
+                chunk_warnings.append(str(item.message))
+        return list(specs), chunk_warnings, tuple(missing_languages)
 
     def _resolve_chunk_vectors(
         self, chunk_pairs: list[tuple[object, str]]
@@ -1244,3 +1298,4 @@ class Indexer:
             report.skipped += 1
         report.errors.extend(outcome.errors)
         report.warnings.extend(outcome.warnings)
+        _record_missing_grammars(report.missing_grammars, outcome.missing_grammars)

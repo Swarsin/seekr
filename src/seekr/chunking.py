@@ -46,7 +46,13 @@ from typing import Any
 from .config import Config
 from .models import ChunkSpec, ExtractedUnit
 
-__all__ = ["AST_SUPPORTED_LANGUAGES", "ChunkingWarning", "ast_support", "chunk"]
+__all__ = [
+    "AST_SUPPORTED_LANGUAGES",
+    "ChunkingWarning",
+    "MissingGrammarWarning",
+    "ast_support",
+    "chunk",
+]
 
 #: Canonical language names accepted by the tree-sitter AST chunker.
 AST_SUPPORTED_LANGUAGES = frozenset(
@@ -74,10 +80,25 @@ _LANGUAGE_PACK_MODULE = "tree_sitter_language_pack"
 _LANGUAGE_PACK_DIST = "tree-sitter-language-pack"
 _FALLBACK_LINES = 60
 _FALLBACK_OVERLAP = 10
+_MISSING_GRAMMAR_MARKERS = (
+    "no locally cached",
+    "in its local cache",
+    "no cached",
+    "missing grammar",
+    "not cached",
+)
 
 
 class ChunkingWarning(UserWarning):
     """A chunking capability is missing and a fallback is being used."""
+
+
+class MissingGrammarWarning(ChunkingWarning):
+    """A supported tree-sitter grammar is not cached locally and a fallback is used."""
+
+    def __init__(self, message: str, *, language: str) -> None:
+        self.language = language
+        super().__init__(message)
 
 
 # ---------------------------------------------------------------------------
@@ -807,6 +828,13 @@ def _warn(message: str) -> None:
     warnings.warn(message, ChunkingWarning, stacklevel=3)
 
 
+def _is_missing_grammar_detail(canonical: str | None, detail: str) -> bool:
+    if canonical not in AST_SUPPORTED_LANGUAGES:
+        return False
+    lowered = detail.lower()
+    return any(marker in lowered for marker in _MISSING_GRAMMAR_MARKERS)
+
+
 def _code_chunks(
     units: list[ExtractedUnit],
     cfg: Config,
@@ -820,12 +848,23 @@ def _code_chunks(
     else:
         parser, detail = _load_parser(canonical)
 
+    is_missing_grammar = parser is None and _is_missing_grammar_detail(canonical, detail)
+    warned_missing_grammar = False
     chunks: list[ChunkSpec] = []
     for unit in units:
         if not unit.text.strip():
             continue
         if parser is None:
-            _warn(detail)
+            if is_missing_grammar:
+                if not warned_missing_grammar:
+                    assert canonical is not None
+                    warnings.warn(
+                        MissingGrammarWarning(detail, language=canonical),
+                        stacklevel=3,
+                    )
+                    warned_missing_grammar = True
+            else:
+                _warn(detail)
             chunks.extend(_line_fallback(unit))
             continue
         try:
