@@ -1,0 +1,18 @@
+{"id": "ml-01", "query": "why does my model overfit", "relevant": ["machine-learning/week2/bias-variance-tradeoff.md"]}
+{"id": "ml-02", "query": "stochastic gradient descent mini-batch learning rate", "relevant": ["machine-learning/week1/gradient-descent-optimization.md"]}
+{"id": "ml-03", "query": "closed form normal equations mean squared error residuals", "relevant": ["machine-learning/week1/linear-regression-and-loss.md"]}
+{"id": "ml-04", "query": "how to shrink large weights and zero out irrelevant features", "relevant": ["machine-learning/week2/regularization-and-penalties.md"]}
+{"id": "ml-05", "query": "backpropagation chain rule Adam momentum vanishing gradients", "relevant": ["machine-learning/week3/backpropagation-and-chain-rule.md"]}
+{"id": "ml-06", "query": "converting linear scores to probabilities and comparing precision recall", "relevant": ["machine-learning/week3/logistic-regression-and-classification.md"]}
+{"id": "ml-07", "query": "preventing preprocessing statistics from leaking into held-out folds", "relevant": ["machine-learning/week4/model-evaluation-and-validation.md"]}
+{"id": "ml-08", "query": "bagging random forests gradient boosting bias-variance", "relevant": ["machine-learning/week4/ensemble-methods-handout.md", "machine-learning/week4/ensemble-methods-handout.pdf"]}
+{"id": "ds-01", "query": "why doubling array capacity stays fast on average", "relevant": ["data-structures/week1/asymptotic-complexity-and-arrays.md"]}
+{"id": "ds-02", "query": "circular ring buffer queue versus linked list cache misses", "relevant": ["data-structures/week1/stacks-queues-and-linked-lists.md"]}
+{"id": "ds-03", "query": "hash collision separate chaining open addressing load factor", "relevant": ["data-structures/week2/hash-tables-and-collisions.md"]}
+{"id": "ds-04", "query": "keeping search trees balanced with rotations and building a min-heap", "relevant": ["data-structures/week2/binary-search-trees-and-heaps.md"]}
+{"id": "ds-05", "query": "finding minimum hop paths and ordering tasks in a DAG", "relevant": ["data-structures/week3/graph-representations-and-traversals.md"]}
+{"id": "ds-06", "query": "Bloom filters consistent hashing visited hash sets", "relevant": ["data-structures/week3/hashing-in-graph-algorithms.md", "data-structures/week3/hashing-in-graph-algorithms.pdf"]}
+{"id": "lg-01", "query": "tautology CNF De Morgan modus ponens resolution", "relevant": ["4CCS1LGC-logic/week1/propositional-logic-and-truth-tables.md"]}
+{"id": "lg-02", "query": "base case and inductive hypothesis for summation", "relevant": ["4CCS1LGC-logic/week1/proof-by-induction-foundations.md"]}
+{"id": "lg-03", "query": "why swapping universal and existential quantifiers changes meaning", "relevant": ["4CCS1LGC-logic/week2/predicate-logic-and-quantifiers.md"]}
+{"id": "lg-04", "query": "strong induction structural induction soundness syntax trees", "relevant": ["4CCS1LGC-logic/week2/structural-induction-and-soundness.md", "4CCS1LGC-logic/week2/structural-induction-and-soundness.pdf"]}

@@ -72,7 +72,7 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-seekr = ["web_assets/*"]
+seekr = ["web_assets/*", "demo_course/**/*"]
 
 [tool.ruff]
 line-length = 100
