@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from _cli_output import strip_ansi
 from seekr import cli_web
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,12 +86,13 @@ def test_register_adds_web_with_frozen_options() -> None:
     cli_web.register(fresh)
 
     result = _runner().invoke(fresh, ["web", "--help"])
+    output = strip_ansi(result.output)
 
     assert result.exit_code == 0, result.output
-    assert "--port" in result.output
-    assert "--open-browser" in result.output
-    assert "8000" in result.output
-    assert "ephemeral" in result.output
+    assert "--port" in output
+    assert "--open-browser" in output
+    assert "8000" in output
+    assert "ephemeral" in output
 
 
 def test_help_does_not_create_backend_or_run_server(
@@ -108,10 +110,11 @@ def test_help_does_not_create_backend_or_run_server(
     )
 
     result = _invoke(["web", "--help"])
+    output = strip_ansi(result.output)
 
     assert result.exit_code == 0, result.output
-    assert "--port" in result.output
-    assert "--open-browser" in result.output
+    assert "--port" in output
+    assert "--open-browser" in output
 
 
 def test_port_zero_and_open_browser_pass_through(

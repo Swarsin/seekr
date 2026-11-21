@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from _cli_output import strip_ansi
 from seekr.config import Config
 from seekr.indexer import SyncReport
 from seekr.lifecycle import RebuildError, rebuild_index
@@ -276,7 +277,7 @@ class CliReindexGuardTests(unittest.TestCase):
         result = self._runner().invoke(self._app(), ["reindex", "--help"])
 
         self.assertEqual(result.exit_code, 0, result.output)
-        output = " ".join(result.output.split())
+        output = " ".join(strip_ansi(result.output).split())
         self.assertIn("--force", output)
         self.assertIn("--allow-empty", output)
         self.assertIn("indexing errors", output)

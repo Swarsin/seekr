@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from _cli_output import strip_ansi
 from seekr import cli_daemon, cli_search, client, daemon
 from seekr.config import Config
 from seekr.embed import FakeEmbedder
@@ -979,10 +980,11 @@ class DaemonCommandRegistrationTests(unittest.TestCase):
         app = typer.Typer()
         cli_daemon.register(app)
         result = CliRunner().invoke(app, ["daemon", "--help"])
+        output = strip_ansi(result.output)
 
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("--socket", result.output)
-        self.assertIn("--debounce", result.output)
+        self.assertIn("--socket", output)
+        self.assertIn("--debounce", output)
 
 
 @unittest.skipUnless(

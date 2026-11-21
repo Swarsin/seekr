@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from _cli_output import strip_ansi
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 CLI_PATH = SRC / "seekr" / "cli.py"
@@ -88,10 +90,11 @@ class CliRegistrationTests(unittest.TestCase):
 
     def test_root_help_lists_all_commands(self) -> None:
         result = self._invoke(["--help"])
+        output = strip_ansi(result.output)
 
         self.assertEqual(result.exit_code, 0, result.output)
         for command in ("doctor", *MODULE_COMMANDS):
-            self.assertIn(command, result.output)
+            self.assertIn(command, output)
 
     def test_all_module_command_names_are_on_the_app(self) -> None:
         from seekr.cli import app
@@ -126,9 +129,10 @@ class CliRegistrationTests(unittest.TestCase):
         for command, options in expected_options.items():
             with self.subTest(command=command):
                 result = self._invoke([command, "--help"])
+                output = strip_ansi(result.output)
                 self.assertEqual(result.exit_code, 0, result.output)
                 for option in options:
-                    self.assertIn(option, result.output)
+                    self.assertIn(option, output)
 
     def test_importing_cli_does_not_load_model_backends(self) -> None:
         script = (
