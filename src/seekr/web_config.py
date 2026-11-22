@@ -20,6 +20,7 @@ import stat
 import tempfile
 import threading
 import tomllib
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,6 +36,8 @@ __all__ = [
     "config_revision",
     "inspect_config",
     "read_roots",
+    "set_roots",
+    "toml_string",
 ]
 
 ROOTS_LIMIT = 50
@@ -210,7 +213,7 @@ def inspect_config(config_path: Path) -> ConfigInspection:
     )
 
 
-def _validate_submitted_root(path_value: object) -> Path:
+def _validate_root_string(path_value: object) -> str:
     if not isinstance(path_value, str):
         raise _invalid_root("root path must be a string")
     if "\x00" in path_value:
@@ -225,9 +228,14 @@ def _validate_submitted_root(path_value: object) -> Path:
         )
     if not path_value.strip():
         raise _invalid_root("root path must not be empty")
+    return path_value
+
+
+def _validate_submitted_root(path_value: object) -> Path:
+    validated = _validate_root_string(path_value)
 
     try:
-        expanded = Path(path_value).expanduser()
+        expanded = Path(validated).expanduser()
         resolved = expanded.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise _invalid_root(f"root path does not exist or cannot be resolved: {_safe_message(exc)}") from exc
@@ -253,7 +261,7 @@ def _canonical_existing(value: str) -> Path | None:
         return None
 
 
-def _toml_string(value: str) -> str:
+def toml_string(value: str) -> str:
     """Encode a TOML basic string, escaping every required control character."""
     if "\x00" in value:
         raise ValueError("NUL is not allowed")
@@ -521,6 +529,10 @@ def _current_raw(path: Path) -> bytes:
         raise _config_invalid(path, f"cannot re-read config file: {_safe_message(exc)}") from exc
 
 
+def _format_roots_array(roots: Sequence[str]) -> str:
+    return "[" + ", ".join(toml_string(item) for item in roots) + "]"
+
+
 def add_root(config_path: Path, path: str, revision: str) -> RootsConfig:
     """Append one canonical directory to the config, preserving other bytes.
 
@@ -532,9 +544,76 @@ def add_root(config_path: Path, path: str, revision: str) -> RootsConfig:
         return _add_root_locked(config_path, path, revision)
 
 
+def set_roots(
+    config_path: Path,
+    roots: Sequence[Path],
+    revision: str | None = None,
+) -> RootsConfig:
+    """Replace the configured ``roots`` array, preserving comments and other keys."""
+    with _WRITE_LOCK:
+        return _set_roots_locked(config_path, roots, revision)
+
+
 def _add_root_locked(config_path: Path, path: str, revision: str) -> RootsConfig:
-    config_path = _absolute(config_path)
     resolved = _validate_submitted_root(path)
+    checked_revision = revision if isinstance(revision, str) else ""
+
+    def compute(existing_roots: tuple[str, ...]) -> tuple[str, ...]:
+        for existing in existing_roots:
+            candidate = _canonical_existing(existing)
+            if candidate == resolved:
+                raise ApiError(
+                    409,
+                    "duplicate_root",
+                    f"root is already configured: {resolved}",
+                    {"path": str(resolved)},
+                )
+        if len(existing_roots) >= ROOTS_LIMIT:
+            raise ApiError(
+                400,
+                "roots_limit",
+                f"at most {ROOTS_LIMIT} roots can be configured",
+            )
+        return (*existing_roots, str(resolved))
+
+    return _rewrite_roots(
+        config_path,
+        compute,
+        checked_revision,
+        preserve_array_padding=True,
+    )
+
+
+def _set_roots_locked(
+    config_path: Path,
+    roots: Sequence[Path],
+    revision: str | None,
+) -> RootsConfig:
+    if len(roots) > ROOTS_LIMIT:
+        raise ApiError(
+            400,
+            "roots_limit",
+            f"at most {ROOTS_LIMIT} roots can be configured",
+        )
+    validated: list[str] = []
+    for item in roots:
+        try:
+            raw_value = os.fspath(item)
+        except TypeError as exc:
+            raise _invalid_root("root path must be a path or string") from exc
+        validated.append(_validate_root_string(raw_value))
+    new_roots = tuple(validated)
+    return _rewrite_roots(config_path, lambda _existing: new_roots, revision)
+
+
+def _rewrite_roots(
+    config_path: Path,
+    compute_roots: Callable[[tuple[str, ...]], tuple[str, ...]],
+    revision: str | None,
+    *,
+    preserve_array_padding: bool = False,
+) -> RootsConfig:
+    config_path = _absolute(config_path)
 
     if config_path.is_symlink():
         raise _config_invalid(config_path, "refusing to replace a symlink config file")
@@ -543,7 +622,7 @@ def _add_root_locked(config_path: Path, path: str, revision: str) -> RootsConfig
     parsed = _parse_toml(raw, config_path)
     _load_validated(config_path)
     original_revision = _revision(raw)
-    if not isinstance(revision, str) or revision != original_revision:
+    if revision is not None and (not isinstance(revision, str) or revision != original_revision):
         raise ApiError(
             409,
             "stale_config",
@@ -551,25 +630,8 @@ def _add_root_locked(config_path: Path, path: str, revision: str) -> RootsConfig
         )
 
     existing_roots = _stored_roots(parsed, config_path)
-    canonical = resolved
-    for existing in existing_roots:
-        candidate = _canonical_existing(existing)
-        if candidate == canonical:
-            raise ApiError(
-                409,
-                "duplicate_root",
-                f"root is already configured: {resolved}",
-                {"path": str(resolved)},
-            )
-    if len(existing_roots) >= ROOTS_LIMIT:
-        raise ApiError(
-            400,
-            "roots_limit",
-            f"at most {ROOTS_LIMIT} roots can be configured",
-        )
+    new_roots = compute_roots(existing_roots)
 
-    new_roots = (*existing_roots, str(resolved))
-    new_value = _toml_string(str(resolved))
     text = raw.decode("utf-8")
     span, has_table, span_error = _find_roots_span(text)
     if span_error is not None:
@@ -577,7 +639,11 @@ def _add_root_locked(config_path: Path, path: str, revision: str) -> RootsConfig
 
     if span is not None:
         start, end = span
-        candidate_text = text[:start] + _with_new_root(text[start:end], new_value) + text[end:]
+        if preserve_array_padding and len(new_roots) == len(existing_roots) + 1:
+            replacement = _with_new_root(text[start:end], toml_string(new_roots[-1]))
+        else:
+            replacement = _format_roots_array(new_roots)
+        candidate_text = text[:start] + replacement + text[end:]
     else:
         if has_table:
             raise _config_invalid(
@@ -588,7 +654,7 @@ def _add_root_locked(config_path: Path, path: str, revision: str) -> RootsConfig
         prefix = text
         if prefix and not prefix.endswith(("\n", "\r")):
             prefix += newline
-        candidate_text = f"{prefix}roots = [{new_value}]{newline}"
+        candidate_text = f"{prefix}roots = {_format_roots_array(new_roots)}{newline}"
 
     candidate = candidate_text.encode("utf-8")
     try:

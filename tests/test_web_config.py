@@ -18,6 +18,8 @@ from seekr.web_config import (
     config_revision,
     inspect_config,
     read_roots,
+    set_roots,
+    toml_string,
 )
 from seekr.web_contract import ApiError
 
@@ -416,3 +418,68 @@ def test_read_roots_displays_stored_order_and_form(tmp_path: Path) -> None:
 
     assert snapshot.roots == ("relative/path", "~/notes", "/absolute")
     assert snapshot.revision == hashlib.sha256(config.read_bytes()).hexdigest()
+
+
+def test_toml_string_roundtrips_tricky_values() -> None:
+    import tomllib
+
+    values = [
+        'quote"dir',
+        "back\\slash",
+        "tab\tnew\nline",
+        "unicodé/日本語",
+    ]
+    for value in values:
+        parsed = tomllib.loads(f"v = {toml_string(value)}\n")
+        assert parsed["v"] == value
+
+
+def test_set_roots_preserves_comments_and_other_keys(tmp_path: Path) -> None:
+    old = _root(tmp_path, "old")
+    new1 = _root(tmp_path, "new1")
+    new2 = _root(tmp_path, "new2")
+    config = _write(
+        tmp_path / "config.toml",
+        (
+            "# top comment\n"
+            "poll_interval_seconds = 30\n"
+            f"roots = [{_toml_path(old)}]  # inline comment\n"
+            "# bottom comment\n"
+            'embed_model = "custom/model"\n'
+        ),
+    )
+
+    snapshot = set_roots(config, [new1, new2], revision=config_revision(config))
+
+    text = config.read_text(encoding="utf-8")
+    assert "# top comment\n" in text
+    assert "poll_interval_seconds = 30\n" in text
+    assert "# inline comment\n" in text
+    assert "# bottom comment\n" in text
+    assert 'embed_model = "custom/model"\n' in text
+    assert snapshot.roots == (str(new1), str(new2))
+    loaded = load_config(config)
+    assert loaded.roots == (new1, new2)
+    assert loaded.poll_interval_seconds == 30
+    assert loaded.embed_model == "custom/model"
+
+
+def test_set_roots_appends_when_absent_and_checks_revision(tmp_path: Path) -> None:
+    root = _root(tmp_path, "docs")
+    config = _write(tmp_path / "config.toml", "poll_interval_seconds = 45\n")
+    before = config.read_bytes()
+
+    with pytest.raises(ApiError) as raised:
+        set_roots(config, [root], revision="0" * 64)
+    assert _code(raised.value) == "stale_config"
+    assert config.read_bytes() == before
+
+    snapshot = set_roots(config, [root])
+    assert snapshot.roots == (str(root),)
+    loaded = load_config(config)
+    assert loaded.roots == (root,)
+    assert loaded.poll_interval_seconds == 45
+
+    cleared = set_roots(config, [])
+    assert cleared.roots == ()
+    assert load_config(config).roots == ()

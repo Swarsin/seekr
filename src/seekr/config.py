@@ -40,13 +40,21 @@ def _xdg_path(env_var: str, fallback: Path) -> Path:
 
 
 def default_config_path() -> Path:
-    """Return $XDG_CONFIG_HOME/seekr/config.toml, falling back to ~/.config."""
+    """Return $SEEKR_CONFIG or $XDG_CONFIG_HOME/seekr/config.toml (fallback ~/.config)."""
+    raw = os.environ.get("SEEKR_CONFIG")
+    if raw is not None and raw.strip():
+        return Path(raw.strip()).expanduser()
     return _xdg_path("XDG_CONFIG_HOME", Path(".config")) / "seekr" / "config.toml"
+
+
+def default_data_dir() -> Path:
+    """Return $XDG_DATA_HOME/seekr, falling back to ~/.local/share/seekr."""
+    return _xdg_path("XDG_DATA_HOME", Path(".local") / "share") / "seekr"
 
 
 def default_db_path() -> Path:
     """Return $XDG_DATA_HOME/seekr/index.db, falling back to ~/.local/share."""
-    return _xdg_path("XDG_DATA_HOME", Path(".local") / "share") / "seekr" / "index.db"
+    return default_data_dir() / "index.db"
 
 
 @dataclass(frozen=True)

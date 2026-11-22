@@ -16,7 +16,7 @@ import os
 import stat as stat_module
 import time
 import warnings
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Literal
@@ -42,6 +42,7 @@ __all__ = [
     "Indexer",
     "SyncReport",
     "grammar_summary_message",
+    "is_ignored",
 ]
 
 IndexResult = Literal["added", "updated", "unchanged", "skipped", "removed"]
@@ -163,6 +164,65 @@ def _is_symlink_loop(exc: BaseException) -> bool:
     return getattr(exc, "errno", None) == errno.ELOOP
 
 
+def _compile_ignore_patterns(
+    patterns: Sequence[str],
+) -> tuple[frozenset[str], tuple[str, ...]]:
+    exact_parts: set[str] = set()
+    glob_patterns: list[str] = []
+    for raw_pattern in patterns:
+        pattern = str(raw_pattern).strip().removeprefix("./")
+        if not pattern:
+            continue
+        if not any(ch in pattern for ch in ("/", "*", "?", "[", "]")):
+            exact_parts.add(pattern)
+        else:
+            glob_patterns.append(pattern)
+    return frozenset(exact_parts), tuple(glob_patterns)
+
+
+def _is_ignored_compiled(
+    path: Path,
+    root: Path | None,
+    exact_parts: frozenset[str],
+    glob_patterns: tuple[str, ...],
+) -> bool:
+    if not exact_parts and not glob_patterns:
+        return False
+
+    candidate = Path(path)
+    if exact_parts and any(part in exact_parts for part in candidate.parts if part):
+        return True
+    if not glob_patterns:
+        return False
+
+    relatives: list[str] = []
+    if root is not None:
+        try:
+            relatives.append(candidate.relative_to(root).as_posix())
+        except ValueError:
+            pass
+    relatives.append(candidate.as_posix())
+
+    for pattern in glob_patterns:
+        if any(fnmatch.fnmatchcase(part, pattern) for part in candidate.parts if part):
+            return True
+        for relative in relatives:
+            if fnmatch.fnmatchcase(relative, pattern):
+                return True
+            try:
+                if PurePosixPath(relative).match(pattern):
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
+def is_ignored(path: Path, root: Path | None, globs: Sequence[str]) -> bool:
+    """Return whether *path* under *root* matches any pattern in *globs*."""
+    exact_parts, glob_patterns = _compile_ignore_patterns(globs)
+    return _is_ignored_compiled(path, root, exact_parts, glob_patterns)
+
+
 class Indexer:
     """Synchronise files into a Store without re-embedding unchanged text."""
 
@@ -188,18 +248,9 @@ class Indexer:
         patterns = self.cfg.ignore_globs
         if self._ignore_cache_key is patterns:
             return
-        exact_parts: set[str] = set()
-        glob_patterns: list[str] = []
-        for raw_pattern in patterns:
-            pattern = str(raw_pattern).strip().removeprefix("./")
-            if not pattern:
-                continue
-            if not any(ch in pattern for ch in ("/", "*", "?", "[", "]")):
-                exact_parts.add(pattern)
-            else:
-                glob_patterns.append(pattern)
-        self._ignore_exact_parts = frozenset(exact_parts)
-        self._ignore_glob_patterns = tuple(glob_patterns)
+        self._ignore_exact_parts, self._ignore_glob_patterns = (
+            _compile_ignore_patterns(patterns)
+        )
         self._ignore_cache_key = patterns
 
     # -- public API --------------------------------------------------------
@@ -1399,41 +1450,9 @@ class Indexer:
 
     def _is_ignored(self, path: Path, root: Path | None = None) -> bool:
         self._compile_ignore_patterns()
-        if not self._ignore_exact_parts and not self._ignore_glob_patterns:
-            return False
-
-        candidate = Path(path)
-        if self._ignore_exact_parts and any(
-            part in self._ignore_exact_parts for part in candidate.parts if part
-        ):
-            return True
-        if not self._ignore_glob_patterns:
-            return False
-
-        relatives: list[str] = []
-        if root is not None:
-            try:
-                relatives.append(candidate.relative_to(root).as_posix())
-            except ValueError:
-                pass
-        relatives.append(candidate.as_posix())
-
-        for pattern in self._ignore_glob_patterns:
-            if any(
-                fnmatch.fnmatchcase(part, pattern)
-                for part in candidate.parts
-                if part
-            ):
-                return True
-            for relative in relatives:
-                if fnmatch.fnmatchcase(relative, pattern):
-                    return True
-                try:
-                    if PurePosixPath(relative).match(pattern):
-                        return True
-                except ValueError:
-                    continue
-        return False
+        return _is_ignored_compiled(
+            path, root, self._ignore_exact_parts, self._ignore_glob_patterns
+        )
 
     @staticmethod
     def _merge_outcome(report: SyncReport, outcome: _Outcome) -> None:

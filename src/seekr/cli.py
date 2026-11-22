@@ -9,6 +9,7 @@ from . import (
     cli_daemon,
     cli_eval,
     cli_index,
+    cli_init,
     cli_models,
     cli_open,
     cli_search,
@@ -102,6 +103,7 @@ def completion(
 cli_daemon.register(app)
 cli_eval.register(app)
 cli_index.register(app)
+cli_init.register(app)
 cli_models.register(app)
 cli_open.register(app)
 cli_search.register(app)

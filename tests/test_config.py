@@ -9,7 +9,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest import mock
 
-from seekr.config import Config, ConfigError, load_config
+from seekr.config import Config, ConfigError, default_config_path, load_config
 from seekr.models import ChunkSpec, ExtractedUnit, Hit, text_sha
 
 
@@ -120,10 +120,54 @@ class ConfigLoadingTests(unittest.TestCase):
             config_dir = Path(tmp) / "seekr"
             config_dir.mkdir()
             self._write(config_dir, 'embed_model = "xdg/model"\n')
-            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}, clear=False):
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}, clear=True):
                 cfg = load_config()
 
         self.assertEqual(cfg.embed_model, "xdg/model")
+
+    def test_seekr_config_env_var(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            custom = base / "alt" / "custom.toml"
+            custom.parent.mkdir(parents=True)
+            custom.write_text('embed_model = "env/model"\n', encoding="utf-8")
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": str(base),
+                    "XDG_CONFIG_HOME": str(base / "xdg"),
+                    "SEEKR_CONFIG": str(custom),
+                },
+                clear=True,
+            ):
+                self.assertEqual(default_config_path(), custom)
+                self.assertEqual(load_config().embed_model, "env/model")
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": str(base),
+                    "XDG_CONFIG_HOME": str(base / "xdg"),
+                    "SEEKR_CONFIG": "~/tilde.toml",
+                },
+                clear=True,
+            ):
+                self.assertEqual(default_config_path(), base / "tilde.toml")
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": str(base),
+                    "XDG_CONFIG_HOME": str(base / "xdg"),
+                    "SEEKR_CONFIG": "   ",
+                },
+                clear=True,
+            ):
+                self.assertEqual(
+                    default_config_path(),
+                    base / "xdg" / "seekr" / "config.toml",
+                )
 
     def test_wrong_value_types_raise(self) -> None:
         cases = [
