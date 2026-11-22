@@ -2,11 +2,14 @@
 
 Chunk kinds
 -----------
-``text`` / ``pdf``
+``text`` / ``pdf`` / ``slides`` / ``notebook``
     Word windows using the configured target, maximum and overlap.
 ``markdown``
     Sections keyed by their heading path (``§A > B``), windowed when long.
     ``loc_start`` is the source line of the first word in the chunk.
+``word``
+    Markdown-shaped extraction chunked like Markdown, falling back to
+    ``¶<line>`` when a chunk has no heading locator.
 ``code``
     Function and class chunks from a real tree-sitter AST, including useful
     module-level code, with ``L<start>-<end>`` locators.  Unsupported
@@ -134,10 +137,12 @@ def chunk(
     if not units or not any(unit.text.strip() for unit in units):
         return []
 
-    if kind in {"text", "pdf"}:
+    if kind in {"text", "pdf", "slides", "notebook"}:
         return _prose_chunks(units, cfg)
     if kind == "markdown":
         return _markdown_chunks(units, cfg)
+    if kind == "word":
+        return _word_chunks(units, cfg)
     if kind == "code":
         return _code_chunks(units, cfg, language)
     if kind == "transcript":
@@ -342,6 +347,17 @@ def _markdown_chunks(units: list[ExtractedUnit], cfg: Config) -> list[ChunkSpec]
                     )
                 )
     return chunks
+
+
+def _word_chunks(units: list[ExtractedUnit], cfg: Config) -> list[ChunkSpec]:
+    return [
+        ChunkSpec(
+            text=spec.text,
+            locator=spec.locator or f"\u00b6{int(spec.loc_start)}",
+            loc_start=spec.loc_start,
+        )
+        for spec in _markdown_chunks(units, cfg)
+    ]
 
 
 # ---------------------------------------------------------------------------

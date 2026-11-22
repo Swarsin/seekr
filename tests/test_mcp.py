@@ -368,3 +368,13 @@ class McpModuleWeekTests(unittest.TestCase):
         self.assertFalse(sim_resp["result"]["isError"])
         self.assertEqual(similar_calls[0][1]["module"], "ml")
         self.assertEqual(similar_calls[0][1]["week"], "4")
+
+    def test_tools_list_kind_enums_include_office_and_notebooks(self) -> None:
+        server = McpServer()
+        response = server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        assert response is not None
+        tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+        expected = {"code", "markdown", "notebook", "pdf", "slides", "text", "transcript", "word"}
+        for tool_name in ("search", "similar"):
+            enum_values = set(tools[tool_name]["inputSchema"]["properties"]["kind"]["enum"])
+            self.assertEqual(enum_values, expected)

@@ -2249,3 +2249,12 @@ def test_hit_dto_has_labels() -> None:
         )
         assert response.status == 200
         assert response.json()["hits"] == [hit.to_dict()]
+
+
+def test_index_html_kind_filter_includes_office_and_notebook_options() -> None:
+    assets = importlib.resources.files("seekr") / "web_assets"
+    html_text = (assets / "index.html").read_text(encoding="utf-8")
+    js_text = (assets / "app.js").read_text(encoding="utf-8")
+    for kind in ("pdf", "markdown", "text", "code", "transcript", "word", "slides", "notebook"):
+        assert f'<option value="{kind}">' in html_text
+        assert f"{kind}:" in js_text

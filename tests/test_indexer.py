@@ -1459,5 +1459,81 @@ class CourseLabelIndexTests(_IndexerTestCase):
             )
 
 
+class OfficeAndNotebookIndexTests(_IndexerTestCase):
+    def test_legacy_doc_is_warned_and_skipped(self) -> None:
+        self.write("notes.txt", "valid indexable text")
+        legacy_doc = self.root / "old.doc"
+        legacy_doc.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1legacy doc")
+        legacy_ppt = self.root / "old.ppt"
+        legacy_ppt.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1legacy ppt")
+
+        report = self.indexer.sync([self.root])
+
+        self.assertEqual(report.added, 1)
+        self.assertEqual(report.skipped, 2)
+        self.assertEqual(report.errors, [])
+        expected_msg = (
+            "legacy Office format is not indexed; save it as .docx/.pptx to include it"
+        )
+        warnings_by_path = dict(report.warnings)
+        self.assertEqual(warnings_by_path.get(str(legacy_doc.resolve())), expected_msg)
+        self.assertEqual(warnings_by_path.get(str(legacy_ppt.resolve())), expected_msg)
+        self.assertIsNone(self.stored(legacy_doc))
+        self.assertIsNone(self.stored(legacy_ppt))
+
+    def test_corrupt_office_and_bad_notebook_are_isolated_per_file(self) -> None:
+        import json
+
+        import docx
+        import pptx
+
+        good_doc = docx.Document()
+        good_doc.add_paragraph("Valid word document content for indexing.")
+        good_docx_path = self.root / "good.docx"
+        good_doc.save(good_docx_path)
+
+        good_prs = pptx.Presentation()
+        slide = good_prs.slides.add_slide(good_prs.slide_layouts[0])
+        slide.shapes.title.text = "Valid slide deck content."
+        good_pptx_path = self.root / "good.pptx"
+        good_prs.save(good_pptx_path)
+
+        good_nb = {
+            "nbformat": 4,
+            "nbformat_minor": 5,
+            "cells": [{"cell_type": "markdown", "source": "Valid notebook cell."}],
+        }
+        good_ipynb_path = self.root / "good.ipynb"
+        good_ipynb_path.write_text(json.dumps(good_nb), encoding="utf-8")
+
+        bad_docx = self.root / "corrupt.docx"
+        bad_docx.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 128)
+        bad_pptx = self.root / "truncated.pptx"
+        bad_pptx.write_bytes(b"PK\x03\x04truncated")
+        bad_ipynb = self.root / "broken.ipynb"
+        bad_ipynb.write_text(
+            json.dumps({"nbformat": 4, "cells": [{"cell_type": "code", "source": 123}]}),
+            encoding="utf-8",
+        )
+
+        report = self.indexer.sync([self.root])
+
+        self.assertEqual(report.added, 3)
+        self.assertEqual(report.skipped, 3)
+        self.assertEqual(len(report.errors), 3)
+        error_paths = {path for path, _ in report.errors}
+        self.assertEqual(
+            error_paths,
+            {
+                str(bad_docx.resolve()),
+                str(bad_pptx.resolve()),
+                str(bad_ipynb.resolve()),
+            },
+        )
+        self.assertIsNotNone(self.stored(good_docx_path))
+        self.assertIsNotNone(self.stored(good_pptx_path))
+        self.assertIsNotNone(self.stored(good_ipynb_path))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -32,6 +32,8 @@ _HAS_FTS5 = _has_fts5()
 _HAS_NUMPY = importlib.util.find_spec("numpy") is not None
 _HAS_SQLITE_VEC = importlib.util.find_spec("sqlite_vec") is not None
 _HAS_PYMUPDF = importlib.util.find_spec("pymupdf") is not None
+_HAS_DOCX = importlib.util.find_spec("docx") is not None
+_HAS_PPTX = importlib.util.find_spec("pptx") is not None
 
 _NEEDS_REAL_STORE = unittest.skipUnless(
     _HAS_NUMPY and _HAS_SQLITE_VEC and _HAS_FTS5,
@@ -69,15 +71,30 @@ class DemoCourseTests(unittest.TestCase):
         pdfs = [p for p in course if p.suffix == ".pdf"]
         self.assertGreaterEqual(len(pdfs), 2)
         self.assertLessEqual(len(pdfs), 3)
+        docx_files = [p for p in course if p.suffix == ".docx"]
+        pptx_files = [p for p in course if p.suffix == ".pptx"]
+        ipynb_files = [p for p in course if p.suffix == ".ipynb"]
+        self.assertGreaterEqual(len(docx_files), 1)
+        self.assertGreaterEqual(len(pptx_files), 1)
+        self.assertGreaterEqual(len(ipynb_files), 1)
         self.assertLess(sum(p.stat().st_size for p in files), 1_000_000)
 
+        extract_kinds = {
+            ".pdf": ("pdf", _HAS_PYMUPDF),
+            ".docx": ("word", _HAS_DOCX),
+            ".pptx": ("slides", _HAS_PPTX),
+            ".ipynb": ("notebook", True),
+        }
         for path in course:
             if path.suffix == ".md":
                 words = len(path.read_text(encoding="utf-8").split())
                 self.assertGreaterEqual(words, 150, path.name)
                 self.assertLessEqual(words, 600, path.name)
-            elif path.suffix == ".pdf" and _HAS_PYMUPDF:
-                result = extract(path, "pdf")
+            elif path.suffix in extract_kinds:
+                kind, available = extract_kinds[path.suffix]
+                if not available:
+                    continue
+                result = extract(path, kind)
                 self.assertEqual(result.warnings, [], path.name)
                 text = " ".join(unit.text for unit in result.units)
                 words = len(text.split())
@@ -88,7 +105,7 @@ class DemoCourseTests(unittest.TestCase):
         root = seekr.demo_course_path()
         lines = (root / "queries.jsonl").read_text(encoding="utf-8").splitlines()
         self.assertGreaterEqual(len(lines), 12)
-        self.assertLessEqual(len(lines), 20)
+        self.assertLessEqual(len(lines), 25)
         for line in lines:
             q = json.loads(line)
             self.assertTrue(q["relevant"])

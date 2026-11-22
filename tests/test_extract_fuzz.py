@@ -249,3 +249,123 @@ def test_fuzz_transcript_lines_extract_and_chunk(lines: list[str]) -> None:
         result = extract(path, "transcript")
         chunks = chunk("transcript", result.units, cfg)
         assert all(item.text.strip() for item in chunks)
+
+
+def _sample_docx_bytes() -> bytes:
+    import io
+
+    import docx
+
+    doc = docx.Document()
+    doc.add_heading("Topic", level=1)
+    doc.add_paragraph("Sample body text for truncation fuzzing.")
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def _sample_pptx_bytes() -> bytes:
+    import io
+
+    import pptx
+
+    prs = pptx.Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
+    slide.shapes.title.text = "Deck Title"
+    slide.placeholders[1].text = "Slide body text for truncation fuzzing."
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+_VALID_DOCX_BYTES = _sample_docx_bytes()
+_VALID_PPTX_BYTES = _sample_pptx_bytes()
+
+
+@_HYPOTHESIS_SETTINGS
+@given(
+    kind=st.sampled_from(["word", "slides", "notebook"]),
+    payload=st.binary(min_size=0, max_size=4096),
+)
+def test_fuzz_random_bytes_as_document_kinds(kind: str, payload: bytes) -> None:
+    cfg = Config()
+    suffix = {"word": ".docx", "slides": ".pptx", "notebook": ".ipynb"}[kind]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / f"fuzz{suffix}"
+        path.write_bytes(payload)
+        try:
+            result = extract(path, kind)
+        except ExtractionError:
+            return
+        chunks = chunk(kind, result.units, cfg)
+        assert all(item.text.strip() for item in chunks)
+
+
+@_HYPOTHESIS_SETTINGS
+@given(
+    kind=st.sampled_from(["word", "slides"]),
+    data=st.data(),
+)
+def test_fuzz_truncated_office_archives(kind: str, data: st.DataObject) -> None:
+    cfg = Config()
+    sample = _VALID_DOCX_BYTES if kind == "word" else _VALID_PPTX_BYTES
+    suffix = ".docx" if kind == "word" else ".pptx"
+    cutoff = data.draw(st.integers(min_value=0, max_value=len(sample) - 1))
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / f"truncated{suffix}"
+        path.write_bytes(sample[:cutoff])
+        try:
+            result = extract(path, kind)
+        except ExtractionError:
+            return
+        chunks = chunk(kind, result.units, cfg)
+        assert all(item.text.strip() for item in chunks)
+
+
+class CorruptOfficeAndNotebookTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.cfg = Config()
+
+    def test_corrupt_xml_inside_office_archives_raises_extraction_error(self) -> None:
+        import io
+        import zipfile
+
+        for kind, sample, target_entry, ext in (
+            ("word", _VALID_DOCX_BYTES, "word/document.xml", ".docx"),
+            ("slides", _VALID_PPTX_BYTES, "ppt/presentation.xml", ".pptx"),
+        ):
+            with self.subTest(kind=kind):
+                buf = io.BytesIO()
+                with (
+                    zipfile.ZipFile(io.BytesIO(sample), "r") as zin,
+                    zipfile.ZipFile(buf, "w") as zout,
+                ):
+                    for item in zin.infolist():
+                        content = (
+                            b"<broken-xml"
+                            if item.filename == target_entry
+                            else zin.read(item.filename)
+                        )
+                        zout.writestr(item, content)
+                path = self.dir / f"corrupt{ext}"
+                path.write_bytes(buf.getvalue())
+                with self.assertRaises(ExtractionError):
+                    extract(path, kind)
+
+    def test_truncated_notebook_and_bad_cell_shapes_raise_extraction_error(self) -> None:
+        cases = {
+            "truncated.ipynb": b'{"nbformat": 4, "cells": [{"cell_type": "code"',
+            "bad_source.ipynb": b'{"nbformat": 4, "cells": [{"cell_type": "code", "source": 42}]}',
+            "non_dict_cell.ipynb": b'{"nbformat": 4, "cells": ["not-a-cell"]}',
+            "invalid_utf8.ipynb": b'{"nbformat": 4, "cells": []}\xff\xfe',
+        }
+        for name, payload in cases.items():
+            with self.subTest(name=name):
+                path = self.dir / name
+                path.write_bytes(payload)
+                with self.assertRaises(ExtractionError):
+                    extract(path, "notebook")
+

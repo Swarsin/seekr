@@ -51,6 +51,10 @@ MAX_FILE_ATTEMPTS = 3
 _READ_BLOCK = 1024 * 1024
 _SYNC_BATCH_FILES = 64
 _SYNC_BATCH_CHUNKS = 128
+_LEGACY_OFFICE_SUFFIXES = frozenset({".doc", ".ppt"})
+_LEGACY_OFFICE_WARNING = (
+    "legacy Office format is not indexed; save it as .docx/.pptx to include it"
+)
 
 
 @dataclass
@@ -120,6 +124,13 @@ class _PreparedFile:
 def _error_text(exc: BaseException) -> str:
     message = str(exc).strip()
     return message or exc.__class__.__name__
+
+
+def _warn_if_legacy_office(
+    path: Path, key: str, warnings_list: list[tuple[str, str]]
+) -> None:
+    if path.suffix.lower() in _LEGACY_OFFICE_SUFFIXES:
+        warnings_list.append((key, _LEGACY_OFFICE_WARNING))
 
 
 # Thin proxies keep the extractor patchable both as ``seekr.indexer.extract``
@@ -411,6 +422,7 @@ class Indexer:
             try:
                 kind = kind_for(resolved)
                 if kind is None:
+                    _warn_if_legacy_office(resolved, key, report.warnings)
                     report.skipped += 1
                     continue
                 notify_file = True
@@ -554,7 +566,11 @@ class Indexer:
         if key in seen:
             return
         seen.add(key)
-        if self._is_ignored(resolved) or kind_for(resolved) is None:
+        if self._is_ignored(resolved):
+            report.skipped += 1
+            return
+        if kind_for(resolved) is None:
+            _warn_if_legacy_office(resolved, key, report.warnings)
             report.skipped += 1
             return
         try:
@@ -656,6 +672,7 @@ class Indexer:
             return outcome
         kind = kind_for(path)
         if kind is None:
+            _warn_if_legacy_office(path, key, outcome.warnings)
             return outcome
 
         prepared, early = self._prepare_resolved_path(path, key, kind, force=force)
@@ -1221,6 +1238,7 @@ class Indexer:
             return self._remove_moved_source(src_resolved, src_key, outcome)
         dst_kind = kind_for(dst_resolved)
         if dst_kind is None:
+            _warn_if_legacy_office(dst_resolved, dst_key, outcome.warnings)
             return self._remove_moved_source(src_resolved, src_key, outcome)
 
         dst_stat: os.stat_result | None = None

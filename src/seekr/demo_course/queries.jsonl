@@ -16,3 +16,6 @@
 {"id": "lg-02", "query": "base case and inductive hypothesis for summation", "relevant": ["4CCS1LGC-logic/week1/proof-by-induction-foundations.md"]}
 {"id": "lg-03", "query": "why swapping universal and existential quantifiers changes meaning", "relevant": ["4CCS1LGC-logic/week2/predicate-logic-and-quantifiers.md"]}
 {"id": "lg-04", "query": "strong induction structural induction soundness syntax trees", "relevant": ["4CCS1LGC-logic/week2/structural-induction-and-soundness.md", "4CCS1LGC-logic/week2/structural-induction-and-soundness.pdf"]}
+{"id": "lg-05", "query": "natural deduction Fitch subproof assumption discharge rules", "relevant": ["4CCS1LGC-logic/week2/natural-deduction-worksheet.docx"]}
+{"id": "ds-07", "query": "Dijkstra edge relaxation negative weights Bellman-Ford", "relevant": ["data-structures/week3/shortest-paths-dijkstra-slides.pptx"]}
+{"id": "ml-09", "query": "stratified k-fold cross validation hyperparameter tuning ROC AUC", "relevant": ["machine-learning/week3/cross-validation-lab.ipynb"]}

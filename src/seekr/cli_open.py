@@ -61,7 +61,9 @@ def _build_pick_command(typer_module: Any) -> Any:
             None, "--path", help="Only search under this path prefix."
         ),
         kind: str | None = typer_module.Option(
-            None, "--kind", help="Filter by kind: pdf, code, markdown, transcript or text."
+            None,
+            "--kind",
+            help="Filter by kind: pdf, code, markdown, word, slides, notebook, transcript or text.",
         ),
         since: str | None = typer_module.Option(
             None,

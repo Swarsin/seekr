@@ -29,6 +29,9 @@ _KIND_BY_SUFFIX = {
     ".pdf": "pdf",
     ".vtt": "transcript",
     ".srt": "transcript",
+    ".docx": "word",
+    ".pptx": "slides",
+    ".ipynb": "notebook",
 }
 
 _LANGUAGE_BY_SUFFIX = {
@@ -97,6 +100,18 @@ def extract(path: Path, kind: str) -> ExtractionResult:
         return _extract_pdf(source)
     if kind == "transcript":
         return _extract_transcript(source)
+    if kind == "word":
+        from .extract_documents import extract_docx
+
+        return extract_docx(source)
+    if kind == "slides":
+        from .extract_documents import extract_pptx
+
+        return extract_pptx(source)
+    if kind == "notebook":
+        from .extract_documents import extract_notebook
+
+        return extract_notebook(source)
     raise ExtractionError(f"unsupported file kind {kind!r} for {source}")
 
 

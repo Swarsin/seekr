@@ -49,6 +49,9 @@
     text: "Plain text",
     code: "Source code",
     transcript: "Transcript",
+    word: "Word",
+    slides: "Slides",
+    notebook: "Notebook",
   };
 
   // ---------------------------------------------------------------- DOM utils

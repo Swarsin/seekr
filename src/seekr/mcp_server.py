@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
 from . import __version__
+from .filters import VALID_KINDS
 from .logging_config import log_event
 
 if TYPE_CHECKING:
@@ -21,12 +22,14 @@ __all__ = ["McpServer"]
 
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_PROTOCOL_VERSION = "2024-11-05"
+_KIND_ENUM = sorted(VALID_KINDS)
 
 _TOOLS: list[dict[str, Any]] = [
     {
         "name": "search",
         "description": (
-            "Search locally indexed files (code, Markdown notes, PDFs, text and "
+            "Search locally indexed files (code, Markdown notes, PDFs, Word "
+            "documents, PowerPoint slides, Jupyter notebooks, text and "
             "transcripts) using hybrid keyword and vector retrieval."
         ),
         "inputSchema": {
@@ -44,7 +47,7 @@ _TOOLS: list[dict[str, Any]] = [
                 "path": {"type": "string", "description": "Optional path prefix filter."},
                 "kind": {
                     "type": "string",
-                    "enum": ["code", "markdown", "pdf", "text", "transcript"],
+                    "enum": _KIND_ENUM,
                     "description": "Optional document kind filter.",
                 },
                 "since": {
@@ -85,7 +88,7 @@ _TOOLS: list[dict[str, Any]] = [
                 },
                 "kind": {
                     "type": "string",
-                    "enum": ["code", "markdown", "pdf", "text", "transcript"],
+                    "enum": _KIND_ENUM,
                 },
                 "since": {
                     "type": "string",

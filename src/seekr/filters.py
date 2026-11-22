@@ -11,7 +11,9 @@ from .course import display_module
 
 __all__ = ["VALID_KINDS", "normalise_kind", "parse_since", "parse_week", "resolve_module"]
 
-VALID_KINDS = frozenset({"pdf", "code", "markdown", "transcript", "text"})
+VALID_KINDS = frozenset(
+    {"pdf", "code", "markdown", "transcript", "text", "word", "slides", "notebook"}
+)
 
 _DURATION_MULTIPLIERS = {
     "m": 60,

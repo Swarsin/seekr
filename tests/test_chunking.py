@@ -608,5 +608,45 @@ class MissingGrammarWarningTests(unittest.TestCase):
         self.assertEqual(caught[0].message.language, "python")  # type: ignore[attr-defined]
 
 
+class OfficeAndNotebookChunkTests(unittest.TestCase):
+    def test_word_chunks_use_headings_and_pilcrow_fallback(self) -> None:
+        text = "Preamble paragraph.\n# Section One\nFirst section body.\n## Sub\nNested body.\n"
+        chunks = chunk("word", [_unit(text)], Config())
+
+        self.assertEqual(
+            [item.locator for item in chunks],
+            ["\u00b61", "\u00a7Section One", "\u00a7Section One > Sub"],
+        )
+        self.assertEqual([item.loc_start for item in chunks], [1.0, 2.0, 4.0])
+
+    def test_word_headingless_long_document_uses_pilcrow_locators(self) -> None:
+        lines = [f"line{idx} " + " ".join(_words(f"w{idx}_", 15)) for idx in range(25)]
+        cfg = _cfg(chunk_target_words=80, chunk_max_words=100, chunk_overlap_words=10)
+        chunks = chunk("word", [_unit("\n".join(lines))], cfg)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(item.locator.startswith("\u00b6") for item in chunks))
+        self.assertEqual(chunks[0].locator, "\u00b61")
+        self.assertGreater(int(chunks[1].locator[1:]), 1)
+
+    def test_slides_and_notebook_use_prose_windowing_and_keep_locators(self) -> None:
+        cfg = _cfg(chunk_target_words=10, chunk_max_words=10, chunk_overlap_words=0)
+        slide_units = [_unit(" ".join(_words("s", 15)), locator="slide 2", loc_start=2.0)]
+        slide_chunks = chunk("slides", slide_units, cfg)
+        self.assertEqual([c.locator for c in slide_chunks], ["slide 2", "slide 2"])
+        self.assertEqual([c.loc_start for c in slide_chunks], [2.0, 2.0])
+
+        nb_units = [_unit(" ".join(_words("c", 15)), locator="cell 3", loc_start=3.0)]
+        nb_chunks = chunk("notebook", nb_units, cfg)
+        self.assertEqual([c.locator for c in nb_chunks], ["cell 3", "cell 3"])
+        self.assertEqual([c.loc_start for c in nb_chunks], [3.0, 3.0])
+
+    def test_empty_units_for_new_kinds_return_empty_list(self) -> None:
+        for kind in ("word", "slides", "notebook"):
+            with self.subTest(kind=kind):
+                self.assertEqual(chunk(kind, [], Config()), [])
+                self.assertEqual(chunk(kind, [_unit("  \n ")], Config()), [])
+
+
 if __name__ == "__main__":
     unittest.main()

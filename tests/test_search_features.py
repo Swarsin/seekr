@@ -270,6 +270,17 @@ class FilterParsingTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 parse_since(bad, now=now)
 
+    def test_normalise_kind_accepts_office_and_notebook_kinds(self) -> None:
+        from seekr.filters import VALID_KINDS
+
+        self.assertEqual(
+            VALID_KINDS,
+            {"pdf", "code", "markdown", "transcript", "text", "word", "slides", "notebook"},
+        )
+        for kind in ("word", "SLIDES", " Notebook "):
+            with self.subTest(kind=kind):
+                self.assertEqual(normalise_kind(kind), kind.strip().lower())
+
 
 @unittest.skipUnless(_NEEDS_REAL_STORE, "numpy, sqlite-vec and FTS5 are required")
 class RealStoreFilterTests(unittest.TestCase):
