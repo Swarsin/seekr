@@ -3,13 +3,14 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -18,3 +19,40 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: pytest -m "not slow"
+
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build
+      - run: |
+          python -m venv /tmp/v
+          /tmp/v/bin/pip install dist/*.whl
+          version="$(/tmp/v/bin/seekr --version)"
+          echo "$version"
+          test "$version" = "seekr 0.1.1"
+          /tmp/v/bin/seekr doctor
+
+  slow:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - id: hf-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ hashFiles('src/seekr/config.py') }}
+      - if: steps.hf-cache.outputs.cache-hit != 'true'
+        run: |
+          python -c 'from sentence_transformers import SentenceTransformer; SentenceTransformer("BAAI/bge-small-en-v1.5")'
+          python -c 'from sentence_transformers import CrossEncoder; CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")'
+      - run: pytest -m slow

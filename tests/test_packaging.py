@@ -2,15 +2,81 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 import tomllib
 import unittest
+import zipfile
 from pathlib import Path
+
+import pytest
 
 import seekr
 
 ROOT = Path(__file__).resolve().parents[1]
 _HAS_TYPER = importlib.util.find_spec("typer") is not None
+_HAS_SETUPTOOLS = importlib.util.find_spec("setuptools") is not None
+
+
+def _has_build_package() -> bool:
+    """Return True when the PyPA ``build`` distribution is installed."""
+    # Check distribution metadata rather than find_spec("build") because a
+    # top-level ./build/ directory in the repo looks like a namespace package.
+    try:
+        importlib.metadata.version("build")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return True
+
+
+def _build_wheel(dist_dir: Path, stage_root: Path) -> Path:
+    """Build a wheel into ``dist_dir`` and return its path."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    if _has_build_package():
+        cmd = [
+            sys.executable,
+            "-m",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
+            str(dist_dir),
+            str(ROOT),
+        ]
+        cwd = stage_root
+    else:
+        stage = stage_root / "stage"
+        stage.mkdir(parents=True, exist_ok=True)
+        for filename in ("pyproject.toml", "LICENSE", "README.md"):
+            src_file = ROOT / filename
+            if src_file.is_file():
+                shutil.copy2(src_file, stage / filename)
+        shutil.copytree(
+            ROOT / "src",
+            stage / "src",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.egg-info"),
+        )
+        cmd = [
+            sys.executable,
+            "-c",
+            "import sys, setuptools.build_meta as bm; print(bm.build_wheel(sys.argv[1]))",
+            str(dist_dir),
+        ]
+        cwd = stage
+
+    proc = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise AssertionError(proc.stderr or proc.stdout)
+
+    wheels = list(dist_dir.glob("seekr_search-*.whl"))
+    if len(wheels) != 1:
+        raise AssertionError(f"expected one seekr_search wheel, found {list(dist_dir.iterdir())}")
+    return wheels[0]
 
 
 class PackagingMetadataTests(unittest.TestCase):
@@ -58,3 +124,36 @@ class PackagingMetadataTests(unittest.TestCase):
         for name in ("uv.lock",):
             self.assertFalse((ROOT / name).exists(), name)
         self.assertTrue((ROOT / "CHANGELOG.md").is_file())
+
+
+@pytest.mark.slow
+class WheelContentTests(unittest.TestCase):
+    @unittest.skipUnless(
+        _has_build_package() or _HAS_SETUPTOOLS,
+        "build or setuptools is required to build a wheel",
+    )
+    def test_wheel_contains_assets_and_demo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            dist_dir = tmp / "dist"
+            dist_dir.mkdir()
+            wheel_path = _build_wheel(dist_dir, tmp)
+            with zipfile.ZipFile(wheel_path) as zf:
+                names = set(zf.namelist())
+
+        for asset in ("app.js", "index.html", "styles.css"):
+            self.assertIn(f"seekr/web_assets/{asset}", names)
+        for meta in ("SOURCES.md", "queries.jsonl"):
+            self.assertIn(f"seekr/demo_course/{meta}", names)
+        for topic in ("machine-learning", "data-structures", "4CCS1LGC-logic"):
+            self.assertTrue(
+                any(n.startswith(f"seekr/demo_course/{topic}/") for n in names),
+                topic,
+            )
+        self.assertTrue(
+            any(n.startswith("seekr/demo_course/") and n.endswith(".pdf") for n in names)
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
