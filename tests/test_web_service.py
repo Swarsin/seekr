@@ -22,7 +22,9 @@ from seekr.config import Config, load_config
 from seekr.embed import FakeEmbedder
 from seekr.indexer import Indexer, SyncReport
 from seekr.lifecycle import LifecycleLock
+from seekr.locations import format_location
 from seekr.models import ChunkSpec, Hit, text_sha
+from seekr.platform_info import Mount
 from seekr.store import SCHEMA_VERSION, Store, StoredChunk
 from seekr.web_contract import ApiError, HitDTO, SearchRequest
 from seekr.web_service import WebService, _socket_is_live
@@ -476,6 +478,8 @@ def test_keyword_path_is_read_only_and_matches_local_get_hits(tmp_path: Path) ->
             module=hit.module,
             week=hit.week,
             highlights=hit.highlights,
+            location=format_location(hit.path, hit.locator, windows_path=None),
+            posix_location=format_location(hit.path, hit.locator, windows_path=None),
         ).to_dict()
         for hit in expected_hits
     ]
@@ -1611,3 +1615,93 @@ def test_search_with_spread_returns_groups(tmp_path: Path) -> None:
             {"module": "ml", "week": 2, "first": True, "chunk_ids": [102]},
             {"module": "ml", "week": 4, "first": False, "chunk_ids": [101]},
         )
+
+
+def test_hit_dto_location_windows_on_wsl(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    hits = [
+        Hit(
+            chunk_id=1,
+            path="/mnt/c/course/notes.md",
+            locator="§A > B",
+            loc_start=1.0,
+            snippet="entropy notes",
+            score=0.9,
+            kind="markdown",
+        ),
+        Hit(
+            chunk_id=2,
+            path="/home/alice/code.py",
+            locator="L10-20",
+            loc_start=10.0,
+            snippet="def entropy(): pass",
+            score=0.8,
+            kind="code",
+        ),
+        Hit(
+            chunk_id=3,
+            path="/mnt/c/course/plain.txt",
+            locator="",
+            loc_start=0.0,
+            snippet="plain entropy",
+            score=0.7,
+            kind="text",
+        ),
+    ]
+    mounts = [
+        Mount(source="C:\\", mount_point="/mnt/c", fstype="9p"),
+        Mount(source="/dev/sdd", mount_point="/", fstype="ext4"),
+    ]
+
+    with _service(
+        config_path,
+        tmp_path,
+        daemon_probe=lambda _path: True,
+        daemon_search=lambda *_args, **_kwargs: hits,
+    ) as service:
+        with (
+            mock.patch("seekr.platform_info.is_wsl", return_value=True),
+            mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
+        ):
+            wsl_result = service.search(SearchRequest("entropy", mode="hybrid"))
+
+        assert [(h.location, h.posix_location) for h in wsl_result.hits] == [
+            (
+                r"C:\course\notes.md (section A > B)",
+                "/mnt/c/course/notes.md (section A > B)",
+            ),
+            (
+                "/home/alice/code.py (lines 10-20)",
+                "/home/alice/code.py (lines 10-20)",
+            ),
+            (
+                r"C:\course\plain.txt",
+                "/mnt/c/course/plain.txt",
+            ),
+        ]
+        assert wsl_result.hits[0].to_dict()["location"] == r"C:\course\notes.md (section A > B)"
+        assert wsl_result.hits[0].to_dict()["posix_location"] == "/mnt/c/course/notes.md (section A > B)"
+
+        with (
+            mock.patch("seekr.platform_info.is_wsl", return_value=False),
+            mock.patch(
+                "seekr.platform_info.read_mounts",
+                side_effect=AssertionError("read_mounts must not run off WSL"),
+            ),
+        ):
+            linux_result = service.search(SearchRequest("entropy", mode="hybrid"))
+
+        assert [(h.location, h.posix_location) for h in linux_result.hits] == [
+            (
+                "/mnt/c/course/notes.md (section A > B)",
+                "/mnt/c/course/notes.md (section A > B)",
+            ),
+            (
+                "/home/alice/code.py (lines 10-20)",
+                "/home/alice/code.py (lines 10-20)",
+            ),
+            (
+                "/mnt/c/course/plain.txt",
+                "/mnt/c/course/plain.txt",
+            ),
+        ]

@@ -18,7 +18,14 @@ from pathlib import Path
 
 from .models import Hit
 
-__all__ = ["format_pick_line", "open_command", "parse_pick_line"]
+__all__ = [
+    "OPEN_SUCCESS_CODES",
+    "format_pick_line",
+    "open_command",
+    "parse_pick_line",
+]
+
+OPEN_SUCCESS_CODES: dict[str, frozenset[int]] = {"explorer.exe": frozenset({0, 1})}
 
 _MAX_SNIPPET_CHARS = 240
 _LINE_LOCATOR_RE = re.compile(r"L(\d+)(?:-\d+)?\Z")
@@ -289,16 +296,30 @@ def open_command(
     kind: str,
     env: Mapping[str, str],
     which: Callable[[str], str | None],
+    *,
+    wsl: bool = False,
+    to_windows: Callable[[str], str | None] | None = None,
 ) -> list[str]:
     """Build the argv that opens *path* at *locator*.
 
     The caller executes the returned argv directly; it is never passed through
-    a shell.  PDFs use zathura when present, located text uses ``$EDITOR``
-    (split with :mod:`shlex`) at the line, Markdown heading locators use the
-    exact heading line when it can still be found, and everything else falls
-    back to ``xdg-open``.
+    a shell.  On WSL (``wsl=True``), ``wslview`` is preferred and otherwise the
+    path is converted for ``explorer.exe``.  On native Linux, PDFs use zathura
+    when present, located text uses ``$EDITOR`` (split with :mod:`shlex`) at
+    the line, Markdown heading locators use the exact heading line when it can
+    still be found, and everything else falls back to ``xdg-open``.
     """
     safe_path = _safe_argv_path(path)
+
+    if wsl:
+        if which("wslview"):
+            return ["wslview", safe_path]
+        win = to_windows(path) if to_windows is not None else None
+        if not win:
+            raise ValueError(
+                f"cannot convert {path} to a Windows path; install wslu for wslview"
+            )
+        return ["explorer.exe", win]
 
     if kind == "pdf":
         page = _page_number(locator)

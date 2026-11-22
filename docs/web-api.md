@@ -304,10 +304,10 @@ Config-write safety details are part of the contract:
   `spread` is omitted from the response.
 - Preserve result ordering from `Searcher`/`get_hits`. Serialize `Hit` fields
   `chunk_id`, `path`, `locator`, `loc_start`, `snippet`, `score`, `kind`,
-  `module`, `week`, and `highlights` (`number[][]` of `[start, end]` character
-  offsets into `snippet`); omit `explain` entirely (do not emit
-  `explain: null`). Do not mislabel scores as confidence percentages.
-  Rerank/explain controls are out of scope.
+  `module`, `week`, `highlights` (`number[][]` of `[start, end]` character
+  offsets into `snippet`), `location`, and `posix_location`; omit `explain`
+  entirely (do not emit `explain: null`). Do not mislabel scores as confidence
+  percentages. Rerank/explain controls are out of scope.
 - `took_ms` is the server-measured search duration, excluding HTTP body parsing
   and response writing. It is a number, not a formatted string.
 - Keyword search bypasses the engine lane with the true read-only path below
@@ -685,9 +685,12 @@ must respect the lane, daemon, read-only, and lifecycle rules above.
 DTOs are frozen dataclasses with `to_dict()` methods:
 
 - `HitDTO(chunk_id, path, locator, loc_start, snippet, score, kind,
-  module=None, week=None, highlights=())`; `highlights` is
-  `tuple[tuple[int, int], ...]` and serializes to `number[][]` of `[start, end]`
-  offsets; no `explain` field, and `to_dict()` must not emit `explain`.
+  module=None, week=None, highlights=(), location="", posix_location="")`;
+  `highlights` is `tuple[tuple[int, int], ...]` and serializes to `number[][]`
+  of `[start, end]` offsets; `location` is the human-readable display location
+  (Windows drive path when on WSL and mounted from a drive letter, otherwise
+  POSIX path) and `posix_location` always uses the POSIX path; no `explain`
+  field, and `to_dict()` must not emit `explain`.
 - `SearchRequest(query, mode="hybrid", k=10, per_file=2, path=None, kind=None,
   since=None, module=None, week=None, spread=False)`. `to_query_kwargs()` maps
   wire field `path` to `get_hits(path_prefix=...)` and returns exactly `query`,

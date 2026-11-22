@@ -16,13 +16,14 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import platform_info
 from .config import (
     DEFAULT_EMBED_MODEL,
     Config,
@@ -30,6 +31,7 @@ from .config import (
     default_config_path,
     load_config,
 )
+from .locations import format_location
 from .web_config import add_root as config_add_root
 from .web_config import inspect_config, read_roots
 from .web_contract import (
@@ -942,14 +944,22 @@ class WebService:
     # -- search ------------------------------------------------------------
 
     @staticmethod
-    def _hit_dto(hit: object) -> HitDTO:
+    def _hit_dto(
+        hit: object,
+        *,
+        is_wsl: bool = False,
+        mounts: Sequence[platform_info.Mount] = (),
+    ) -> HitDTO:
         raw_module = getattr(hit, "module", None)
         raw_week = getattr(hit, "week", None)
         raw_highlights = getattr(hit, "highlights", ()) or ()
+        path = str(hit.path)  # type: ignore[attr-defined]
+        locator = str(hit.locator)  # type: ignore[attr-defined]
+        win = platform_info.windows_path(path, mounts) if is_wsl else None
         return HitDTO(
             chunk_id=int(hit.chunk_id),  # type: ignore[attr-defined]
-            path=str(hit.path),  # type: ignore[attr-defined]
-            locator=str(hit.locator),  # type: ignore[attr-defined]
+            path=path,
+            locator=locator,
             loc_start=float(hit.loc_start),  # type: ignore[attr-defined]
             snippet=str(hit.snippet),  # type: ignore[attr-defined]
             score=float(hit.score),  # type: ignore[attr-defined]
@@ -957,6 +967,8 @@ class WebService:
             module=str(raw_module) if raw_module is not None else None,
             week=int(raw_week) if raw_week is not None else None,
             highlights=tuple((int(a), int(b)) for a, b in raw_highlights),
+            location=format_location(path, locator, windows_path=win),
+            posix_location=format_location(path, locator, windows_path=None),
         )
 
     def _search_result(
@@ -973,8 +985,12 @@ class WebService:
 
             groups = compute_spread(spread_hits)  # type: ignore[arg-type]
             spread_payload = tuple(spread_to_dict(group) for group in groups)
+        is_wsl = platform_info.is_wsl()
+        mounts = platform_info.read_mounts() if is_wsl else ()
         return SearchResult(
-            hits=tuple(self._hit_dto(hit) for hit in hits),
+            hits=tuple(
+                self._hit_dto(hit, is_wsl=is_wsl, mounts=mounts) for hit in hits
+            ),
             took_ms=took_ms,
             spread=spread_payload,
         )

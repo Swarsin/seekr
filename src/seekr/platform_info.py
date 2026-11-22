@@ -5,9 +5,11 @@ from __future__ import annotations
 import os
 import posixpath
 import re
-from collections.abc import Sequence
+import subprocess
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 __all__ = [
     "SLOW_FSTYPES",
@@ -17,10 +19,13 @@ __all__ = [
     "mount_for",
     "parse_mounts",
     "read_mounts",
+    "windows_path",
+    "wslpath_windows",
 ]
 
 _OSRELEASE_PATH = Path("/proc/sys/kernel/osrelease")
 _MOUNTS_PATH = Path("/proc/mounts")
+_WINDOWS_DRIVE_RE = re.compile(r"([A-Za-z]):\\?")
 
 SLOW_FSTYPES = frozenset(
     {"9p", "drvfs", "cifs", "smb3", "nfs", "nfs4", "fuse.sshfs"}
@@ -125,3 +130,42 @@ def is_slow_path(path: Path, mounts: Sequence[Mount]) -> bool:
     """Return ``True`` if *path* resides on a filesystem requiring polling."""
     mount = mount_for(path, mounts)
     return mount is not None and mount.fstype in SLOW_FSTYPES
+
+
+def windows_path(path: str, mounts: Sequence[Mount]) -> str | None:
+    """Convert a POSIX *path* on a Windows drive mount to ``X:\\...`` form."""
+    mount = mount_for(Path(path), mounts)
+    if mount is None:
+        return None
+    match = _WINDOWS_DRIVE_RE.fullmatch(mount.source)
+    if match is None:
+        return None
+    drive = match.group(1)
+    target = _normalize_posix_path(Path(path))
+    mount_point = _normalize_posix_path(mount.mount_point)
+    if target == mount_point:
+        return f"{drive}:\\"
+    rel = target.lstrip("/") if mount_point == "/" else target[len(mount_point) + 1 :]
+    win_rel = rel.replace("/", "\\")
+    return f"{drive}:\\{win_rel}"
+
+
+def wslpath_windows(
+    path: str,
+    run: Callable[..., Any] = subprocess.run,
+) -> str | None:
+    """Convert *path* via ``wslpath -w``, returning ``None`` on any failure."""
+    try:
+        result = run(
+            ["wslpath", "-w", path],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if getattr(result, "returncode", 1) != 0:
+        return None
+    converted = (getattr(result, "stdout", "") or "").strip()
+    return converted or None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,8 @@ from seekr.platform_info import (
     mount_for,
     parse_mounts,
     read_mounts,
+    windows_path,
+    wslpath_windows,
 )
 
 MOUNTS = "C:\\134 /mnt/c 9p rw,dirsync,aname=drvfs 0 0\n/dev/sdc / ext4 rw 0 0\n"
@@ -152,6 +155,90 @@ class PlatformInfoTests(unittest.TestCase):
                     Mount(source="remote", mount_point="/mnt/remote", fstype=fstype),
                 ]
                 self.assertTrue(is_slow_path(Path("/mnt/remote/file.md"), slow_mounts))
+
+    def test_windows_path_pure(self) -> None:
+        mounts = [
+            Mount(source="C:\\", mount_point="/mnt/c", fstype="9p"),
+            Mount(source="d:", mount_point="/mnt/d", fstype="drvfs"),
+            Mount(source="/dev/sdc", mount_point="/", fstype="ext4"),
+            Mount(source="\\\\server\\share", mount_point="/mnt/share", fstype="cifs"),
+        ]
+
+        self.assertEqual(
+            windows_path("/mnt/c/Users/me/a.pdf", mounts),
+            r"C:\Users\me\a.pdf",
+        )
+        self.assertEqual(windows_path("/mnt/c", mounts), "C:\\")
+        self.assertEqual(windows_path("/mnt/c/", mounts), "C:\\")
+        self.assertEqual(
+            windows_path("/mnt/c/Users/../Users/me/a.pdf", mounts),
+            r"C:\Users\me\a.pdf",
+        )
+        self.assertEqual(
+            windows_path("/mnt/d/slides/deck.pptx", mounts),
+            r"d:\slides\deck.pptx",
+        )
+        self.assertEqual(windows_path("/mnt/d", mounts), "d:\\")
+
+        self.assertIsNone(windows_path("/home/alice/notes.md", mounts))
+        self.assertIsNone(windows_path("/mnt/cd/notes.md", mounts))
+        self.assertIsNone(windows_path("/mnt/c/..", mounts))
+        self.assertIsNone(windows_path("relative/notes.md", mounts))
+        self.assertIsNone(windows_path("", mounts))
+        self.assertIsNone(windows_path("/mnt/share/file.pdf", mounts))
+        self.assertIsNone(windows_path("/mnt/c/Users/me/a.pdf", ()))
+
+    def test_wslpath_windows(self) -> None:
+        calls: list[tuple[list[str], dict[str, object]]] = []
+
+        def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append((argv, kwargs))
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=0,
+                stdout="\\\\wsl.localhost\\Ubuntu\\tmp\\a.pdf\n",
+                stderr="",
+            )
+
+        self.assertEqual(
+            wslpath_windows("/tmp/a.pdf", run=fake_run),
+            r"\\wsl.localhost\Ubuntu\tmp\a.pdf",
+        )
+        self.assertEqual(
+            calls,
+            [
+                (
+                    ["wslpath", "-w", "/tmp/a.pdf"],
+                    {"capture_output": True, "text": True, "timeout": 2, "check": False},
+                )
+            ],
+        )
+
+        self.assertIsNone(
+            wslpath_windows(
+                "/tmp/a.pdf",
+                run=lambda argv, **_: subprocess.CompletedProcess(
+                    args=argv, returncode=1, stdout="", stderr="error"
+                ),
+            )
+        )
+        self.assertIsNone(
+            wslpath_windows(
+                "/tmp/a.pdf",
+                run=lambda argv, **_: subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="   \n", stderr=""
+                ),
+            )
+        )
+
+        def raise_oserror(*_args: object, **_kwargs: object) -> object:
+            raise FileNotFoundError("wslpath")
+
+        def raise_timeout(*_args: object, **_kwargs: object) -> object:
+            raise subprocess.TimeoutExpired(cmd=["wslpath", "-w", "/tmp/a.pdf"], timeout=2)
+
+        self.assertIsNone(wslpath_windows("/tmp/a.pdf", run=raise_oserror))
+        self.assertIsNone(wslpath_windows("/tmp/a.pdf", run=raise_timeout))
 
 
 if __name__ == "__main__":

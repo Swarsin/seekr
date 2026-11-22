@@ -15,7 +15,13 @@ from unittest import mock
 
 from seekr import cli_open
 from seekr.models import Hit
-from seekr.opener import format_pick_line, open_command, parse_pick_line
+from seekr.opener import (
+    OPEN_SUCCESS_CODES,
+    format_pick_line,
+    open_command,
+    parse_pick_line,
+)
+from seekr.platform_info import Mount
 
 ROOT = Path(__file__).resolve().parents[1]
 POPUP_PATH = ROOT / "contrib" / "seekr-popup.sh"
@@ -221,6 +227,89 @@ class OpenCommandTests(unittest.TestCase):
                 argv = open_command(path, "L3-4", "markdown", {"EDITOR": "nano"}, lambda _: None)
                 self.assertEqual(argv, ["nano", "+3", f"./{path}"])
 
+    def test_wsl_open_prefers_wslview(self) -> None:
+        self.assertEqual(
+            open_command(
+                "/mnt/c/Users/me/a.pdf",
+                "p.14",
+                "pdf",
+                {"EDITOR": "nano"},
+                lambda name: "/usr/bin/wslview" if name == "wslview" else "/usr/bin/zathura",
+                wsl=True,
+                to_windows=lambda _: r"C:\Users\me\a.pdf",
+            ),
+            ["wslview", "/mnt/c/Users/me/a.pdf"],
+        )
+        self.assertEqual(
+            open_command(
+                "/mnt/c/Users/me/code.py",
+                "L10-20",
+                "code",
+                {"EDITOR": "nano"},
+                lambda name: "/usr/bin/wslview" if name == "wslview" else None,
+                wsl=True,
+                to_windows=lambda _: r"C:\Users\me\code.py",
+            ),
+            ["wslview", "/mnt/c/Users/me/code.py"],
+        )
+        self.assertEqual(
+            open_command(
+                "-report.pdf",
+                "p.2",
+                "pdf",
+                {},
+                lambda name: "/usr/bin/wslview" if name == "wslview" else None,
+                wsl=True,
+                to_windows=lambda _: None,
+            ),
+            ["wslview", "./-report.pdf"],
+        )
+
+    def test_wsl_open_falls_back_to_explorer(self) -> None:
+        self.assertEqual(
+            open_command(
+                "/mnt/c/Users/me/a.pdf",
+                "p.14",
+                "pdf",
+                {"EDITOR": "nano"},
+                lambda name: "/usr/bin/zathura" if name == "zathura" else None,
+                wsl=True,
+                to_windows=lambda p: r"C:\Users\me\a.pdf" if p == "/mnt/c/Users/me/a.pdf" else None,
+            ),
+            ["explorer.exe", r"C:\Users\me\a.pdf"],
+        )
+        self.assertEqual(
+            open_command(
+                "/mnt/c/Users/me/code.py",
+                "L10-20",
+                "code",
+                {"EDITOR": "nano"},
+                lambda _: None,
+                wsl=True,
+                to_windows=lambda _: r"C:\Users\me\code.py",
+            ),
+            ["explorer.exe", r"C:\Users\me\code.py"],
+        )
+
+    def test_wsl_open_unconvertible_raises(self) -> None:
+        for converter in (lambda _: None, lambda _: "", None):
+            with (
+                self.subTest(converter=converter),
+                self.assertRaisesRegex(
+                    ValueError,
+                    r"cannot convert /home/me/a\.pdf to a Windows path; install wslu for wslview",
+                ),
+            ):
+                open_command(
+                    "/home/me/a.pdf",
+                    "p.1",
+                    "pdf",
+                    {},
+                    lambda _: None,
+                    wsl=True,
+                    to_windows=converter,
+                )
+
 
 class MarkdownHeadingTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -347,6 +436,7 @@ class CliTests(unittest.TestCase):
         completed = types.SimpleNamespace(returncode=0)
 
         with (
+            mock.patch("seekr.platform_info.is_wsl", return_value=False),
             mock.patch.dict(os.environ, {"EDITOR": "nano"}),
             mock.patch.object(cli_open.subprocess, "run", return_value=completed) as run,
         ):
@@ -361,7 +451,10 @@ class CliTests(unittest.TestCase):
         line = format_pick_line(_hit(str(vtt_file), "00:01:02", "hello", "transcript"))
         completed = types.SimpleNamespace(returncode=0)
 
-        with mock.patch.object(cli_open.subprocess, "run", return_value=completed) as run:
+        with (
+            mock.patch("seekr.platform_info.is_wsl", return_value=False),
+            mock.patch.object(cli_open.subprocess, "run", return_value=completed) as run,
+        ):
             app.commands["open"](target=line)
 
         run.assert_called_once_with(["xdg-open", str(vtt_file)], check=False)
@@ -375,12 +468,103 @@ class CliTests(unittest.TestCase):
             completed = types.SimpleNamespace(returncode=0)
 
             with (
+                mock.patch("seekr.platform_info.is_wsl", return_value=False),
                 mock.patch.dict(os.environ, {}, clear=True),
                 mock.patch.object(cli_open.subprocess, "run", return_value=completed) as run,
             ):
                 app.commands["open"](target=line)
 
         run.assert_called_once_with(["nvim", "+1", str(notes)], check=False)
+
+    def test_open_wsl_uses_wslview_when_available(self) -> None:
+        app, _ = self._registered()
+        completed = types.SimpleNamespace(returncode=0)
+
+        with (
+            mock.patch("seekr.platform_info.is_wsl", return_value=True),
+            mock.patch.object(
+                cli_open.shutil,
+                "which",
+                side_effect=lambda name: "/usr/bin/wslview" if name == "wslview" else None,
+            ),
+            mock.patch.object(cli_open.subprocess, "run", return_value=completed) as run,
+        ):
+            app.commands["open"](target="/mnt/c/Users/me/a.pdf:p.14")
+
+        run.assert_called_once_with(["wslview", "/mnt/c/Users/me/a.pdf"], check=False)
+
+    def test_explorer_exit_code_one_is_success(self) -> None:
+        self.assertEqual(OPEN_SUCCESS_CODES, {"explorer.exe": frozenset({0, 1})})
+        app, _ = self._registered()
+        mounts = [Mount(source="C:\\", mount_point="/mnt/c", fstype="9p")]
+
+        with (
+            mock.patch("seekr.platform_info.is_wsl", return_value=True),
+            mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
+            mock.patch.object(cli_open.shutil, "which", return_value=None),
+            mock.patch.object(
+                cli_open.subprocess,
+                "run",
+                return_value=types.SimpleNamespace(returncode=1),
+            ) as run,
+        ):
+            app.commands["open"](target="/mnt/c/Users/me/a.pdf:p.14")
+
+        run.assert_called_once_with(["explorer.exe", r"C:\Users\me\a.pdf"], check=False)
+
+        with (
+            mock.patch("seekr.platform_info.is_wsl", return_value=True),
+            mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
+            mock.patch.object(cli_open.shutil, "which", return_value=None),
+            mock.patch.object(
+                cli_open.subprocess,
+                "run",
+                return_value=types.SimpleNamespace(returncode=2),
+            ),
+            self.assertRaises(_FakeExit) as ctx,
+        ):
+            app.commands["open"](target="/mnt/c/Users/me/a.pdf:p.14")
+        self.assertEqual(ctx.exception.exit_code, 2)
+
+    def test_open_wsl_falls_back_to_wslpath_and_reports_unconvertible_error(self) -> None:
+        app, fake_typer = self._registered()
+        ext4_mounts = [Mount(source="/dev/sdc", mount_point="/", fstype="ext4")]
+
+        with (
+            mock.patch("seekr.platform_info.is_wsl", return_value=True),
+            mock.patch("seekr.platform_info.read_mounts", return_value=ext4_mounts),
+            mock.patch(
+                "seekr.platform_info.wslpath_windows",
+                return_value=r"\\wsl.localhost\Ubuntu\home\me\a.pdf",
+            ),
+            mock.patch.object(cli_open.shutil, "which", return_value=None),
+            mock.patch.object(
+                cli_open.subprocess,
+                "run",
+                return_value=types.SimpleNamespace(returncode=1),
+            ) as run,
+        ):
+            app.commands["open"](target="/home/me/a.pdf:p.14")
+
+        run.assert_called_once_with(
+            ["explorer.exe", r"\\wsl.localhost\Ubuntu\home\me\a.pdf"], check=False
+        )
+
+        with (
+            mock.patch("seekr.platform_info.is_wsl", return_value=True),
+            mock.patch("seekr.platform_info.read_mounts", return_value=ext4_mounts),
+            mock.patch("seekr.platform_info.wslpath_windows", return_value=None),
+            mock.patch.object(cli_open.shutil, "which", return_value=None),
+            mock.patch.object(cli_open.subprocess, "run") as run,
+            self.assertRaises(_FakeExit) as ctx,
+        ):
+            app.commands["open"](target="/home/me/a.pdf:p.14")
+
+        self.assertEqual(ctx.exception.exit_code, 1)
+        run.assert_not_called()
+        self.assertTrue(
+            any("cannot convert /home/me/a.pdf to a Windows path" in line for line in fake_typer.output)
+        )
 
 
 class PopupScriptTests(unittest.TestCase):

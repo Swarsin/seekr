@@ -139,6 +139,8 @@ class HitDTO:
     module: str | None = None
     week: int | None = None
     highlights: tuple[tuple[int, int], ...] = ()
+    location: str = ""
+    posix_location: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -152,6 +154,8 @@ class HitDTO:
             "module": self.module,
             "week": self.week,
             "highlights": [[int(a), int(b)] for a, b in self.highlights],
+            "location": self.location,
+            "posix_location": self.posix_location,
         }
 
 

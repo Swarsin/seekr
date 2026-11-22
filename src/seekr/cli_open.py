@@ -15,11 +15,12 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
+from . import platform_info
 from .cli_search import SearchError, get_hits
 from .client import DaemonError
 from .extract import kind_for
 from .lifecycle import LifecycleError
-from .opener import format_pick_line, open_command, parse_pick_line
+from .opener import OPEN_SUCCESS_CODES, format_pick_line, open_command, parse_pick_line
 from .store import ModelMismatchError, SchemaVersionError
 
 if TYPE_CHECKING:
@@ -37,11 +38,14 @@ _SEARCH_ERRORS = (
 )
 
 
-def _exit_error(command: str, message: str) -> NoReturn:
-    import typer
+def _exit_error(
+    command: str, message: str, typer_module: Any = None
+) -> NoReturn:
+    if typer_module is None:
+        import typer as typer_module
 
-    typer.echo(f"seekr {command}: {message}", err=True)
-    raise typer.Exit(code=1)
+    typer_module.echo(f"seekr {command}: {message}", err=True)
+    raise typer_module.Exit(code=1)
 
 
 def _build_pick_command(typer_module: Any) -> Any:
@@ -98,13 +102,18 @@ def _build_pick_command(typer_module: Any) -> Any:
                 **extra,
             )
         except _SEARCH_ERRORS as exc:
-            _exit_error("pick", str(exc))
+            _exit_error("pick", str(exc), typer_module)
         except ImportError as exc:
-            _exit_error("pick", f"search backend is unavailable: {exc}; run `seekr doctor`")
+            _exit_error(
+                "pick",
+                f"search backend is unavailable: {exc}; run `seekr doctor`",
+                typer_module,
+            )
         except (OSError, sqlite3.Error) as exc:
             _exit_error(
                 "pick",
                 f"cannot read the index: {exc}; run `seekr doctor` or `seekr reindex`",
+                typer_module,
             )
 
         for hit in hits:
@@ -123,17 +132,39 @@ def _build_open_command(typer_module: Any) -> Any:
         """Open a result at its page, line or Markdown heading."""
         path, locator = parse_pick_line(target)
         kind = kind_for(Path(path)) or ""
-        argv = open_command(path, locator, kind, os.environ, shutil.which)
+        is_wsl = platform_info.is_wsl()
+
+        def to_windows(p: str) -> str | None:
+            return platform_info.windows_path(
+                p, platform_info.read_mounts()
+            ) or platform_info.wslpath_windows(p)
+
+        try:
+            argv = open_command(
+                path,
+                locator,
+                kind,
+                os.environ,
+                shutil.which,
+                wsl=is_wsl,
+                to_windows=to_windows,
+            )
+        except ValueError as exc:
+            _exit_error("open", str(exc), typer_module)
         try:
             result = subprocess.run(argv, check=False)
         except FileNotFoundError:
             _exit_error(
                 "open",
                 f"cannot run {argv[0]!r}: executable not found; install it or set $EDITOR / $SEEKR_OPENER",
+                typer_module,
             )
         except (OSError, ValueError) as exc:
-            _exit_error("open", f"cannot run {argv[0]!r}: {exc}")
-        if result.returncode:
+            _exit_error("open", f"cannot run {argv[0]!r}: {exc}", typer_module)
+        success_codes = OPEN_SUCCESS_CODES.get(
+            Path(argv[0]).name.lower(), frozenset({0})
+        )
+        if result.returncode not in success_codes:
             raise typer_module.Exit(code=result.returncode)
 
     open_target.__doc__ = "Open a result at its page, line or Markdown heading."

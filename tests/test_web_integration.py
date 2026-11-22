@@ -36,6 +36,7 @@ from seekr.config import load_config
 from seekr.embed import FakeEmbedder
 from seekr.indexer import Indexer, SyncReport
 from seekr.lifecycle import LifecycleLock
+from seekr.locations import format_location
 from seekr.models import ChunkSpec, text_sha
 from seekr.store import Store, StoredChunk
 from seekr.web_contract import LIMITS, HitDTO
@@ -536,6 +537,8 @@ def test_novice_flow_over_http_with_real_service(tmp_path: Path) -> None:
                     "module",
                     "week",
                     "highlights",
+                    "location",
+                    "posix_location",
                 }
                 assert Path(hit["path"]).resolve() in (
                     docs / "notes.md",
@@ -570,6 +573,8 @@ def test_novice_flow_over_http_with_real_service(tmp_path: Path) -> None:
                 module=hit.module,
                 week=hit.week,
                 highlights=hit.highlights,
+                location=format_location(hit.path, hit.locator, windows_path=None),
+                posix_location=format_location(hit.path, hit.locator, windows_path=None),
             ).to_dict()
             for hit in expected
         ]
@@ -1300,6 +1305,8 @@ def test_keyword_and_lane_conflicts_during_real_paused_index_over_http(
                 module=hit.module,
                 week=hit.week,
                 highlights=hit.highlights,
+                location=format_location(hit.path, hit.locator, windows_path=None),
+                posix_location=format_location(hit.path, hit.locator, windows_path=None),
             ).to_dict()
             for hit in expected
         ]
