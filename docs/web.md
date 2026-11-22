@@ -57,13 +57,13 @@ When no folders are configured or the local model is unavailable, the **Set up S
 
 - **Download search model (about 130 MB) — the only time seekr uses the internet** — runs `seekr models pull --yes --grammars` in the background, streaming progress and output lines until the local model and grammars are cached.
 
-You can also provision the model manually from a terminal using the Python interpreter from the environment where Seekr is installed (this is the README quickstart command):
+You can also provision the configured embedding model and code grammars from a terminal with `seekr models pull` (or run `seekr init` for guided first-run setup):
 
 ```bash
-~/.local/pipx/venvs/seekr-search/bin/python -c 'from sentence_transformers import SentenceTransformer; SentenceTransformer("BAAI/bge-small-en-v1.5")'
+seekr models pull --grammars
 ```
 
-If you installed Seekr differently, use that environment’s Python (for example `.venv/bin/python`). Downloading runs only once to fill the local Hugging Face cache; afterwards Seekr’s indexing and searching work offline. If you changed `embed_model`, provision that model name instead.
+Downloading runs only once to fill the local Hugging Face cache; afterwards Seekr’s indexing and searching work offline. Add `--rerank` (or `--all`) if you also use `--rerank` scoring, and if you changed `embed_model`, `seekr models pull` caches that model instead.
 
 The **Local model** panel in **Index status** shows:
 
@@ -181,7 +181,7 @@ Removing a folder with **Remove** updates `config.toml` and removes indexed entr
 ## Troubleshooting
 
 - **Port 8000 is already in use** — use `seekr web --port 8001`, or `seekr web --port 0` and open the actual printed address.
-- **Local model is Unavailable** — choose **Download search model (about 130 MB) — the only time seekr uses the internet** in the setup panel, or run the [provisioning command](#make-the-local-model-available), then choose **Check model** again. Exact-words search still works. `seekr doctor` checks the SQLite environment, not whether a model is cached.
+- **Local model is Unavailable** — choose **Download search model (about 130 MB) — the only time seekr uses the internet** in the setup panel, or run `seekr models pull --grammars` (see [Make the local model available](#make-the-local-model-available)), then choose **Check model** again. Exact-words search still works. `seekr doctor` (and `seekr models status`) checks whether your configured models, code grammars, roots, and SQLite environment are ready locally.
 - **Index says Needs rebuilding** — stop any daemon, make the configured model available, and run `seekr reindex` in a terminal. The page leaves the old index untouched.
 - **Index says Can’t be read** — the page cannot repair it. Run `seekr doctor` to rule out SQLite/FTS5/sqlite-vec problems; if the database file is damaged, stop any daemon and rebuild from a terminal with `seekr reindex`. Search and index updates cannot use the old index until it is fixed.
 - **Settings file says Can’t be read** — open the path shown, fix the TOML by hand, and choose **Refresh**. If the file has table headers but no `roots` key, add a top-level `roots = [...]` above the first table header. For other unsupported layouts, correct the existing `roots` expression by hand.

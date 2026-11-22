@@ -43,7 +43,7 @@ REQUIRED_IDS = (
     "check-model",
     "job",
     "job-body",
-    # Phase 1 Web UI elements
+    # Course, preview, and first-run UI elements
     "module-filter",
     "week-from",
     "week-to",
