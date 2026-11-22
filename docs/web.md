@@ -52,7 +52,7 @@ The limits are 50 folders and 4,096 UTF-8 bytes per submitted path. If a `seekr 
 The web page never downloads a model or executes an installation command. The model must already be on this computer; Seekr loads it locally with network access disabled. Run this one-time provisioning command in a terminal, using the Python interpreter from the environment where Seekr is installed (this is the README quickstart command):
 
 ```bash
-~/.local/pipx/venvs/seekr/bin/python -c 'from sentence_transformers import SentenceTransformer; SentenceTransformer("BAAI/bge-small-en-v1.5")'
+~/.local/pipx/venvs/seekr-search/bin/python -c 'from sentence_transformers import SentenceTransformer; SentenceTransformer("BAAI/bge-small-en-v1.5")'
 ```
 
 If you installed Seekr differently, use that environment’s Python (for example `.venv/bin/python`). The command may use the network once to fill the local Hugging Face cache; afterwards Seekr’s indexing and searching are offline. If you changed `embed_model`, provision that model name instead.
@@ -113,7 +113,7 @@ If nothing is indexed, a search returns no hits; **Index status** explains wheth
 
 `seekr daemon` is optional. It watches configured folders, maintains the index, and keeps a model warm. The page only probes whether the daemon socket is live; it never starts, stops, or reconfigures the daemon. When the daemon is present, **Background service** shows **Running** and **Update index** is disabled with an explanation. The page never claims to detect live daemon indexing activity; socket presence is the only signal.
 
-To update from the page, stop the daemon first: press Ctrl+C in its terminal, or run `systemctl --user stop seekr.service` if you installed the README’s systemd user unit. Then choose **Refresh**; **Update index** becomes available. Adding a folder while the daemon runs succeeds but warns that the daemon needs a restart; restart `seekr daemon` (or the systemd unit) so it sees the new folder for daemon-backed searches. The page never restarts it. If the daemon is reachable but fails a search, the page shows an error and suggests restarting it or stopping it so the page searches the local index directly. See [Daemon and desktop integration](../README.md#daemon-and-desktop-integration).
+To update from the page, stop the daemon first: press Ctrl+C in its terminal, or run `systemctl --user stop seekr.service` if you installed the [`contrib/seekr.service`](../contrib/seekr.service) systemd user unit. Then choose **Refresh**; **Update index** becomes available. Adding a folder while the daemon runs succeeds but warns that the daemon needs a restart; restart `seekr daemon` (or the systemd unit) so it sees the new folder for daemon-backed searches. The page never restarts it. If the daemon is reachable but fails a search, the page shows an error and suggests restarting it or stopping it so the page searches the local index directly. See [What it does](../README.md#what-it-does).
 
 When a daemon answers searches, the **Local model** indicator still describes this web process; the daemon may use its own warm model.
 
@@ -130,7 +130,7 @@ There is no **Remove folder** button in this release. Edit the `roots` array by 
 ## Privacy and local-only security
 
 - The server binds only to `127.0.0.1` and validates the exact `127.0.0.1:<port>` host and `http://127.0.0.1:<port>` origin. There is no LAN or public option.
-- Pages, CSS, and JavaScript are packaged locally. Seekr emits no CORS headers and makes no CDN, remote-font, remote-image, or telemetry requests. After the model is cached, indexing and searching are offline; see the [offline guarantee](../README.md#offline-guarantee).
+- Pages, CSS, and JavaScript are packaged locally. Seekr emits no CORS headers and makes no CDN, remote-font, remote-image, or telemetry requests. After the model is cached, indexing and searching are offline; see the [offline guarantee](../README.md#how-it-works).
 - A session token and browser-origin checks stop other websites from driving the local server. The token stays in memory, is never in the URL, and is invalidated by a restart. This is CSRF protection, not user authentication, and not a boundary against malware or another process running as your user.
 - Headerless `curl` to `/api/session` and the static assets gets a deliberate `403 forbidden` with a hint that browser-origin headers are required. This session request works (replace 8000 with the printed port if needed):
 
@@ -167,6 +167,6 @@ Not included in this release: OCR for scanned PDFs, uploads, remote file access,
 ## Related documentation
 
 - [README quickstart](../README.md#quickstart)
-- [Daemon and desktop integration](../README.md#daemon-and-desktop-integration)
-- [Offline guarantee](../README.md#offline-guarantee)
+- [What it does (CLI, web UI, daemon, MCP)](../README.md#what-it-does)
+- [How it works and offline guarantee](../README.md#how-it-works)
 - [Web API contract](web-api.md)
