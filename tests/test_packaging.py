@@ -128,10 +128,7 @@ class PackagingMetadataTests(unittest.TestCase):
 
 @pytest.mark.slow
 class WheelContentTests(unittest.TestCase):
-    @unittest.skipUnless(
-        _has_build_package() or _HAS_SETUPTOOLS,
-        "build or setuptools is required to build a wheel",
-    )
+    @unittest.skipUnless(_HAS_SETUPTOOLS, "setuptools is required to build a wheel offline")
     def test_wheel_contains_assets_and_demo(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
