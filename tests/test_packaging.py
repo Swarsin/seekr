@@ -151,6 +151,23 @@ class WheelContentTests(unittest.TestCase):
             any(n.startswith("seekr/demo_course/") and n.endswith(".pdf") for n in names)
         )
 
+        web_root = ROOT / "src" / "seekr" / "web_assets"
+        expected_web = {
+            f"seekr/web_assets/{p.relative_to(web_root).as_posix()}"
+            for p in web_root.rglob("*")
+            if p.is_file()
+        }
+        demo_root = ROOT / "src" / "seekr" / "demo_course"
+        expected_demo = {
+            f"seekr/demo_course/{p.relative_to(demo_root).as_posix()}"
+            for p in demo_root.rglob("*")
+            if p.is_file()
+        }
+        self.assertTrue(expected_web)
+        self.assertTrue(expected_demo)
+        self.assertEqual(expected_web - names, set())
+        self.assertEqual(expected_demo - names, set())
+
 
 if __name__ == "__main__":
     unittest.main()

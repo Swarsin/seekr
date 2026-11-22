@@ -1,17 +1,12 @@
-"""Tests for the packaged demo course, evaluation queries, and wheel contents."""
+"""Tests for the packaged demo course and evaluation queries."""
 
 from __future__ import annotations
 
 import importlib.util
 import json
-import os
-import shutil
 import sqlite3
-import subprocess
-import sys
 import tempfile
 import unittest
-import zipfile
 from pathlib import Path
 
 import seekr
@@ -22,8 +17,6 @@ from seekr.extract import extract
 from seekr.indexer import Indexer
 from seekr.search import Searcher
 from seekr.store import Store
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _has_fts5() -> bool:
@@ -39,7 +32,6 @@ _HAS_FTS5 = _has_fts5()
 _HAS_NUMPY = importlib.util.find_spec("numpy") is not None
 _HAS_SQLITE_VEC = importlib.util.find_spec("sqlite_vec") is not None
 _HAS_PYMUPDF = importlib.util.find_spec("pymupdf") is not None
-_HAS_SETUPTOOLS = importlib.util.find_spec("setuptools") is not None
 
 _NEEDS_REAL_STORE = unittest.skipUnless(
     _HAS_NUMPY and _HAS_SQLITE_VEC and _HAS_FTS5,
@@ -140,71 +132,6 @@ class DemoCourseTests(unittest.TestCase):
                 store.close()
 
         self.assertGreaterEqual(matched / len(queries), 0.8)
-
-    @unittest.skipUnless(_HAS_SETUPTOOLS, "setuptools is required to build a wheel")
-    def test_built_wheel_contains_web_assets_and_demo_course(self) -> None:
-        demo_root = seekr.demo_course_path()
-        expected_demo = {
-            f"seekr/demo_course/{p.relative_to(demo_root).as_posix()}"
-            for p in demo_root.rglob("*")
-            if p.is_file()
-        }
-        web_root = REPO_ROOT / "src" / "seekr" / "web_assets"
-        expected_web = {
-            f"seekr/web_assets/{p.relative_to(web_root).as_posix()}"
-            for p in web_root.rglob("*")
-            if p.is_file()
-        }
-        self.assertTrue(expected_web)
-        self.assertTrue(expected_demo)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            stage = tmp / "stage"
-            stage.mkdir()
-            for filename in ("pyproject.toml", "README.md", "LICENSE"):
-                src_file = REPO_ROOT / filename
-                if src_file.is_file():
-                    shutil.copy2(src_file, stage / filename)
-            shutil.copytree(
-                REPO_ROOT / "src",
-                stage / "src",
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.egg-info"),
-            )
-            dist_dir = tmp / "dist"
-            dist_dir.mkdir()
-
-            env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    (
-                        "import sys; "
-                        "import setuptools.build_meta as bm; "
-                        "print(bm.build_wheel(sys.argv[1]))"
-                    ),
-                    str(dist_dir),
-                ],
-                cwd=stage,
-                env=env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
-            wheels = list(dist_dir.glob("*.whl"))
-            self.assertEqual(len(wheels), 1, wheels)
-
-            with zipfile.ZipFile(wheels[0]) as zf:
-                names = set(zf.namelist())
-
-        missing_web = sorted(expected_web - names)
-        missing_demo = sorted(expected_demo - names)
-        self.assertEqual(missing_web, [], f"missing web_assets in wheel: {missing_web}")
-        self.assertEqual(
-            missing_demo, [], f"missing demo_course files in wheel: {missing_demo}"
-        )
 
 
 if __name__ == "__main__":

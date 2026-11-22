@@ -160,11 +160,9 @@ def reindex(
 
 
 def _daemon_status() -> tuple[bool, Path]:
-    from .daemon import _socket_is_active, socket_path, socket_path_problem
+    from .daemon import _socket_is_active, socket_path
 
     sock = socket_path()
-    if socket_path_problem(sock) is not None:
-        return False, sock
     try:
         return _socket_is_active(sock), sock
     except OSError:

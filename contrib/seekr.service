@@ -1,6 +1,6 @@
 [Unit]
 Description=seekr local semantic search daemon
-Documentation=https://github.com/seekr/seekr
+Documentation=https://github.com/Swarsin/seekr
 After=default.target
 
 [Service]
