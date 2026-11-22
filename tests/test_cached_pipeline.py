@@ -46,6 +46,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterable
 from pathlib import Path
 
 try:  # pragma: no cover - pytest is an optional development dependency
@@ -239,12 +240,24 @@ class AuditHookTests(unittest.TestCase):
 class _PipelineStubDoc:
     """Minimal document row for :class:`_PipelineStubStore`."""
 
-    def __init__(self, *, id: int, mtime_ns: int, size: int, sha256: str, kind: str):
+    def __init__(
+        self,
+        *,
+        id: int,
+        mtime_ns: int,
+        size: int,
+        sha256: str,
+        kind: str,
+        module: str | None = None,
+        week: int | None = None,
+    ):
         self.id = id
         self.mtime_ns = mtime_ns
         self.size = size
         self.sha256 = sha256
         self.kind = kind
+        self.module = module
+        self.week = week
 
 
 class _PipelineStubChunk:
@@ -266,6 +279,7 @@ class _PipelineStubStore:
     def __init__(self) -> None:
         self.documents: dict[str, _PipelineStubDoc] = {}
         self.chunks: dict[int, _PipelineStubChunk] = {}
+        self.meta: dict[str, str] = {}
         self._next_doc_id = 1
         self._next_chunk_id = 1
 
@@ -277,7 +291,15 @@ class _PipelineStubStore:
         return self.documents.get(str(path))
 
     def upsert_document(
-        self, path: str, mtime_ns: int, size: int, sha256: str, kind: str
+        self,
+        path: str,
+        mtime_ns: int,
+        size: int,
+        sha256: str,
+        kind: str,
+        *,
+        module: str | None = None,
+        week: int | None = None,
     ) -> int:
         doc = self.documents.get(str(path))
         if doc is None:
@@ -286,9 +308,28 @@ class _PipelineStubStore:
         else:
             doc_id = doc.id
         self.documents[str(path)] = _PipelineStubDoc(
-            id=doc_id, mtime_ns=int(mtime_ns), size=int(size), sha256=sha256, kind=kind
+            id=doc_id,
+            mtime_ns=int(mtime_ns),
+            size=int(size),
+            sha256=sha256,
+            kind=kind,
+            module=None if module is None else str(module),
+            week=None if week is None else int(week),
         )
         return doc_id
+
+    def set_document_labels(
+        self, labels: Iterable[tuple[str, str | None, int | None]]
+    ) -> int:
+        updated = 0
+        for path, module, week in labels:
+            doc = self.documents.get(str(path))
+            if doc is None:
+                continue
+            doc.module = None if module is None else str(module)
+            doc.week = None if week is None else int(week)
+            updated += 1
+        return updated
 
     def replace_chunks(self, doc_id: int, chunks: list[object]) -> None:
         for chunk_id in [
@@ -319,6 +360,12 @@ class _PipelineStubStore:
 
     def set_last_error_count(self, n: int) -> None:
         pass
+
+    def get_meta_value(self, key: str) -> str | None:
+        return self.meta.get(str(key))
+
+    def set_meta_value(self, key: str, value: str) -> None:
+        self.meta[str(key)] = str(value)
 
 
 class _HashVectorsEmbedder:

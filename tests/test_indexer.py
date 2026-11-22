@@ -15,13 +15,15 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest import mock
 
 from seekr import indexer as indexer_module
 from seekr.config import Config
+from seekr.course import CourseLabel
 from seekr.extract import ExtractionError
 from seekr.indexer import Indexer
 from seekr.models import text_sha
@@ -60,6 +62,7 @@ class FakeStore:
     def __init__(self) -> None:
         self.documents: dict[str, DocRow] = {}
         self.chunks: dict[int, _FakeChunk] = {}
+        self.meta: dict[str, str] = {}
         self._next_doc_id = 1
         self._next_chunk_id = 1
         self.move_calls: list[tuple[str, str, int, int]] = []
@@ -74,14 +77,16 @@ class FakeStore:
         return (
             copy.deepcopy(self.documents),
             copy.deepcopy(self.chunks),
+            copy.deepcopy(self.meta),
             self._next_doc_id,
             self._next_chunk_id,
         )
 
     def _restore(self, snapshot: tuple[object, ...]) -> None:
-        documents, chunks, next_doc_id, next_chunk_id = snapshot
+        documents, chunks, meta, next_doc_id, next_chunk_id = snapshot
         self.documents = documents  # type: ignore[assignment]
         self.chunks = chunks  # type: ignore[assignment]
+        self.meta = meta  # type: ignore[assignment]
         self._next_doc_id = next_doc_id  # type: ignore[assignment]
         self._next_chunk_id = next_chunk_id  # type: ignore[assignment]
 
@@ -103,7 +108,15 @@ class FakeStore:
 
     # -- Store protocol ----------------------------------------------------
     def upsert_document(
-        self, path: str, mtime_ns: int, size: int, sha256: str, kind: str
+        self,
+        path: str,
+        mtime_ns: int,
+        size: int,
+        sha256: str,
+        kind: str,
+        *,
+        module: str | None = None,
+        week: int | None = None,
     ) -> int:
         if self.fail_upsert:
             raise RuntimeError("injected document write failure")
@@ -120,8 +133,26 @@ class FakeStore:
             size=int(size),
             sha256=sha256,
             kind=kind,
+            module=None if module is None else str(module),
+            week=None if week is None else int(week),
         )
         return doc_id
+
+    def set_document_labels(
+        self, labels: Iterable[tuple[str, str | None, int | None]]
+    ) -> int:
+        updated = 0
+        for path, module, week in labels:
+            doc = self.documents.get(str(path))
+            if doc is None:
+                continue
+            self.documents[str(path)] = replace(
+                doc,
+                module=None if module is None else str(module),
+                week=None if week is None else int(week),
+            )
+            updated += 1
+        return updated
 
     def get_document(self, path: str) -> DocRow | None:
         return self.documents.get(str(path))
@@ -169,6 +200,8 @@ class FakeStore:
             size=int(size),
             sha256=doc.sha256,
             kind=doc.kind,
+            module=doc.module,
+            week=doc.week,
         )
         return doc.id
 
@@ -195,6 +228,12 @@ class FakeStore:
 
     def get_last_error_count(self) -> int:
         return self.last_error_count
+
+    def get_meta_value(self, key: str) -> str | None:
+        return self.meta.get(str(key))
+
+    def set_meta_value(self, key: str, value: str) -> None:
+        self.meta[str(key)] = str(value)
 
 
 class RecordingEmbedder:
@@ -1226,6 +1265,198 @@ class RealStoreIndexerTests(unittest.TestCase):
         assert current is not None
         self.assertEqual(current.sha256, old_doc.sha256)
         self.assertEqual(len(self.store.keyword_search("keepword", 10)), 1)
+
+
+class CourseLabelIndexTests(_IndexerTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.course = self.tmp / "course"
+        self.course.mkdir()
+
+    def write_course(self, relative: str, text: str) -> Path:
+        path = self.course / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def doc(self, relative: str) -> DocRow:
+        row = self.stored(self.course / relative)
+        assert row is not None
+        return row
+
+    def doc_label(self, relative: str) -> tuple[str | None, int | None]:
+        row = self.doc(relative)
+        return (row.module, row.week)
+
+    def test_sync_labels_documents(self) -> None:
+        a_md = self.write_course("ml/week2/a.md", "gradient descent notes")
+        self.write_course("syllabus.md", "course overview")
+        self.write_course("ml/notes.md", "general machine learning")
+        self.write_course("Week 01/intro.md", "week one introduction")
+        cfg = self._config(roots=(self.course,))
+        indexer = Indexer(self.store, self.embedder, cfg)
+
+        report = indexer.sync([self.course])
+
+        self.assertEqual(report.added, 4)
+        self.assertEqual(report.errors, [])
+        self.assertEqual(indexer.label(a_md), CourseLabel("ml", 2))
+        self.assertEqual(self.doc_label("ml/week2/a.md"), ("ml", 2))
+        self.assertIsNone(self.doc("syllabus.md").module)
+        self.assertIsNone(self.doc("syllabus.md").week)
+        self.assertEqual(self.doc_label("ml/notes.md"), ("ml", None))
+        self.assertEqual(self.doc_label("Week 01/intro.md"), ("course", 1))
+
+    def test_changing_week_pattern_relabels_without_embedding(self) -> None:
+        self.write_course("ml/week2/a.md", "week two notes")
+        self.write_course("ml/lecture3/b.md", "lecture three notes")
+        cfg = self._config(roots=(self.course,))
+        indexer = Indexer(self.store, self.embedder, cfg)
+
+        indexer.sync([self.course])
+        calls = len(self.embedder.calls)
+        self.assertEqual(self.doc_label("ml/week2/a.md"), ("ml", 2))
+        self.assertEqual(self.doc_label("ml/lecture3/b.md"), ("ml", None))
+        self.assertFalse(indexer.relabel_if_needed())
+
+        cfg2 = replace(cfg, week_pattern=r"^lecture[\s_-]*(\d+)\b")
+        indexer2 = Indexer(self.store, self.embedder, cfg2)
+        report2 = indexer2.sync([self.course])
+
+        self.assertEqual(len(self.embedder.calls), calls)
+        self.assertEqual((report2.added, report2.updated, report2.unchanged), (0, 0, 2))
+        self.assertEqual(self.doc_label("ml/week2/a.md"), ("ml", None))
+        self.assertEqual(self.doc_label("ml/lecture3/b.md"), ("ml", 3))
+        self.assertFalse(indexer2.relabel_if_needed())
+
+    def test_course_structure_false_clears_labels(self) -> None:
+        a_md = self.write_course("ml/week2/a.md", "ml notes")
+        self.write_course("ds/week1/b.md", "ds notes")
+        cfg = self._config(roots=(self.course,))
+        Indexer(self.store, self.embedder, cfg).sync([self.course])
+        calls = len(self.embedder.calls)
+        self.assertEqual(self.doc_label("ml/week2/a.md"), ("ml", 2))
+
+        cfg_off = replace(cfg, course_structure=False)
+        indexer_off = Indexer(self.store, self.embedder, cfg_off)
+        self.assertEqual(indexer_off.label(a_md), CourseLabel())
+
+        report = indexer_off.sync([self.course])
+        self.assertEqual(len(self.embedder.calls), calls)
+        self.assertEqual(report.unchanged, 2)
+        self.assertEqual(self.doc_label("ml/week2/a.md"), (None, None))
+        self.assertEqual(self.doc_label("ds/week1/b.md"), (None, None))
+
+        Indexer(self.store, self.embedder, cfg).sync([self.course])
+        self.assertEqual(len(self.embedder.calls), calls)
+        self.assertEqual(self.doc_label("ml/week2/a.md"), ("ml", 2))
+
+    def test_move_recomputes_label_for_destination(self) -> None:
+        src = self.write_course("ml/week1/a.md", _paragraph("alpha"))
+        other_src = self.write_course("ml/week2/dup.md", _paragraph("bravo"))
+        existing_dst = self.write_course("ds/week5/dup.md", _paragraph("bravo"))
+        cfg = self._config(roots=(self.course,))
+        indexer = Indexer(self.store, self.embedder, cfg)
+
+        indexer.sync([self.course])
+        calls = len(self.embedder.calls)
+        self.assertEqual(self.doc_label("ml/week1/a.md"), ("ml", 1))
+
+        dst = self.course / "ml/week3/a.md"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+        result = indexer.move_path(src, dst)
+
+        self.assertEqual(result, "unchanged")
+        self.assertEqual(len(self.embedder.calls), calls)
+        self.assertEqual(self.doc_label("ml/week3/a.md"), ("ml", 3))
+
+        cross_dst = self.course / "ds/week4/a.md"
+        cross_dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.rename(cross_dst)
+        self.assertEqual(indexer.move_path(dst, cross_dst), "unchanged")
+        self.assertEqual(len(self.embedder.calls), calls)
+        self.assertEqual(self.doc_label("ds/week4/a.md"), ("ds", 4))
+
+        # Moving over an already-indexed identical destination keeps destination label.
+        other_src.rename(existing_dst)
+        self.assertEqual(indexer.move_path(other_src, existing_dst), "removed")
+        self.assertEqual(len(self.embedder.calls), calls)
+        self.assertEqual(self.doc_label("ds/week5/dup.md"), ("ds", 5))
+
+    def test_on_file_callback_called_per_processed_file(self) -> None:
+        a_md = self.write_course("ml/week1/a.md", "alpha beta")
+        b_txt = self.write_course("ml/week1/b.txt", "gamma delta")
+        self.write_course("node_modules/ignored.md", "ignored text")
+        image_png = self.write_course("ml/week1/diagram.png", "not supported")
+        cfg = self._config(roots=(self.course,))
+        indexer = Indexer(self.store, self.embedder, cfg)
+
+        seen_first: list[Path] = []
+        report1 = indexer.sync([self.course], on_file=seen_first.append)
+
+        self.assertEqual((report1.added, report1.skipped), (2, 2))
+        self.assertEqual(seen_first, sorted([a_md.resolve(), b_txt.resolve()]))
+
+        a_md.write_text("alpha beta updated", encoding="utf-8")
+        c_md = self.write_course("ds/week2/c.md", "epsilon zeta")
+        bad_txt = self.course / "ds/week2/bad.txt"
+        bad_txt.parent.mkdir(parents=True, exist_ok=True)
+        bad_txt.write_bytes(b"\x00\x01binary")
+
+        seen_second: list[Path] = []
+        report2 = indexer.sync([self.course], on_file=seen_second.append)
+
+        self.assertEqual((report2.added, report2.updated, report2.unchanged), (1, 1, 1))
+        self.assertEqual(len(report2.errors), 1)
+        expected_second = sorted(
+            [a_md.resolve(), b_txt.resolve(), bad_txt.resolve(), c_md.resolve()]
+        )
+        self.assertEqual(seen_second, expected_second)
+
+        seen_single: list[Path] = []
+        indexer.sync([a_md], on_file=seen_single.append)
+        self.assertEqual(seen_single, [a_md.resolve()])
+
+        seen_unsupported: list[Path] = []
+        indexer.sync([image_png], on_file=seen_unsupported.append)
+        self.assertEqual(seen_unsupported, [])
+
+    @unittest.skipUnless(_HAS_FTS5, "FTS5 is required for the SQLite Store harness")
+    def test_relabel_persists_with_sqlite_store(self) -> None:
+        from seekr.store import Store
+
+        self.write_course("ml/week2/a.md", "gradient descent notes")
+        self.write_course("ml/lecture4/b.md", "lecture four notes")
+        cfg = Config(
+            roots=(self.course,),
+            db_path=self.tmp / "real.db",
+            chunk_target_words=10,
+            chunk_max_words=10,
+            chunk_overlap_words=0,
+        )
+        with _stdlib_vector_backend():
+            store = Store(cfg.db_path, cfg.embed_model, 8)
+            self.addCleanup(store.close)
+            embedder = ByteEmbedder()
+            Indexer(store, embedder, cfg).sync([self.course])
+            calls = len(embedder.calls)
+            self.assertEqual(store.list_modules(), ["ml"])
+            self.assertEqual(
+                store.get_document(str((self.course / "ml/week2/a.md").resolve())).week,
+                2,
+            )
+
+            cfg2 = replace(cfg, week_pattern=r"^lecture[\s_-]*(\d+)\b")
+            Indexer(store, embedder, cfg2).sync([self.course])
+            self.assertEqual(len(embedder.calls), calls)
+            self.assertIsNone(
+                store.get_document(str((self.course / "ml/week2/a.md").resolve())).week
+            )
+            self.assertEqual(
+                store.get_document(str((self.course / "ml/lecture4/b.md").resolve())).week,
+                4,
+            )
 
 
 if __name__ == "__main__":

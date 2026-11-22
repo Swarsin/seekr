@@ -14,6 +14,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -112,6 +113,7 @@ class _MemoryStore:
         self.documents: dict[str, DocRow] = {}
         self.vectors: dict[str, object] = {}
         self.chunks: dict[int, tuple[int, StoredChunk]] = {}
+        self.meta: dict[str, str] = {}
         self._next_id = 1
         self._next_chunk_id = 1
 
@@ -129,6 +131,9 @@ class _MemoryStore:
         size: int,
         sha256: str,
         kind: str,
+        *,
+        module: str | None = None,
+        week: int | None = None,
     ) -> int:
         key = str(path)
         existing = self.documents.get(key)
@@ -142,8 +147,26 @@ class _MemoryStore:
             size=int(size),
             sha256=sha256,
             kind=kind,
+            module=None if module is None else str(module),
+            week=None if week is None else int(week),
         )
         return doc_id
+
+    def set_document_labels(
+        self, labels: Iterable[tuple[str, str | None, int | None]]
+    ) -> int:
+        updated = 0
+        for path, module, week in labels:
+            doc = self.documents.get(str(path))
+            if doc is None:
+                continue
+            self.documents[str(path)] = replace(
+                doc,
+                module=None if module is None else str(module),
+                week=None if week is None else int(week),
+            )
+            updated += 1
+        return updated
 
     def find_vector_by_text_sha(self, sha: str) -> object | None:
         return self.vectors.get(sha)
@@ -187,6 +210,12 @@ class _MemoryStore:
 
     def set_last_error_count(self, n: int) -> None:
         return None
+
+    def get_meta_value(self, key: str) -> str | None:
+        return self.meta.get(str(key))
+
+    def set_meta_value(self, key: str, value: str) -> None:
+        self.meta[str(key)] = str(value)
 
 
 class _CountingEmbedder:

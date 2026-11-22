@@ -16,7 +16,7 @@ import os
 import stat as stat_module
 import time
 import warnings
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Literal
@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Literal
 from . import extract as _extract_module
 from .chunking import ChunkingWarning, MissingGrammarWarning, chunk
 from .config import Config
+from .course import CourseLabel, compile_week_pattern, label_for, labels_signature
 from .extract import ExtractionError, ExtractionResult
 from .logging_config import log_event
 from .models import text_sha
@@ -113,6 +114,7 @@ class _PreparedFile:
     chunks: list[tuple[object, str]]
     warnings: list[tuple[str, str]]
     missing_grammars: tuple[str, ...] = ()
+    label: CourseLabel = field(default_factory=CourseLabel)
 
 
 def _error_text(exc: BaseException) -> str:
@@ -164,6 +166,13 @@ class Indexer:
         self._ignore_exact_parts: frozenset[str] = frozenset()
         self._ignore_glob_patterns: tuple[str, ...] = ()
         self._compile_ignore_patterns()
+        resolved_roots: list[Path] = []
+        for raw_root in self.cfg.roots:
+            resolved, _ = self._resolve(Path(raw_root))
+            if resolved is not None:
+                resolved_roots.append(resolved)
+        self._resolved_roots: tuple[Path, ...] = tuple(resolved_roots)
+        self._week_re = compile_week_pattern(self.cfg.week_pattern)
 
     def _compile_ignore_patterns(self) -> None:
         patterns = self.cfg.ignore_globs
@@ -189,6 +198,32 @@ class Indexer:
         """Return the report from the most recent completed :meth:`sync`."""
         return self._last_report
 
+    def label(self, path: Path) -> CourseLabel:
+        """Derive module and week labels for *path* under configured roots."""
+        if not self.cfg.course_structure:
+            return CourseLabel()
+        resolved, _ = self._resolve(Path(path))
+        target = resolved if resolved is not None else Path(path)
+        return label_for(target, self._resolved_roots, self._week_re)
+
+    def relabel_if_needed(self) -> bool:
+        """Recompute stored labels when label-affecting configuration changed."""
+        sig = labels_signature(
+            self._resolved_roots, self.cfg.week_pattern, self.cfg.course_structure
+        )
+        if self.store.get_meta_value("labels_signature") == sig:
+            return False
+        with self.store.transaction(write=True):
+            paths = self.store.list_paths()
+            if paths:
+                labels: list[tuple[str, str | None, int | None]] = []
+                for raw_path in paths:
+                    lbl = self.label(Path(raw_path))
+                    labels.append((raw_path, lbl.module, lbl.week))
+                self.store.set_document_labels(labels)
+            self.store.set_meta_value("labels_signature", sig)
+        return True
+
     def index_path(self, path: Path) -> IndexResult:
         """Index one path, recording failures instead of raising them."""
         outcome = self._index_path(Path(path))
@@ -212,7 +247,12 @@ class Indexer:
         self._last_outcome = outcome
         return outcome.result
 
-    def sync(self, roots: list[Path]) -> SyncReport:
+    def sync(
+        self,
+        roots: list[Path],
+        *,
+        on_file: Callable[[Path], None] | None = None,
+    ) -> SyncReport:
         """Index every supported file below *roots*, then prune vanished files."""
         started = time.monotonic()
         log_event(_LOGGER, logging.INFO, "indexer.sync.start", roots=len(roots))
@@ -221,6 +261,16 @@ class Indexer:
         healthy_roots: list[Path] = []
 
         try:
+            try:
+                self.relabel_if_needed()
+            except Exception as exc:
+                report.errors.append(
+                    (
+                        str(self.cfg.db_path),
+                        f"cannot relabel documents: {_error_text(exc)}",
+                    )
+                )
+
             for raw_root in list(roots):
                 root, issue = self._resolve(Path(raw_root))
                 if root is None:
@@ -240,10 +290,10 @@ class Indexer:
                     continue
 
                 if stat_module.S_ISREG(root_stat.st_mode):
-                    self._index_walked_file(root, root, seen, report)
+                    self._index_walked_file(root, root, seen, report, on_file=on_file)
                     healthy_roots.append(root)
                 elif stat_module.S_ISDIR(root_stat.st_mode):
-                    walk_ok = self._sync_dir_root(root, seen, report)
+                    walk_ok = self._sync_dir_root(root, seen, report, on_file=on_file)
                     if walk_ok:
                         healthy_roots.append(root)
                 else:
@@ -324,7 +374,14 @@ class Indexer:
         files.sort(key=lambda item: str(item))
         return files, walk_ok
 
-    def _sync_dir_root(self, root: Path, seen: set[str], report: SyncReport) -> bool:
+    def _sync_dir_root(
+        self,
+        root: Path,
+        seen: set[str],
+        report: SyncReport,
+        *,
+        on_file: Callable[[Path], None] | None = None,
+    ) -> bool:
         docs_cache: dict[str, DocRow] | None = None
         get_meta = getattr(self.store, "get_documents_metadata", None)
         if callable(get_meta):
@@ -343,16 +400,20 @@ class Indexer:
                 continue
 
             resolved, key, before_opt = self._resolve_walked_entry(
-                file_path, root, seen, report
+                file_path, root, seen, report, on_file=on_file
             )
             if resolved is None or key is None:
                 continue
 
+            prepared = None
+            outcome = None
+            notify_file = False
             try:
                 kind = kind_for(resolved)
                 if kind is None:
                     report.skipped += 1
                     continue
+                notify_file = True
 
                 if before_opt is not None:
                     if before_opt.st_size > self.cfg.max_file_bytes:
@@ -399,6 +460,9 @@ class Indexer:
                 report.skipped += 1
                 report.errors.append((key, _error_text(exc)))
                 continue
+            finally:
+                if notify_file and on_file is not None:
+                    on_file(resolved)
 
             if outcome is not None:
                 self._merge_outcome(report, outcome)
@@ -422,6 +486,8 @@ class Indexer:
         root: Path,
         seen: set[str],
         report: SyncReport,
+        *,
+        on_file: Callable[[Path], None] | None = None,
     ) -> tuple[Path | None, str | None, os.stat_result | None]:
         try:
             lstat_res = os.lstat(path)
@@ -437,11 +503,9 @@ class Indexer:
                     (str(path), "path resolves outside the indexed root; skipped")
                 )
                 return None, None, None
-            key = str(resolved)
-            if key in seen:
-                return None, None, None
-            seen.add(key)
-            self._merge_outcome(report, self._index_path(resolved))
+            self._index_resolved_walked_file(
+                resolved, seen, report, on_file=on_file
+            )
             return None, None, None
 
         if stat_module.S_ISLNK(lstat_res.st_mode):
@@ -478,8 +542,35 @@ class Indexer:
         seen.add(key)
         return path, key, lstat_res
 
+    def _index_resolved_walked_file(
+        self,
+        resolved: Path,
+        seen: set[str],
+        report: SyncReport,
+        *,
+        on_file: Callable[[Path], None] | None = None,
+    ) -> None:
+        key = str(resolved)
+        if key in seen:
+            return
+        seen.add(key)
+        if self._is_ignored(resolved) or kind_for(resolved) is None:
+            report.skipped += 1
+            return
+        try:
+            self._merge_outcome(report, self._index_path(resolved))
+        finally:
+            if on_file is not None:
+                on_file(resolved)
+
     def _index_walked_file(
-        self, path: Path, root: Path, seen: set[str], report: SyncReport
+        self,
+        path: Path,
+        root: Path,
+        seen: set[str],
+        report: SyncReport,
+        *,
+        on_file: Callable[[Path], None] | None = None,
     ) -> None:
         if self._is_ignored(path, root):
             report.skipped += 1
@@ -497,11 +588,7 @@ class Indexer:
             )
             return
 
-        key = str(resolved)
-        if key in seen:
-            return
-        seen.add(key)
-        self._merge_outcome(report, self._index_path(resolved))
+        self._index_resolved_walked_file(resolved, seen, report, on_file=on_file)
 
     def _prune_root(self, root: Path, seen: set[str], report: SyncReport) -> None:
         try:
@@ -659,14 +746,16 @@ class Indexer:
                     return None, outcome
                 if signature != _signature(after):
                     continue
+                label = self.label(path)
                 try:
                     with self.store.transaction(write=True):
-                        doc_id = self.store.upsert_document(
+                        doc_id = self._upsert_document(
                             key,
                             before.st_mtime_ns,
                             before.st_size,
                             sha256,
                             kind,
+                            label,
                         )
                 except Exception as exc:
                     outcome.errors.append(
@@ -681,6 +770,8 @@ class Indexer:
                         size=before.st_size,
                         sha256=sha256,
                         kind=kind,
+                        module=label.module,
+                        week=label.week,
                     )
                 outcome.result = "unchanged"
                 return None, outcome
@@ -747,6 +838,7 @@ class Indexer:
                     chunks=chunk_pairs,
                     warnings=file_warnings,
                     missing_grammars=missing_grammars,
+                    label=self.label(path),
                 ),
                 None,
             )
@@ -792,12 +884,13 @@ class Indexer:
         try:
             with self.store.transaction(write=True):
                 for item, stored in prepared_writes:
-                    doc_id = self.store.upsert_document(
+                    doc_id = self._upsert_document(
                         item.key,
                         item.after_stat.st_mtime_ns,
                         item.after_stat.st_size,
                         item.sha256,
                         item.kind,
+                        item.label,
                     )
                     self.store.replace_chunks(doc_id, stored)
                     written_docs.append(
@@ -810,6 +903,8 @@ class Indexer:
                                 size=item.after_stat.st_size,
                                 sha256=item.sha256,
                                 kind=item.kind,
+                                module=item.label.module,
+                                week=item.label.week,
                             ),
                         )
                     )
@@ -852,6 +947,37 @@ class Indexer:
         ]
         return self._write_prepared_single(prepared, stored, docs_cache=docs_cache)
 
+    def _upsert_document(
+        self,
+        path: str,
+        mtime_ns: int,
+        size: int,
+        sha256: str,
+        kind: str,
+        label: CourseLabel,
+    ) -> int:
+        try:
+            return self.store.upsert_document(
+                path,
+                mtime_ns,
+                size,
+                sha256,
+                kind,
+                module=label.module,
+                week=label.week,
+            )
+        except TypeError as exc:
+            message = str(exc)
+            if "unexpected keyword argument" not in message or not any(
+                name in message for name in ("'module'", "'week'")
+            ):
+                raise
+            doc_id = self.store.upsert_document(path, mtime_ns, size, sha256, kind)
+            set_labels = getattr(self.store, "set_document_labels", None)
+            if callable(set_labels):
+                set_labels([(path, label.module, label.week)])
+            return doc_id
+
     def _write_prepared_single(
         self,
         prepared: _PreparedFile,
@@ -862,12 +988,13 @@ class Indexer:
         outcome = _Outcome(result="skipped")
         try:
             with self.store.transaction(write=True):
-                doc_id = self.store.upsert_document(
+                doc_id = self._upsert_document(
                     prepared.key,
                     prepared.after_stat.st_mtime_ns,
                     prepared.after_stat.st_size,
                     prepared.sha256,
                     prepared.kind,
+                    prepared.label,
                 )
                 self.store.replace_chunks(doc_id, stored)
         except Exception as exc:
@@ -883,6 +1010,8 @@ class Indexer:
                 size=prepared.after_stat.st_size,
                 sha256=prepared.sha256,
                 kind=prepared.kind,
+                module=prepared.label.module,
+                week=prepared.label.week,
             )
         outcome.result = "updated" if prepared.existed else "added"
         outcome.warnings.extend(prepared.warnings)
@@ -1158,6 +1287,7 @@ class Indexer:
             and src_doc.kind == dst_kind
             and self._same_chunking_language(src_doc.path, dst_resolved, dst_kind)
         )
+        dst_label = self.label(dst_resolved)
 
         if same_content_and_kind and dst_doc is None:
             try:
@@ -1167,6 +1297,9 @@ class Indexer:
                         dst_key,
                         mtime_ns=dst_stat.st_mtime_ns,
                         size=dst_stat.st_size,
+                    )
+                    self.store.set_document_labels(
+                        [(dst_key, dst_label.module, dst_label.week)]
                     )
             except KeyError:
                 return self._index_path(dst_resolved)
@@ -1191,12 +1324,13 @@ class Indexer:
         ):
             try:
                 with self.store.transaction(write=True):
-                    self.store.upsert_document(
+                    self._upsert_document(
                         dst_key,
                         dst_stat.st_mtime_ns,
                         dst_stat.st_size,
                         dst_doc.sha256,
                         dst_doc.kind,
+                        dst_label,
                     )
                     self.store.delete_document(src_key)
             except Exception as exc:
