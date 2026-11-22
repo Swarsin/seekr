@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Extraction and chunking support for Word documents (`.docx`), PowerPoint slides (`.pptx`), and Jupyter notebooks (`.ipynb`), with warnings for legacy `.doc`/`.ppt` binary files.
 - Automatic module and week labeling derived from course folder hierarchies (`course_structure` and `week_pattern` in `config.toml`), with `--module` and `--week` filtering across the CLI, daemon, MCP tools, and web interface.
 - Cross-course topic spread summaries (`--spread` on `seekr search`, `spread` on MCP `search`, and **Appears in** chips in the web UI) plus word-aligned snippets with stemmed query highlights.
-- Web UI course endpoints (`/api/course`), inline passage and PDF page preview (`/api/preview`, `/api/preview/page`), native/WSL file opening (`/api/open`), folder removal (`/api/roots/remove`), and one-click setup model download (`/api/models/pull`, `/api/models/pull/status`).
+- Web UI course endpoints (`/api/course`), inline passage and PDF page preview (`/api/preview`, `/api/preview/page`), native/WSL file opening (`/api/open`), folder removal (`/api/roots/remove`), and one-click setup model download (`/api/setup/download`, tracked via `/api/jobs/{job_id}`).
 - WSL2 support: automatic polling (`PollingObserver`, configurable via `poll_interval_seconds`) on `9p`, `drvfs`, and network mounts, Windows path/location formatting, and launching results in Windows apps via `wslview` or `explorer.exe`.
 - Personal course evaluation guidance in `docs/eval.md` (with `eval/personal/` git-ignored), real-model demo course evaluation test (`tests/test_demo_eval_slow.py`), and Windows-drive sync benchmark (`bench/drvfs_sync.py`) recorded in `docs/benchmarks.md`.
 

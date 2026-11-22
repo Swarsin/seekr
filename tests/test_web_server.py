@@ -2165,16 +2165,18 @@ def test_signal_handlers_stay_installed_through_backend_shutdown() -> None:
 
 def test_access_log_has_no_token_or_body() -> None:
     marker = "UNIQUE_DOCUMENT_MARKER_MUST_NOT_BE_LOGGED"
-    with running_server() as (server, _backend):
+    with (
+        capture_web_log() as log_stream,
+        running_server() as (server, _backend),
+    ):
         token = fetch_token(server)
-        with capture_web_log() as log_stream:
-            response = request(
-                server,
-                "POST",
-                "/api/search",
-                headers=json_headers(token),
-                body=json.dumps({"query": marker}).encode(),
-            )
+        response = request(
+            server,
+            "POST",
+            "/api/search",
+            headers=json_headers(token),
+            body=json.dumps({"query": marker}).encode(),
+        )
         assert response.status == 200
     log_text = log_stream.getvalue()
     assert log_text
