@@ -585,6 +585,7 @@ def _verify_cached_grammar(
     """Check the 1.x local cache without triggering a download."""
     label = f"tree-sitter-language-pack {version or '1.x'}"
     registry_error: Exception | None = None
+    registry_missing_detail: str | None = None
     registry_type = getattr(module, "LanguageRegistry", None)
     if registry_type is not None:
         try:
@@ -594,7 +595,7 @@ def _verify_cached_grammar(
             if callable(has_parser):
                 if has_parser(language):
                     return True, f"{label} has a locally cached {language} parser."
-                return False, (
+                registry_missing_detail = (
                     f"{label} has no locally cached {language!r} parser. seekr refuses to "
                     "call get_parser() because that could download a grammar. Pre-download "
                     f"it once (python -c \"from tree_sitter_language_pack import download; "
@@ -626,6 +627,9 @@ def _verify_cached_grammar(
             f"download(['{language}'])\") or install tree-sitter-language-pack<1, whose "
             f"wheels bundle grammars. Falling back to {_FALLBACK_LINES}-line windows."
         )
+
+    if registry_missing_detail is not None:
+        return False, registry_missing_detail
 
     reason = (
         f" LanguageRegistry inspection also failed: {registry_error}."

@@ -476,6 +476,44 @@ class OfflineLoaderContractTests(unittest.TestCase):
         self.assertIn("manifest unavailable", message)
         self.assertIn("60-line", message)
 
+    def test_registry_false_falls_back_to_downloaded_languages(self) -> None:
+        source = "def alpha():\n    return 1\n"
+        function = _FakeNode(
+            "function_definition",
+            start_byte=0,
+            end_byte=len(source.rstrip("\n")),
+            children=[],
+        )
+        root = _FakeNode("module", start_byte=0, end_byte=len(source), children=[function])
+        module = self._fake_pack(
+            version="1.25.2",
+            cached=["python"],
+            parser=_FakeParser(root),
+        )
+
+        class EmptyRegistry:
+            @staticmethod
+            def new() -> EmptyRegistry:
+                return EmptyRegistry()
+
+            def has_parser(self, name: str) -> bool:
+                del name
+                return False
+
+        module.LanguageRegistry = EmptyRegistry  # type: ignore[attr-defined]
+
+        with (
+            mock.patch.dict(sys.modules, {"tree_sitter_language_pack": module}),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            chunks = chunk("code", [_unit(source)], Config(), language="python")
+
+        self.assertEqual(caught, [])
+        self.assertEqual(module.calls, ["python"])  # type: ignore[attr-defined]
+        self.assertEqual([item.locator for item in chunks], ["L1-2"])
+        self.assertIn("def alpha", chunks[0].text)
+
 
 class _FakeNode:
     def __init__(
