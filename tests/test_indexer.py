@@ -1534,6 +1534,40 @@ class OfficeAndNotebookIndexTests(_IndexerTestCase):
         self.assertIsNotNone(self.stored(good_pptx_path))
         self.assertIsNotNone(self.stored(good_ipynb_path))
 
+    def test_docx_schema_invalid_xml_is_isolated_per_file(self) -> None:
+        import io
+        import zipfile
+
+        import docx
+
+        doc = docx.Document()
+        doc.add_heading("Section", level=1)
+        doc.add_paragraph("Valid body text.")
+        buf = io.BytesIO()
+        doc.save(buf)
+
+        bad_docx = self.root / "missing_attr.docx"
+        with (
+            zipfile.ZipFile(io.BytesIO(buf.getvalue()), "r") as zin,
+            zipfile.ZipFile(bad_docx, "w") as zout,
+        ):
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename == "word/document.xml":
+                    data = data.replace(b'w:val="Heading1"', b"")
+                zout.writestr(item, data)
+
+        good_txt = self.write("sibling.txt", "sibling valid content")
+
+        report = self.indexer.sync([self.root])
+
+        self.assertEqual(report.added, 1)
+        self.assertEqual(report.skipped, 1)
+        self.assertEqual(len(report.errors), 1)
+        self.assertEqual(report.errors[0][0], str(bad_docx.resolve()))
+        self.assertIsNotNone(self.stored(good_txt))
+        self.assertIsNone(self.stored(bad_docx))
+
 
 if __name__ == "__main__":
     unittest.main()

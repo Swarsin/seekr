@@ -135,6 +135,7 @@ class DemoCourseTests(unittest.TestCase):
                 self.assertEqual(report.errors, [])
                 searcher = Searcher(store, embedder)
                 matched = 0
+                matched_ids: set[str] = set()
                 for query in queries:
                     hits = searcher.search(
                         query.query, k=3, mode="keyword", per_file=1
@@ -145,10 +146,13 @@ class DemoCourseTests(unittest.TestCase):
                     }
                     if top3 & query.relevant:
                         matched += 1
+                        matched_ids.add(query.id)
             finally:
                 store.close()
 
         self.assertGreaterEqual(matched / len(queries), 0.8)
+        for query_id in ("lg-05", "ds-07", "ml-09"):
+            self.assertIn(query_id, matched_ids)
 
 
 if __name__ == "__main__":

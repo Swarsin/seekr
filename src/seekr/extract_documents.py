@@ -38,6 +38,27 @@ _BASE_OFFICE_ERRORS: tuple[type[BaseException], ...] = (
 )
 
 
+_DOCX_EXCEPTION_SPECS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("docx.exceptions", ("PythonDocxError",)),
+    ("docx.opc.exceptions", ("OpcError",)),
+    ("docx.oxml.exceptions", ("XmlchemyError",)),
+    (
+        "docx.image.exceptions",
+        (
+            "InvalidImageStreamError",
+            "UnexpectedEndOfFileError",
+            "UnrecognizedImageError",
+        ),
+    ),
+    ("lxml.etree", ("LxmlError",)),
+)
+_PPTX_EXCEPTION_SPECS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("pptx.exc", ("PythonPptxError",)),
+    ("pptx.exceptions", ("PythonPptxError",)),
+    ("lxml.etree", ("LxmlError",)),
+)
+
+
 def _load_package(module_name: str, package_name: str, label: str) -> Any:
     try:
         return importlib.import_module(module_name)
@@ -56,20 +77,37 @@ def _load_docx_types() -> tuple[type[Any], type[Any]]:
         raise ExtractionError("python-docx is required to extract Word files") from exc
 
 
-def _office_error_types(*extra: type[BaseException] | None) -> tuple[type[BaseException], ...]:
-    types: list[type[BaseException]] = list(_BASE_OFFICE_ERRORS)
-    for err in extra:
-        if err is not None:
-            types.append(err)
-    try:
-        lxml_etree = importlib.import_module("lxml.etree")
-    except ImportError:
-        pass
-    else:
-        lxml_error = getattr(lxml_etree, "LxmlError", None)
-        if isinstance(lxml_error, type) and issubclass(lxml_error, BaseException):
-            types.append(lxml_error)
-    return tuple(types)
+def _resolve_exception_types(
+    root_module: Any,
+    specs: tuple[tuple[str, tuple[str, ...]], ...],
+) -> tuple[type[BaseException], ...]:
+    resolved: list[type[BaseException]] = list(_BASE_OFFICE_ERRORS)
+    seen: set[type[BaseException]] = set(resolved)
+    prefix = f"{root_module.__name__}."
+    for module_name, attr_names in specs:
+        target: Any = None
+        try:
+            target = importlib.import_module(module_name)
+        except ImportError:
+            if module_name.startswith(prefix):
+                cur: Any = root_module
+                for part in module_name[len(prefix) :].split("."):
+                    cur = getattr(cur, part, None)
+                    if cur is None:
+                        break
+                target = cur
+        if target is None:
+            continue
+        for attr_name in attr_names:
+            candidate = getattr(target, attr_name, None)
+            if (
+                isinstance(candidate, type)
+                and issubclass(candidate, BaseException)
+                and candidate not in seen
+            ):
+                seen.add(candidate)
+                resolved.append(candidate)
+    return tuple(resolved)
 
 
 def _reject_ole2_header(handle: BinaryIO, source: Path) -> None:
@@ -133,12 +171,7 @@ def extract_docx(path: Path) -> ExtractionResult:
     source = Path(path)
     docx_mod = _load_package("docx", "python-docx", "Word")
     paragraph_cls, table_cls = _load_docx_types()
-    opc_error = getattr(
-        getattr(getattr(docx_mod, "opc", None), "exceptions", None),
-        "OpcError",
-        None,
-    )
-    error_types = _office_error_types(opc_error)
+    error_types = _resolve_exception_types(docx_mod, _DOCX_EXCEPTION_SPECS)
 
     lines: list[str] = []
     try:
@@ -193,8 +226,7 @@ def extract_pptx(path: Path) -> ExtractionResult:
     """Extract one unit per slide (with speaker notes) from a ``.pptx`` deck."""
     source = Path(path)
     pptx_mod = _load_package("pptx", "python-pptx", "PowerPoint")
-    pptx_error = getattr(getattr(pptx_mod, "exc", None), "PythonPptxError", None)
-    error_types = _office_error_types(pptx_error)
+    error_types = _resolve_exception_types(pptx_mod, _PPTX_EXCEPTION_SPECS)
 
     units: list[ExtractedUnit] = []
     warnings: list[str] = []
@@ -209,7 +241,11 @@ def extract_pptx(path: Path) -> ExtractionResult:
                 notes_parts: list[str] = []
 
                 title_shape = getattr(slide.shapes, "title", None)
-                title_element = getattr(title_shape, "element", None) if title_shape else None
+                title_element = (
+                    getattr(title_shape, "element", None)
+                    if title_shape is not None
+                    else None
+                )
                 if title_shape is not None and getattr(title_shape, "has_text_frame", False):
                     title_text = _clean_inline(title_shape.text_frame.text or "")
                     if title_text:
@@ -264,12 +300,11 @@ def extract_notebook(path: Path) -> ExtractionResult:
     if not isinstance(payload, dict):
         raise ExtractionError(f"invalid notebook {source}: root must be a JSON object")
 
-    if "nbformat" in payload:
-        nbformat = payload["nbformat"]
-        if type(nbformat) is not int or nbformat != 4:
-            raise ExtractionError(
-                f"unsupported notebook format in {source}: expected nbformat 4"
-            )
+    nbformat = payload.get("nbformat")
+    if type(nbformat) is not int or nbformat != 4:
+        raise ExtractionError(
+            f"unsupported or missing notebook format in {source}: expected nbformat 4"
+        )
 
     if "cells" not in payload or not isinstance(payload["cells"], list):
         raise ExtractionError(f"invalid notebook {source}: missing 'cells' list")

@@ -355,6 +355,31 @@ class CorruptOfficeAndNotebookTests(unittest.TestCase):
                 with self.assertRaises(ExtractionError):
                     extract(path, kind)
 
+    def test_docx_missing_required_openxml_attribute_raises_extraction_error(self) -> None:
+        import io
+        import zipfile
+
+        for target_entry, old_attr in (
+            ("word/document.xml", b'w:val="Heading1"'),
+            ("word/styles.xml", b'w:val="Normal"'),
+        ):
+            with self.subTest(target_entry=target_entry):
+                buf = io.BytesIO()
+                with (
+                    zipfile.ZipFile(io.BytesIO(_VALID_DOCX_BYTES), "r") as zin,
+                    zipfile.ZipFile(buf, "w") as zout,
+                ):
+                    for item in zin.infolist():
+                        data = zin.read(item.filename)
+                        if item.filename == target_entry:
+                            self.assertIn(old_attr, data)
+                            data = data.replace(old_attr, b"")
+                        zout.writestr(item, data)
+                path = self.dir / f"schema_{Path(target_entry).stem}.docx"
+                path.write_bytes(buf.getvalue())
+                with self.assertRaises(ExtractionError):
+                    extract(path, "word")
+
     def test_truncated_notebook_and_bad_cell_shapes_raise_extraction_error(self) -> None:
         cases = {
             "truncated.ipynb": b'{"nbformat": 4, "cells": [{"cell_type": "code"',

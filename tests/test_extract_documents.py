@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -166,6 +167,29 @@ class DocxExtractionTests(_TempDirTestCase):
             extract(ole, "word")
         self.assertIn("python-docx", str(raised.exception).lower())
 
+    def test_docx_missing_required_xml_attribute_raises_extraction_error(self) -> None:
+        doc = docx.Document()
+        doc.add_heading("Regularisation", level=1)
+        doc.add_paragraph("Body paragraph.")
+        src = self.dir / "valid.docx"
+        doc.save(src)
+
+        for target_entry, old_attr in (
+            ("word/document.xml", b'w:val="Heading1"'),
+            ("word/styles.xml", b'w:val="Normal"'),
+        ):
+            with self.subTest(target_entry=target_entry):
+                bad = self.dir / f"bad_{Path(target_entry).stem}.docx"
+                with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(bad, "w") as zout:
+                    for item in zin.infolist():
+                        data = zin.read(item.filename)
+                        if item.filename == target_entry:
+                            self.assertIn(old_attr, data)
+                            data = data.replace(old_attr, b"")
+                        zout.writestr(item, data)
+                with self.assertRaises(ExtractionError):
+                    extract(bad, "word")
+
 
 class PptxExtractionTests(_TempDirTestCase):
     def test_pptx_one_unit_per_slide_with_notes(self) -> None:
@@ -313,6 +337,8 @@ class NotebookExtractionTests(_TempDirTestCase):
             {"nbformat": 4, "cells": "not-a-list"},
             {"nbformat": 4},
             {"nbformat": 3, "cells": []},
+            {"nbformat": True, "cells": []},
+            {"cells": []},
             ["not", "a", "dict"],
         ]
         for idx, payload in enumerate(bad_payloads):
