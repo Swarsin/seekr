@@ -8,6 +8,8 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from seekr.course import DEFAULT_WEEK_PATTERN, compile_week_pattern
+
 DEFAULT_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_VECTOR_QUANT = "int8"
@@ -60,6 +62,8 @@ class Config:
     chunk_target_words: int = DEFAULT_CHUNK_TARGET_WORDS
     chunk_max_words: int = DEFAULT_CHUNK_MAX_WORDS
     chunk_overlap_words: int = DEFAULT_CHUNK_OVERLAP_WORDS
+    week_pattern: str = DEFAULT_WEEK_PATTERN
+    course_structure: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.roots, tuple) or not all(
@@ -106,6 +110,14 @@ class Config:
             raise ConfigError("chunk_overlap_words must be >= 0")
         if self.chunk_overlap_words >= self.chunk_target_words:
             raise ConfigError("chunk_overlap_words must be less than chunk_target_words")
+        if not isinstance(self.week_pattern, str):
+            raise ConfigError("week_pattern must be a string")
+        try:
+            compile_week_pattern(self.week_pattern)
+        except ValueError as exc:
+            raise ConfigError(f"week_pattern is invalid: {exc}") from exc
+        if not isinstance(self.course_structure, bool):
+            raise ConfigError("course_structure must be a boolean")
 
 
 def _read_toml(path: Path) -> dict[str, Any]:
@@ -183,5 +195,9 @@ def load_config(path: Path | None = None) -> Config:
         values["chunk_max_words"] = data["chunk_max_words"]
     if "chunk_overlap_words" in data:
         values["chunk_overlap_words"] = data["chunk_overlap_words"]
+    if "week_pattern" in data:
+        values["week_pattern"] = data["week_pattern"]
+    if "course_structure" in data:
+        values["course_structure"] = data["course_structure"]
 
     return Config(**values)

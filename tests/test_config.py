@@ -157,6 +157,52 @@ class ConfigLoadingTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             cfg.embed_model = "other"  # type: ignore[misc]
 
+    def test_week_pattern_and_course_structure_load(self) -> None:
+        defaults = Config()
+        self.assertEqual(defaults.week_pattern, r"^(?:week|wk|w)[\s_-]*0*(\d{1,2})\b")
+        self.assertIs(defaults.course_structure, True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = self._write(
+                Path(tmp),
+                'week_pattern = "^semana(\\\\d+)$"\ncourse_structure = false\n',
+            )
+            cfg = load_config(cfg_path)
+
+        self.assertEqual(cfg.week_pattern, r"^semana(\d+)$")
+        self.assertIs(cfg.course_structure, False)
+
+    def test_invalid_week_pattern_is_config_error(self) -> None:
+        bad_configs = (
+            'week_pattern = "("\n',
+            'week_pattern = "week\\\\d+"\n',
+            "week_pattern = 1\n",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for bad in bad_configs:
+                cfg_path = self._write(Path(tmp), bad)
+                with self.subTest(bad=bad):
+                    with self.assertRaises(ConfigError) as raised:
+                        load_config(cfg_path)
+                    self.assertIn("week_pattern", str(raised.exception))
+
+        with self.assertRaises(ConfigError) as raised:
+            Config(week_pattern="(")
+        self.assertIn("week_pattern", str(raised.exception))
+
+    def test_course_structure_must_be_bool(self) -> None:
+        for bad in (1, 0, "false", "true", None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ConfigError) as raised:
+                    Config(course_structure=bad)  # type: ignore[arg-type]
+                self.assertIn("course_structure", str(raised.exception))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for toml in ('course_structure = "false"\n', "course_structure = 1\n"):
+                cfg_path = self._write(Path(tmp), toml)
+                with self.subTest(toml=toml), self.assertRaises(ConfigError):
+                    load_config(cfg_path)
+
 
 class ModelTests(unittest.TestCase):
     def test_text_sha_ignores_case_and_whitespace(self) -> None:
