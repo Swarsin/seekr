@@ -2108,6 +2108,14 @@ def test_remove_root_purges_config_and_db_respects_prefix_lane_and_daemon(
             service.remove_root(str(tmp_path / "not-configured"), rev)
         assert _error_code(raised.value) == "invalid_root"
 
+        for bad_path in ("bad\x00path", "\ud800", "", "   "):
+            with pytest.raises(ApiError) as raised:
+                service.remove_root(bad_path, rev)
+            assert raised.value.status == 400
+            assert _error_code(raised.value) == "invalid_root"
+            assert load_config(config_path).roots == (root, root2)
+            assert service.search(SearchRequest("uniquewordrootone", mode="keyword")).hits
+
         updated = service.remove_root(str(root), rev)
         assert updated.roots == (str(root2),)
         assert updated.revision != rev
@@ -2161,6 +2169,7 @@ def test_start_download_job_scrubs_offline_env_keeps_last_50_lines_and_handles_f
         ]
         child_env = captured_calls[0]["env"]
         assert isinstance(child_env, dict)
+        assert child_env.get("SEEKR_CONFIG") == str(config_path)
         for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
             assert key not in child_env
 
@@ -2203,3 +2212,103 @@ def test_start_download_job_scrubs_offline_env_keeps_last_50_lines_and_handles_f
         assert failed.state == "failed"
         assert "network unreachable" in (failed.error or "")
         assert service.status().activity == {"lane": "idle", "job_id": None}
+
+
+def test_start_download_success_resets_unavailable_model_state(tmp_path: Path) -> None:
+    import types
+
+    config_path = _write_config(tmp_path)
+
+    def failing_embedder(cfg: Config):
+        raise RuntimeError("model missing")
+
+    with _service(config_path, tmp_path, embedder_factory=failing_embedder) as service:
+        check_view = _wait_job(service, service.start_model_check())
+        assert check_view.state == "failed"
+        assert service.status().model["state"] == "unavailable"
+
+        with mock.patch(
+            "subprocess.run",
+            return_value=types.SimpleNamespace(returncode=0, stdout="Done.\n", stderr=""),
+        ):
+            dl_view = _wait_job(service, service.start_download())
+
+        assert dl_view.state == "succeeded"
+        model_status = service.status().model
+        assert model_status["state"] == "unchecked"
+        assert model_status["message"] is None
+
+
+def test_preview_page_png_locator_variants_and_encrypted_pdf(tmp_path: Path) -> None:
+    import pymupdf
+
+    docs = _root(tmp_path, "loc-docs")
+    pdf_path = _make_pdf(
+        docs / "multi.pdf",
+        [(300, 400, "page one text"), (400, 400, "page two text")],
+    )
+    db_path = tmp_path / "loc.db"
+    embedder = FakeEmbedder(dim=64)
+    store = Store(db_path, "fake", 64, vector_quant="int8")
+    try:
+        doc_id = store.upsert_document(str(pdf_path), 1, 10, "a" * 64, "pdf")
+        store.replace_chunks(
+            doc_id,
+            [
+                StoredChunk(
+                    spec=ChunkSpec(text="empty loc", locator="", loc_start=1.0),
+                    text_sha=text_sha("empty loc"),
+                    vector=embedder.embed_documents(["empty loc"])[0],
+                ),
+                StoredChunk(
+                    spec=ChunkSpec(text="range loc", locator="p.1-2", loc_start=1.0),
+                    text_sha=text_sha("range loc"),
+                    vector=embedder.embed_documents(["range loc"])[0],
+                ),
+                StoredChunk(
+                    spec=ChunkSpec(text="zero loc", locator="p.0", loc_start=0.0),
+                    text_sha=text_sha("zero loc"),
+                    vector=embedder.embed_documents(["zero loc"])[0],
+                ),
+                StoredChunk(
+                    spec=ChunkSpec(text="line loc", locator="L1", loc_start=1.0),
+                    text_sha=text_sha("line loc"),
+                    vector=embedder.embed_documents(["line loc"])[0],
+                ),
+            ],
+        )
+    finally:
+        store.close()
+
+    empty_id = _chunk_id_for_path(db_path, str(pdf_path), "")
+    range_id = _chunk_id_for_path(db_path, str(pdf_path), "p.1-2")
+    zero_id = _chunk_id_for_path(db_path, str(pdf_path), "p.0")
+    line_id = _chunk_id_for_path(db_path, str(pdf_path), "L1")
+    config_path = _write_config(tmp_path, roots=[docs], db_path=db_path)
+
+    with _service(config_path, tmp_path) as service:
+        for ok_id in (empty_id, range_id):
+            png = service.preview_page_png(ok_id)
+            assert png.startswith(b"\x89PNG\r\n\x1a\n")
+            assert pymupdf.Pixmap(png).width == 450
+
+        for bad_id in (zero_id, line_id):
+            with pytest.raises(ApiError) as raised:
+                service.preview_page_png(bad_id)
+            assert _error_code(raised.value) == "not_found"
+
+        closed: list[bool] = []
+
+        class _EncryptedDoc:
+            needs_pass = True
+
+            def close(self) -> None:
+                closed.append(True)
+
+        with (
+            mock.patch("pymupdf.open", return_value=_EncryptedDoc()),
+            pytest.raises(ApiError) as raised,
+        ):
+            service.preview_page_png(empty_id)
+        assert _error_code(raised.value) == "not_found"
+        assert closed == [True]

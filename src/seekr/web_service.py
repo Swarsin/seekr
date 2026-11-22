@@ -981,7 +981,6 @@ class WebService:
                         409, "busy", f"index is busy: {_safe_message(exc)}"
                     ) from exc
 
-            prefixes = self._removed_root_prefixes(path, cfg.roots)
             lock: Any = None
             if index_snapshot is not None and index_snapshot.state == "ready":
                 lock = self._acquire_lifecycle_lock(
@@ -998,6 +997,7 @@ class WebService:
                         500, "internal_error", f"cannot remove the root: {_safe_message(exc)}"
                     ) from exc
 
+                prefixes = self._removed_root_prefixes(path, cfg.roots)
                 if (
                     index_snapshot is not None
                     and index_snapshot.state == "ready"
@@ -1034,11 +1034,11 @@ class WebService:
         prefixes: list[str] = []
         try:
             canonical = str(Path(path).expanduser().resolve(strict=False))
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             canonical = ""
         try:
             expanded = str(Path(path).expanduser())
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             expanded = ""
         for candidate in (canonical, expanded):
             if candidate and candidate != "/" and candidate not in prefixes:
@@ -1047,7 +1047,7 @@ class WebService:
             for existing in configured_roots:
                 try:
                     existing_resolved = str(existing.expanduser().resolve(strict=False))
-                except (OSError, RuntimeError):
+                except (OSError, RuntimeError, ValueError):
                     continue
                 if existing_resolved == canonical:
                     exp = str(existing.expanduser())
@@ -1855,6 +1855,7 @@ class WebService:
             env = dict(os.environ)
             for key in _OFFLINE_ENV_KEYS:
                 env.pop(key, None)
+            env["SEEKR_CONFIG"] = str(self._config_path)
             result = subprocess.run(
                 cmd,
                 env=env,
