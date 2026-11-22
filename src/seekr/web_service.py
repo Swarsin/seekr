@@ -18,7 +18,7 @@ import time
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -959,12 +959,31 @@ class WebService:
             highlights=tuple((int(a), int(b)) for a, b in raw_highlights),
         )
 
-    def _search_result(self, hits: list[object], started: float) -> SearchResult:
+    def _search_result(
+        self,
+        hits: list[object],
+        started: float,
+        *,
+        spread_hits: list[object] | None = None,
+    ) -> SearchResult:
         took_ms = max(0.0, (time.monotonic() - started) * 1000.0)
+        spread_payload: tuple[dict[str, object], ...] | None = None
+        if spread_hits is not None:
+            from .spread import compute_spread, spread_to_dict
+
+            groups = compute_spread(spread_hits)  # type: ignore[arg-type]
+            spread_payload = tuple(spread_to_dict(group) for group in groups)
         return SearchResult(
             hits=tuple(self._hit_dto(hit) for hit in hits),
             took_ms=took_ms,
+            spread=spread_payload,
         )
+
+    @staticmethod
+    def _spread_request(request: SearchRequest) -> SearchRequest:
+        from .spread import SPREAD_CANDIDATES
+
+        return replace(request, k=SPREAD_CANDIDATES, per_file=2)
 
     @staticmethod
     def _optional_filter_kwargs(request: SearchRequest) -> dict[str, object]:
@@ -1064,7 +1083,7 @@ class WebService:
 
     def _keyword_search(
         self, cfg: Config, request: SearchRequest, snapshot: _IndexSnapshot
-    ) -> list[object]:
+    ) -> tuple[list[object], list[object] | None]:
         if snapshot.dim is None or snapshot.vector_quant is None:
             raise ApiError(503, "index_unavailable", "index metadata could not be read")
         from .cli_search import get_hits
@@ -1110,22 +1129,30 @@ class WebService:
                 cfg.embed_model
             )
             searcher = searcher_factory(store, keyword_embedder)
-            return list(
-                get_hits(
-                    request.query,
-                    k=request.k,
-                    mode="keyword",
-                    per_file=request.per_file,
-                    rerank=False,
-                    path_prefix=request.path,
-                    kind=request.kind,
-                    since=request.since,
-                    cfg=cfg,
-                    searcher=searcher,
-                    use_daemon=False,
-                    **self._optional_filter_kwargs(request),
+
+            def run_query(req: SearchRequest) -> list[object]:
+                return list(
+                    get_hits(
+                        req.query,
+                        k=req.k,
+                        mode="keyword",
+                        per_file=req.per_file,
+                        rerank=False,
+                        path_prefix=req.path,
+                        kind=req.kind,
+                        since=req.since,
+                        cfg=cfg,
+                        searcher=searcher,
+                        use_daemon=False,
+                        **self._optional_filter_kwargs(req),
+                    )
                 )
-            )
+
+            hits = run_query(request)
+            spread_hits: list[object] | None = None
+            if request.spread:
+                spread_hits = run_query(self._spread_request(request)) if hits else []
+            return hits, spread_hits
         finally:
             if store is not None:
                 with suppress(Exception):
@@ -1134,11 +1161,19 @@ class WebService:
 
     def _hybrid_local_search(
         self, cfg: Config, request: SearchRequest
-    ) -> list[object]:
+    ) -> tuple[list[object], list[object] | None]:
         self._begin_lane("search")
         try:
             embedder = self._load_model_for_lane(cfg)[0]
-            return self._call_local_search(cfg, request, embedder)
+            hits = self._call_local_search(cfg, request, embedder)
+            spread_hits: list[object] | None = None
+            if request.spread:
+                spread_hits = (
+                    self._call_local_search(cfg, self._spread_request(request), embedder)
+                    if hits
+                    else []
+                )
+            return hits, spread_hits
         finally:
             self._end_lane()
 
@@ -1204,16 +1239,24 @@ class WebService:
         started = time.monotonic()
         if request.mode not in ("keyword", "vector", "hybrid"):
             raise ApiError(400, "invalid_request", "mode must be keyword, vector or hybrid")
+        if type(request.spread) is not bool:
+            raise ApiError(
+                400,
+                "invalid_request",
+                "spread must be a boolean",
+                {"spread": "spread must be a boolean"},
+            )
         cfg = self._load_config()
 
+        empty_spread: list[object] | None = [] if request.spread else None
         if not request.query.strip():
-            return self._search_result([], started)
+            return self._search_result([], started, spread_hits=empty_spread)
 
         self._validate_search_filters(request)
 
         present, _socket_path = self._daemon_status()
         if present:
-            from .client import DaemonMismatchError
+            from .client import DaemonError, DaemonMismatchError
 
             try:
                 daemon_hits = self._call_daemon_search(cfg, request)
@@ -1222,18 +1265,36 @@ class WebService:
             except Exception as exc:
                 raise self._map_search_error(exc) from exc
             if daemon_hits is not None:
-                return self._search_result(list(daemon_hits), started)
+                daemon_spread: list[object] | None = None
+                if request.spread:
+                    if daemon_hits:
+                        try:
+                            spread_result = self._call_daemon_search(
+                                cfg, self._spread_request(request)
+                            )
+                            if spread_result is None:
+                                raise DaemonError(
+                                    "daemon became unavailable during spread search"
+                                )
+                            daemon_spread = list(spread_result)
+                        except Exception as exc:
+                            raise self._map_search_error(exc) from exc
+                    else:
+                        daemon_spread = []
+                return self._search_result(
+                    list(daemon_hits), started, spread_hits=daemon_spread
+                )
 
         snapshot = self._preflight_search(cfg)
         if snapshot.state in ("missing", "empty"):
-            return self._search_result([], started)
+            return self._search_result([], started, spread_hits=empty_spread)
 
         if request.mode == "keyword":
             try:
-                hits = self._keyword_search(cfg, request, snapshot)
+                hits, spread_hits = self._keyword_search(cfg, request, snapshot)
             except Exception as exc:
                 raise self._map_search_error(exc) from exc
-            return self._search_result(hits, started)
+            return self._search_result(hits, started, spread_hits=spread_hits)
 
         if self._model_state_for(cfg.embed_model) == "unavailable":
             raise ApiError(
@@ -1242,10 +1303,10 @@ class WebService:
                 f"embedding model {cfg.embed_model!r} is unavailable; run an explicit model check",
             )
         try:
-            hits = self._hybrid_local_search(cfg, request)
+            hits, spread_hits = self._hybrid_local_search(cfg, request)
         except Exception as exc:
             raise self._map_search_error(exc) from exc
-        return self._search_result(hits, started)
+        return self._search_result(hits, started, spread_hits=spread_hits)
 
     # -- jobs: model check -------------------------------------------------
 

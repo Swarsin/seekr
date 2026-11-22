@@ -168,6 +168,7 @@ class SearchRequest:
     since: str | None = None
     module: str | None = None
     week: str | None = None
+    spread: bool = False
 
     def to_query_kwargs(self) -> dict[str, object]:
         """Map the wire field ``path`` to ``get_hits``'s ``path_prefix``.
@@ -194,12 +195,16 @@ class SearchResult:
 
     hits: tuple[HitDTO, ...]
     took_ms: float
+    spread: tuple[dict[str, object], ...] | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "hits": [hit.to_dict() for hit in self.hits],
             "took_ms": self.took_ms,
         }
+        if self.spread is not None:
+            payload["spread"] = [dict(item) for item in self.spread]
+        return payload
 
 
 @dataclass(frozen=True)

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, TextIO
 from . import __version__
 from .filters import VALID_KINDS
 from .logging_config import log_event
+from .spread import SPREAD_CANDIDATES, compute_spread, spread_to_dict
 
 if TYPE_CHECKING:
     from .models import Hit
@@ -66,6 +67,11 @@ _TOOLS: list[dict[str, Any]] = [
                     "type": "boolean",
                     "default": False,
                     "description": "Include per-retriever rank and score breakdown.",
+                },
+                "spread": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Include module/week course spread summary.",
                 },
             },
             "required": ["query"],
@@ -266,8 +272,7 @@ class McpServer:
             }
 
         try:
-            hits = self._dispatch_tool(tool_name, arguments)
-            payload = [_hit_to_dict(hit) for hit in hits]
+            payload, hit_count = self._dispatch_tool_payload(tool_name, arguments)
             text = json.dumps(payload, ensure_ascii=False, indent=2)
         except (
             ValueError,
@@ -295,83 +300,116 @@ class McpServer:
             logging.DEBUG,
             "mcp.tool_ok",
             tool=tool_name,
-            hits=len(payload),
+            hits=hit_count,
         )
         return {
             "content": [{"type": "text", "text": text}],
             "isError": False,
         }
 
-    def _dispatch_tool(
+    def _dispatch_tool_payload(
         self, tool_name: str, arguments: Mapping[str, Any]
-    ) -> list[Hit]:
+    ) -> tuple[Any, int]:
         if tool_name == "search":
-            if "query" not in arguments:
-                raise ValueError("search requires a 'query' string")
-            query = _require_str(arguments.get("query"), "query")
-            k = _optional_positive_int(arguments.get("k"), "k", default=10)
-            mode = _optional_str(arguments.get("mode"), "mode") or "hybrid"
-            per_file = _optional_positive_int(
-                arguments.get("per_file"), "per_file", default=2
-            )
-            rerank = _optional_bool(arguments.get("rerank"), "rerank", default=False)
-            path_prefix = _optional_str(arguments.get("path"), "path")
-            kind = _optional_str(arguments.get("kind"), "kind")
-            since = _optional_str(arguments.get("since"), "since")
-            module = _optional_str(arguments.get("module"), "module")
-            week = _optional_str(arguments.get("week"), "week")
-            explain = _optional_bool(arguments.get("explain"), "explain", default=False)
-
-            extra: dict[str, Any] = {}
-            if explain:
-                extra["explain"] = True
-            if kind is not None:
-                extra["kind"] = kind
-            if since is not None:
-                extra["since"] = since
-            if module is not None:
-                extra["module"] = module
-            if week is not None:
-                extra["week"] = week
-            return self._search_fn(
-                query,
-                k=k,
-                mode=mode,
-                per_file=per_file,
-                rerank=rerank,
-                path_prefix=path_prefix,
-                **extra,
-            )
-
+            return self._dispatch_search(arguments)
         if tool_name == "similar":
-            if "path" not in arguments:
-                raise ValueError("similar requires a 'path' string")
-            target = Path(_require_str(arguments.get("path"), "path"))
-            k = _optional_positive_int(arguments.get("k"), "k", default=10)
-            per_file = _optional_positive_int(
-                arguments.get("per_file"), "per_file", default=1
-            )
-            path_prefix = _optional_str(arguments.get("path_prefix"), "path_prefix")
-            kind = _optional_str(arguments.get("kind"), "kind")
-            since = _optional_str(arguments.get("since"), "since")
-            module = _optional_str(arguments.get("module"), "module")
-            week = _optional_str(arguments.get("week"), "week")
-            extra_similar: dict[str, Any] = {}
-            if module is not None:
-                extra_similar["module"] = module
-            if week is not None:
-                extra_similar["week"] = week
-            return self._similar_fn(
-                target,
-                k=k,
-                per_file=per_file,
-                path_prefix=path_prefix,
-                kind=kind,
-                since=since,
-                **extra_similar,
-            )
-
+            hits = self._dispatch_similar(arguments)
+            return [_hit_to_dict(hit) for hit in hits], len(hits)
         raise LookupError(f"unknown tool: {tool_name!r}; expected 'search' or 'similar'")
+
+    def _dispatch_search(self, arguments: Mapping[str, Any]) -> tuple[Any, int]:
+        if "query" not in arguments:
+            raise ValueError("search requires a 'query' string")
+        query = _require_str(arguments.get("query"), "query")
+        k = _optional_positive_int(arguments.get("k"), "k", default=10)
+        mode = _optional_str(arguments.get("mode"), "mode") or "hybrid"
+        per_file = _optional_positive_int(
+            arguments.get("per_file"), "per_file", default=2
+        )
+        rerank = _optional_bool(arguments.get("rerank"), "rerank", default=False)
+        path_prefix = _optional_str(arguments.get("path"), "path")
+        kind = _optional_str(arguments.get("kind"), "kind")
+        since = _optional_str(arguments.get("since"), "since")
+        module = _optional_str(arguments.get("module"), "module")
+        week = _optional_str(arguments.get("week"), "week")
+        explain = _optional_bool(arguments.get("explain"), "explain", default=False)
+        spread = _optional_bool(arguments.get("spread"), "spread", default=False)
+
+        filter_kwargs: dict[str, Any] = {}
+        if kind is not None:
+            filter_kwargs["kind"] = kind
+        if since is not None:
+            filter_kwargs["since"] = since
+        if module is not None:
+            filter_kwargs["module"] = module
+        if week is not None:
+            filter_kwargs["week"] = week
+
+        extra = dict(filter_kwargs)
+        if explain:
+            extra["explain"] = True
+
+        hits = self._search_fn(
+            query,
+            k=k,
+            mode=mode,
+            per_file=per_file,
+            rerank=rerank,
+            path_prefix=path_prefix,
+            **extra,
+        )
+        hit_dicts = [_hit_to_dict(hit) for hit in hits]
+        if not spread:
+            return hit_dicts, len(hits)
+
+        if query.strip() and hits:
+            spread_hits = self._search_fn(
+                query,
+                k=SPREAD_CANDIDATES,
+                mode=mode,
+                per_file=2,
+                rerank=False,
+                path_prefix=path_prefix,
+                **filter_kwargs,
+            )
+            groups = compute_spread(spread_hits)
+        else:
+            groups = []
+        return (
+            {
+                "hits": hit_dicts,
+                "spread": [spread_to_dict(group) for group in groups],
+            },
+            len(hits),
+        )
+
+    def _dispatch_similar(self, arguments: Mapping[str, Any]) -> list[Hit]:
+        if "path" not in arguments:
+            raise ValueError("similar requires a 'path' string")
+        target = Path(_require_str(arguments.get("path"), "path"))
+        k = _optional_positive_int(arguments.get("k"), "k", default=10)
+        per_file = _optional_positive_int(
+            arguments.get("per_file"), "per_file", default=1
+        )
+        path_prefix = _optional_str(arguments.get("path_prefix"), "path_prefix")
+        kind = _optional_str(arguments.get("kind"), "kind")
+        since = _optional_str(arguments.get("since"), "since")
+        module = _optional_str(arguments.get("module"), "module")
+        week = _optional_str(arguments.get("week"), "week")
+        extra_similar: dict[str, Any] = {}
+        if module is not None:
+            extra_similar["module"] = module
+        if week is not None:
+            extra_similar["week"] = week
+        return self._similar_fn(
+            target,
+            k=k,
+            per_file=per_file,
+            path_prefix=path_prefix,
+            kind=kind,
+            since=since,
+            **extra_similar,
+        )
 
     def serve_stdio(
         self,

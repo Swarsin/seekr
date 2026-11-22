@@ -249,10 +249,30 @@ def _optional_int(body: dict[str, Any], key: str, default: int, low: int, high: 
     return value
 
 
+def _optional_bool(body: dict[str, Any], key: str, default: bool = False) -> bool:
+    if key not in body:
+        return default
+    value = body[key]
+    if type(value) is not bool:
+        raise _invalid(f"{key} must be a boolean", field=key)
+    return value
+
+
 def _validate_search(body: dict[str, Any]) -> SearchRequest:
     _reject_unknown_fields(
         body,
-        {"query", "mode", "k", "per_file", "path", "kind", "since", "module", "week"},
+        {
+            "query",
+            "mode",
+            "k",
+            "per_file",
+            "path",
+            "kind",
+            "since",
+            "module",
+            "week",
+            "spread",
+        },
     )
     query = _require_string(body, "query")
     if len(query) > LIMITS["query_chars"]:
@@ -276,6 +296,7 @@ def _validate_search(body: dict[str, Any]) -> SearchRequest:
     since = _optional_string(body, "since")
     module = _optional_string(body, "module")
     week = _optional_string(body, "week")
+    spread = _optional_bool(body, "spread", default=False)
     return SearchRequest(
         query=query,
         mode=mode,  # type: ignore[arg-type]
@@ -286,6 +307,7 @@ def _validate_search(body: dict[str, Any]) -> SearchRequest:
         since=since,
         module=module,
         week=week,
+        spread=spread,
     )
 
 

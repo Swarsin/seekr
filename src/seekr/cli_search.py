@@ -14,6 +14,7 @@ import json
 import logging
 import sqlite3
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
@@ -26,6 +27,13 @@ from .lifecycle import LifecycleError, lifecycle_lock
 from .logging_config import log_event
 from .models import Hit, HitExplain
 from .search import SEARCH_MODES, Searcher, SearchMode
+from .spread import (
+    SPREAD_CANDIDATES,
+    SpreadGroup,
+    compute_spread,
+    format_spread,
+    spread_to_dict,
+)
 from .store import (
     VECTOR_QUANTS,
     ModelMismatchError,
@@ -689,9 +697,18 @@ def _echo_hits(
     *,
     as_json: bool = False,
     explain: bool = False,
+    spread_groups: Sequence[SpreadGroup] | None = None,
 ) -> None:
     if as_json:
-        payload = [_hit_to_json_dict(hit) for hit in hits]
+        hit_dicts = [_hit_to_json_dict(hit) for hit in hits]
+        payload: Any = (
+            hit_dicts
+            if spread_groups is None
+            else {
+                "hits": hit_dicts,
+                "spread": [spread_to_dict(group) for group in spread_groups],
+            }
+        )
         typer_module.echo(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
@@ -706,6 +723,9 @@ def _echo_hits(
             typer_module.echo(_format_explain_line(hit.explain))
         typer_module.echo(_format_snippet(typer_module, hit))
         typer_module.echo()
+
+    if spread_groups:
+        typer_module.echo(format_spread(spread_groups))
 
 
 def _exit_error(message: str, *, command: str = "search") -> NoReturn:
@@ -767,19 +787,25 @@ def _build_search_command(typer_module: Any) -> Any:
         explain: bool = typer_module.Option(
             False, "--explain", help="Include retriever rank and score attribution."
         ),
+        spread: bool = typer_module.Option(
+            False,
+            "--spread",
+            help="Show where the topic appears across modules and weeks.",
+        ),
     ) -> None:
         """Search the locally indexed files."""
-        extra: dict[str, Any] = {}
+        filter_kwargs: dict[str, Any] = {}
+        if kind is not None:
+            filter_kwargs["kind"] = kind
+        if since is not None:
+            filter_kwargs["since"] = since
+        if module is not None:
+            filter_kwargs["module"] = module
+        if week is not None:
+            filter_kwargs["week"] = week
+        extra = dict(filter_kwargs)
         if explain:
             extra["explain"] = True
-        if kind is not None:
-            extra["kind"] = kind
-        if since is not None:
-            extra["since"] = since
-        if module is not None:
-            extra["module"] = module
-        if week is not None:
-            extra["week"] = week
         try:
             hits = get_hits(
                 query,
@@ -790,6 +816,21 @@ def _build_search_command(typer_module: Any) -> Any:
                 path_prefix=path_prefix,
                 **extra,
             )
+            spread_groups: list[SpreadGroup] | None = None
+            if spread:
+                if query.strip() and hits:
+                    spread_hits = get_hits(
+                        query,
+                        k=SPREAD_CANDIDATES,
+                        mode=mode,
+                        per_file=2,
+                        rerank=False,
+                        path_prefix=path_prefix,
+                        **filter_kwargs,
+                    )
+                    spread_groups = compute_spread(spread_hits)
+                else:
+                    spread_groups = []
         except _CLI_SEARCH_ERRORS as exc:
             _exit_error(str(exc), command="search")
         except ImportError as exc:
@@ -803,7 +844,13 @@ def _build_search_command(typer_module: Any) -> Any:
                 command="search",
             )
 
-        _echo_hits(typer_module, hits, as_json=as_json, explain=explain)
+        _echo_hits(
+            typer_module,
+            hits,
+            as_json=as_json,
+            explain=explain,
+            spread_groups=spread_groups,
+        )
 
     search.__doc__ = "Search the locally indexed files."
     return search

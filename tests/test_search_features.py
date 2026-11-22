@@ -890,3 +890,130 @@ class SnippetCliTests(unittest.TestCase):
             cli_search._echo_hits(typer, [hit])
         self.assertIn("The model learned slowly.", plain_buf.getvalue())
         self.assertNotIn("\x1b[", plain_buf.getvalue())
+
+
+@unittest.skipUnless(_HAS_TYPER, "typer is not installed")
+class CliSpreadTests(unittest.TestCase):
+    def test_spread_flag_json_shape(self) -> None:
+        from typer.testing import CliRunner
+
+        main_hit = Hit(
+            chunk_id=10,
+            path="/course/machine-learning/week4/trees.md",
+            locator="§Trees",
+            loc_start=1.0,
+            snippet="decision trees",
+            score=0.9,
+            kind="markdown",
+            module="machine-learning",
+            week=4,
+        )
+        spread_hits = [
+            main_hit,
+            Hit(
+                chunk_id=20,
+                path="/course/machine-learning/week2/intro.md",
+                locator="§Intro",
+                loc_start=1.0,
+                snippet="trees intro",
+                score=0.7,
+                kind="markdown",
+                module="machine-learning",
+                week=2,
+            ),
+            Hit(
+                chunk_id=30,
+                path="/course/machine-learning/notes.md",
+                locator="L1",
+                loc_start=1.0,
+                snippet="trees overview",
+                score=0.5,
+                kind="markdown",
+                module="machine-learning",
+                week=None,
+            ),
+        ]
+
+        with mock.patch("seekr.cli_search.get_hits", return_value=[main_hit]) as single_mock:
+            plain_json = CliRunner().invoke(app, ["search", "trees", "--json"])
+        self.assertEqual(plain_json.exit_code, 0, plain_json.output)
+        self.assertEqual(single_mock.call_count, 1)
+        self.assertIsInstance(json.loads(plain_json.stdout), list)
+
+        with mock.patch(
+            "seekr.cli_search.get_hits",
+            side_effect=[[main_hit], spread_hits],
+        ) as spread_mock:
+            spread_json = CliRunner().invoke(
+                app,
+                [
+                    "search",
+                    "trees",
+                    "-k",
+                    "5",
+                    "--mode",
+                    "keyword",
+                    "--per-file",
+                    "1",
+                    "--rerank",
+                    "--path",
+                    "/course",
+                    "--kind",
+                    "markdown",
+                    "--since",
+                    "7d",
+                    "--module",
+                    "ml",
+                    "--week",
+                    "1-6",
+                    "--explain",
+                    "--spread",
+                    "--json",
+                ],
+            )
+        self.assertEqual(spread_json.exit_code, 0, spread_json.output)
+        self.assertEqual(spread_mock.call_count, 2)
+        second_call = spread_mock.call_args_list[1]
+        self.assertEqual(second_call.args, ("trees",))
+        self.assertEqual(
+            second_call.kwargs,
+            {
+                "k": 30,
+                "mode": "keyword",
+                "per_file": 2,
+                "rerank": False,
+                "path_prefix": "/course",
+                "kind": "markdown",
+                "since": "7d",
+                "module": "ml",
+                "week": "1-6",
+            },
+        )
+        parsed = json.loads(spread_json.stdout)
+        self.assertEqual(set(parsed), {"hits", "spread"})
+        self.assertEqual([item["chunk_id"] for item in parsed["hits"]], [10])
+        self.assertEqual(
+            parsed["spread"],
+            [
+                {"module": "machine-learning", "week": 2, "first": True, "chunk_ids": [20]},
+                {"module": "machine-learning", "week": 4, "first": False, "chunk_ids": [10]},
+                {"module": "machine-learning", "week": None, "first": False, "chunk_ids": [30]},
+            ],
+        )
+
+        with mock.patch(
+            "seekr.cli_search.get_hits",
+            side_effect=[[main_hit], spread_hits],
+        ):
+            spread_text = CliRunner().invoke(app, ["search", "trees", "--spread"])
+        self.assertEqual(spread_text.exit_code, 0, spread_text.output)
+        self.assertIn(
+            "Appears in: machine learning: Week 2 (first) · Week 4 · other",
+            spread_text.stdout,
+        )
+
+        with mock.patch("seekr.cli_search.get_hits", return_value=[]) as empty_mock:
+            empty_json = CliRunner().invoke(app, ["search", "missing", "--spread", "--json"])
+        self.assertEqual(empty_json.exit_code, 0, empty_json.output)
+        self.assertEqual(empty_mock.call_count, 1)
+        self.assertEqual(json.loads(empty_json.stdout), {"hits": [], "spread": []})

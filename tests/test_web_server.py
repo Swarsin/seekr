@@ -2259,3 +2259,63 @@ def test_index_html_kind_filter_includes_office_and_notebook_options() -> None:
     for kind in ("pdf", "markdown", "text", "code", "transcript", "word", "slides", "notebook"):
         assert f'<option value="{kind}">' in html_text
         assert f"{kind}:" in js_text
+
+
+def test_search_with_spread_returns_groups() -> None:
+    spread_groups = (
+        {"module": "machine-learning", "week": 2, "first": True, "chunk_ids": [2]},
+        {"module": "machine-learning", "week": 4, "first": False, "chunk_ids": [1]},
+    )
+    with_spread = SearchResult(hits=(), took_ms=1.2, spread=spread_groups)
+    assert with_spread.to_dict() == {
+        "hits": [],
+        "took_ms": 1.2,
+        "spread": [
+            {"module": "machine-learning", "week": 2, "first": True, "chunk_ids": [2]},
+            {"module": "machine-learning", "week": 4, "first": False, "chunk_ids": [1]},
+        ],
+    }
+
+    without_spread = SearchResult(hits=(), took_ms=1.2)
+    assert "spread" not in without_spread.to_dict()
+
+    with running_server(FakeWebBackend(search_result=without_spread)) as (server, no_spread_backend):
+        token = fetch_token(server)
+        no_spread_resp = request(
+            server,
+            "POST",
+            "/api/search",
+            headers=json_headers(token),
+            body=json.dumps({"query": "trees", "spread": False}).encode(),
+        )
+        assert no_spread_resp.status == 200
+        assert "spread" not in no_spread_resp.json()
+        assert no_spread_backend.calls[-1][1]["request"] == SearchRequest(
+            query="trees", spread=False
+        )
+
+    backend = FakeWebBackend(search_result=with_spread)
+    with running_server(backend) as (server, backend):
+        token = fetch_token(server)
+        response = request(
+            server,
+            "POST",
+            "/api/search",
+            headers=json_headers(token),
+            body=json.dumps({"query": "trees", "spread": True}).encode(),
+        )
+        assert response.status == 200
+        assert response.json() == with_spread.to_dict()
+        sent = backend.calls[-1][1]["request"]
+        assert sent == SearchRequest(query="trees", spread=True)
+
+        for bad_spread in ("true", 1, None, []):
+            bad_resp = request(
+                server,
+                "POST",
+                "/api/search",
+                headers=json_headers(token),
+                body=json.dumps({"query": "trees", "spread": bad_spread}).encode(),
+            )
+            assert bad_resp.status == 400
+            assert bad_resp.json()["error"]["code"] == "invalid_request"

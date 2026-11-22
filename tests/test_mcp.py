@@ -407,3 +407,138 @@ class McpModuleWeekTests(unittest.TestCase):
         for tool_name in ("search", "similar"):
             enum_values = set(tools[tool_name]["inputSchema"]["properties"]["kind"]["enum"])
             self.assertEqual(enum_values, expected)
+
+    def test_search_tool_spread(self) -> None:
+        list_server = McpServer()
+        list_resp = list_server.handle_message(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        )
+        assert list_resp is not None
+        tools = {tool["name"]: tool for tool in list_resp["result"]["tools"]}
+        search_props = tools["search"]["inputSchema"]["properties"]
+        self.assertIn("spread", search_props)
+        self.assertEqual(search_props["spread"]["type"], "boolean")
+        self.assertEqual(search_props["spread"]["default"], False)
+
+        calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        main_hit = Hit(
+            chunk_id=10,
+            path="/course/machine-learning/week4/trees.md",
+            locator="§Trees",
+            loc_start=1.0,
+            snippet="decision trees",
+            score=0.9,
+            kind="markdown",
+            module="machine-learning",
+            week=4,
+        )
+        spread_hits = [
+            main_hit,
+            Hit(
+                chunk_id=20,
+                path="/course/machine-learning/week2/intro.md",
+                locator="§Intro",
+                loc_start=1.0,
+                snippet="trees intro",
+                score=0.7,
+                kind="markdown",
+                module="machine-learning",
+                week=2,
+            ),
+        ]
+
+        def fake_search(*args: Any, **kwargs: Any) -> list[Hit]:
+            calls.append((args, kwargs))
+            if args[0] == "missing":
+                return []
+            if len(calls) == 1:
+                return [main_hit]
+            return spread_hits
+
+        server = McpServer(search_fn=fake_search, similar_fn=lambda *a, **kw: [])
+        resp = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "search",
+                    "arguments": {
+                        "query": "trees",
+                        "k": 5,
+                        "mode": "keyword",
+                        "per_file": 1,
+                        "rerank": True,
+                        "path": "/course",
+                        "kind": "markdown",
+                        "since": "7d",
+                        "module": "ml",
+                        "week": "1-6",
+                        "explain": True,
+                        "spread": True,
+                    },
+                },
+            }
+        )
+        assert resp is not None
+        self.assertFalse(resp["result"]["isError"])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][0], ("trees",))
+        self.assertEqual(
+            calls[1][1],
+            {
+                "k": 30,
+                "mode": "keyword",
+                "per_file": 2,
+                "rerank": False,
+                "path_prefix": "/course",
+                "kind": "markdown",
+                "since": "7d",
+                "module": "ml",
+                "week": "1-6",
+            },
+        )
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        self.assertEqual(set(payload), {"hits", "spread"})
+        self.assertEqual([item["chunk_id"] for item in payload["hits"]], [10])
+        self.assertEqual(
+            payload["spread"],
+            [
+                {"module": "machine-learning", "week": 2, "first": True, "chunk_ids": [20]},
+                {"module": "machine-learning", "week": 4, "first": False, "chunk_ids": [10]},
+            ],
+        )
+
+        calls.clear()
+        empty_resp = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "search",
+                    "arguments": {"query": "missing", "spread": True},
+                },
+            }
+        )
+        assert empty_resp is not None
+        self.assertFalse(empty_resp["result"]["isError"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            json.loads(empty_resp["result"]["content"][0]["text"]),
+            {"hits": [], "spread": []},
+        )
+
+        bad_resp = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "search",
+                    "arguments": {"query": "trees", "spread": "yes"},
+                },
+            }
+        )
+        assert bad_resp is not None
+        self.assertTrue(bad_resp["result"]["isError"])

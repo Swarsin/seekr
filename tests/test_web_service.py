@@ -1497,3 +1497,117 @@ def test_hit_dto_highlights(tmp_path: Path) -> None:
         hit = res.hits[0]
         assert hit.highlights == ((10, 17), (26, 34))
         assert hit.to_dict()["highlights"] == [[10, 17], [26, 34]]
+
+
+def test_search_with_spread_returns_groups(tmp_path: Path) -> None:
+    docs = _root(tmp_path)
+    _write_docs(
+        docs,
+        {
+            "machine-learning/week4/trees.md": "# Trees\n\nentropy split criteria in decision trees.\n",
+            "machine-learning/week2/basics.md": "# Basics\n\nentropy information gain basics.\n",
+            "machine-learning/overview.md": "# Overview\n\nentropy across the module.\n",
+            "data-structures/week1/huffman.md": "# Huffman\n\nentropy coding and trees.\n",
+            "misc.md": "entropy note outside modules.\n",
+        },
+    )
+    config_path = _write_config(tmp_path, roots=[docs])
+    embedder = FakeEmbedder(dim=64)
+    opened_stores: list[dict[str, object]] = []
+
+    def store_factory(*args, **kwargs):
+        if kwargs.get("read_only"):
+            opened_stores.append(dict(kwargs))
+        return Store(*args, **kwargs)
+
+    with _service(
+        config_path,
+        tmp_path,
+        embedder_factory=lambda _cfg: embedder,
+        store_factory=store_factory,
+    ) as service:
+        job = _wait_job(service, service.start_index())
+        assert job.state == "succeeded"
+
+        plain = service.search(SearchRequest("entropy", mode="keyword", k=1, spread=False))
+        assert plain.spread is None
+        assert "spread" not in plain.to_dict()
+        assert len(opened_stores) == 1
+
+        opened_stores.clear()
+        for mode in ("keyword", "vector", "hybrid"):
+            res = service.search(
+                SearchRequest("entropy", mode=mode, k=1, per_file=1, spread=True)
+            )
+            assert len(res.hits) == 1
+            assert res.spread is not None
+            payload = res.to_dict()
+            assert "spread" in payload
+            if mode in ("keyword", "hybrid"):
+                assert [(g["module"], g["week"], g["first"]) for g in payload["spread"]] == [
+                    ("data-structures", 1, True),
+                    ("machine-learning", 2, True),
+                    ("machine-learning", 4, False),
+                    ("machine-learning", None, False),
+                    (None, None, False),
+                ]
+            assert all(g["chunk_ids"] for g in payload["spread"])
+
+        assert len(opened_stores) == 1
+
+        empty_query = service.search(SearchRequest("   ", mode="keyword", spread=True))
+        assert empty_query.spread == ()
+        assert empty_query.to_dict()["spread"] == []
+
+        no_hits = service.search(SearchRequest("unmatchedtokenxyz", mode="keyword", spread=True))
+        assert no_hits.hits == ()
+        assert no_hits.spread == ()
+        assert no_hits.to_dict()["spread"] == []
+
+    daemon_calls: list[dict[str, object]] = []
+    daemon_main_hit = Hit(
+        chunk_id=101,
+        path="/course/ml/week4/a.md",
+        locator="L1",
+        loc_start=1.0,
+        snippet="entropy",
+        score=0.9,
+        kind="markdown",
+        module="ml",
+        week=4,
+    )
+    daemon_spread_hits = [
+        daemon_main_hit,
+        Hit(
+            chunk_id=102,
+            path="/course/ml/week2/b.md",
+            locator="L1",
+            loc_start=1.0,
+            snippet="entropy",
+            score=0.8,
+            kind="markdown",
+            module="ml",
+            week=2,
+        ),
+    ]
+
+    def daemon_search(*args, **kwargs):
+        daemon_calls.append({"query": args[0], **kwargs})
+        return [daemon_main_hit] if len(daemon_calls) == 1 else daemon_spread_hits
+
+    with _service(
+        config_path,
+        tmp_path,
+        daemon_probe=lambda _path: True,
+        daemon_search=daemon_search,
+    ) as service:
+        res = service.search(
+            SearchRequest("entropy", mode="hybrid", k=1, per_file=1, spread=True)
+        )
+        assert len(daemon_calls) == 2
+        assert daemon_calls[1]["k"] == 30
+        assert daemon_calls[1]["per_file"] == 2
+        assert res.spread == (
+            {"module": "ml", "week": 2, "first": True, "chunk_ids": [102]},
+            {"module": "ml", "week": 4, "first": False, "chunk_ids": [101]},
+        )
