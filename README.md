@@ -3,8 +3,8 @@
 Private, offline hybrid keyword and semantic search for your notes, PDFs, code, and lecture transcripts — stored in a single SQLite file on your machine.
 
 [![CI](https://github.com/Swarsin/seekr/actions/workflows/ci.yml/badge.svg)](https://github.com/Swarsin/seekr/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/seekr-search)](https://pypi.org/project/seekr-search/)
-[![Python](https://img.shields.io/pypi/pyversions/seekr-search)](https://pypi.org/project/seekr-search/)
+[![PyPI](https://img.shields.io/pypi/v/seekr-search?logo=pypi&logoColor=white)](https://pypi.org/project/seekr-search/)
+[![Python](https://img.shields.io/pypi/pyversions/seekr-search?logo=python&logoColor=white)](https://pypi.org/project/seekr-search/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/Swarsin/seekr/blob/main/LICENSE)
 
 ![seekr CLI demo](https://raw.githubusercontent.com/Swarsin/seekr/main/docs/img/demo.gif)
