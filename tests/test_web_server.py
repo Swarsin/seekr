@@ -1440,7 +1440,7 @@ def test_500_does_not_leak_backend_text() -> None:
 def test_security_headers_and_no_store_on_error() -> None:
     expected_csp = (
         "default-src 'self'; script-src 'self'; style-src 'self'; "
-        "img-src 'self' data:; connect-src 'self'; font-src 'self'; "
+        "img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; "
         "object-src 'none'; base-uri 'none'; form-action 'self'; "
         "frame-ancestors 'none'"
     )

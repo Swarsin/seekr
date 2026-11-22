@@ -720,11 +720,13 @@ unauthenticated body before the earlier checks.
   header baseline is:
 
 ```text
-Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
+Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
 X-Frame-Options: DENY
 X-Content-Type-Options: nosniff
 Referrer-Policy: no-referrer
 ```
+
+`img-src` includes `blob:` solely so authenticated same-origin PDF page previews fetched via `X-Seekr-Token` can be rendered via `URL.createObjectURL`.
 
 - Serve scripts/styles locally with no inline `<script>`, no inline styles or
   style attributes, no `eval`, no `document.write`, and no `innerHTML`. Render

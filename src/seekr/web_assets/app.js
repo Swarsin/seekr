@@ -7,6 +7,8 @@
   - Every server-provided string (paths, locators, snippets, messages) is
     rendered with textContent / text nodes. Highlighting builds <mark>
     elements from text nodes; no HTML strings are parsed.
+  - Blob object URLs created for page previews are always revoked when
+    closing, switching previews, or unloading.
   - All requests go to this page's own origin.
 */
 (function () {
@@ -24,6 +26,9 @@
     status: null,
     roots: null,
     rootsError: null,
+    course: null,
+    courseError: null,
+    courseSeq: 0,
     job: null,
     jobTimer: null,
     lastJob: null,
@@ -32,13 +37,35 @@
     searchQueued: false,
     searchShown: false,
     searchError: null,
+    lastHits: [],
+    lastSpread: [],
+    lastTookMs: null,
+    lastQuery: "",
+    lastTerms: [],
+    visibleHits: [],
+    selectedSpreadKey: null,
+    activeHitIndex: -1,
+    previewSeq: 0,
+    previewAbort: null,
+    previewOpen: false,
+    previewChunkId: null,
+    previewHit: null,
+    previewData: null,
+    previewObjectUrl: null,
+    openPending: false,
     forcedFromMode: null,
     view: "search",
     addPending: false,
+    removePending: false,
+    downloadStarting: false,
+    lastDownload: null,
+    firstRunDismissed: false,
+    lastModelState: null,
     statusSeq: 0,
     statusError: null,
     rootsSeq: 0,
     newRoot: null,
+    rootsNotice: null,
     pollInFlight: false,
     finishedJobs: Object.create(null),
   };
@@ -108,7 +135,6 @@
   function announce(message) {
     var region = byId("announcer");
     region.textContent = "";
-    // A separate task so screen readers notice repeated identical messages.
     window.requestAnimationFrame(function () {
       region.textContent = message;
     });
@@ -219,6 +245,48 @@
     return last || path;
   }
 
+  function displayModule(name) {
+    if (typeof name !== "string") {
+      return "";
+    }
+    return name.replace(/[-_\s]+/g, " ").trim();
+  }
+
+  function describeLocator(locator) {
+    var text = str(locator).trim();
+    if (!text) {
+      return "";
+    }
+    if (text.charAt(0) === "\u00a7") {
+      var title = text.slice(1).trim();
+      return title ? "section " + title : text;
+    }
+    var patterns = [
+      [/^p\.(\d+(?:-\d+)?)$/, "page "],
+      [/^L(\d+-\d+)$/, "lines "],
+      [/^L(\d+)$/, "line "],
+      [/^slide\s+(\d+)$/, "slide "],
+      [/^cell\s+(\d+)$/, "cell "],
+      [/^\u00b6(\d+)$/, "paragraph "],
+    ];
+    for (var i = 0; i < patterns.length; i += 1) {
+      var match = patterns[i][0].exec(text);
+      if (match) {
+        return patterns[i][1] + match[1];
+      }
+    }
+    if (/^(?:\d+:)?\d{1,2}:\d{2}$/.test(text)) {
+      return "at " + text;
+    }
+    return text;
+  }
+
+  function formatPosixLocation(path, locator) {
+    var base = str(path);
+    var desc = describeLocator(locator);
+    return desc ? base + " (" + desc + ")" : base;
+  }
+
   // ---------------------------------------------------------------- API layer
 
   function ApiFailure(kind, status, code, message, fields) {
@@ -293,7 +361,7 @@
     return session.pending;
   }
 
-  async function api(method, path, body, options) {
+  async function apiRequest(method, path, body, options) {
     var opts = options || {};
     try {
       await ensureSession(false);
@@ -303,7 +371,10 @@
       }
       throw err;
     }
-    var headers = { "X-Seekr-Token": session.token, Accept: "application/json" };
+    var headers = {
+      "X-Seekr-Token": session.token,
+      Accept: opts.accept || "application/json",
+    };
     var init = {
       method: method,
       headers: headers,
@@ -327,14 +398,22 @@
       throw new ApiFailure("network", 0, "network", "");
     }
     markConnected();
-    var data = await readJson(response);
     if (response.ok) {
-      return { status: response.status, data: data };
+      if (opts.responseType === "blob") {
+        try {
+          return { status: response.status, data: await response.blob() };
+        } catch (err) {
+          if (isAbort(err)) {
+            throw new ApiFailure("aborted");
+          }
+          throw new ApiFailure("protocol", response.status, "protocol", "Could not read preview image.");
+        }
+      }
+      return { status: response.status, data: await readJson(response) };
     }
+    var data = await readJson(response);
     var failure = failureFrom(response, data);
     if (failure.status === 403 && failure.code === "forbidden" && !opts.retried) {
-      // The token is only valid for one server process. After a restart,
-      // bootstrap a fresh one and retry once; a 403 means nothing ran.
       try {
         await ensureSession(true);
       } catch (err) {
@@ -343,9 +422,27 @@
         }
         throw err;
       }
-      return api(method, path, body, { signal: opts.signal, retried: true });
+      return apiRequest(method, path, body, {
+        signal: opts.signal,
+        retried: true,
+        accept: opts.accept,
+        responseType: opts.responseType,
+      });
     }
     throw failure;
+  }
+
+  function api(method, path, body, options) {
+    return apiRequest(method, path, body, options);
+  }
+
+  function apiBlob(path, options) {
+    var opts = options || {};
+    return apiRequest("GET", path, undefined, {
+      signal: opts.signal,
+      accept: "image/png",
+      responseType: "blob",
+    });
   }
 
   // ---------------------------------------------------------------- connection
@@ -394,21 +491,20 @@
       }
       return;
     }
-    // Connection state is decided by these real requests, not assumed.
-    await Promise.all([refreshStatus(), refreshRoots()]);
+    await Promise.all([refreshStatus(), refreshRoots(), refreshCourse()]);
     if (state.job && !state.jobTimer) {
       pollJob();
     }
   }
 
-  // ---------------------------------------------------------------- status
+  // ---------------------------------------------------------------- status & course
 
   function engineBusy() {
     if (state.job) {
       return true;
     }
     var lane = state.status && state.status.activity ? state.status.activity.lane : "idle";
-    return lane === "index" || lane === "model_check";
+    return lane === "index" || lane === "model_check" || lane === "download";
   }
 
   function indexRunning() {
@@ -452,13 +548,17 @@
       if (!data || typeof data !== "object" || !data.index || !data.model || !data.daemon || !data.config) {
         return;
       }
+      var nextModelState = data.model.state;
+      if (nextModelState === "unavailable" && state.lastModelState !== "unavailable") {
+        state.firstRunDismissed = false;
+      }
+      state.lastModelState = nextModelState;
       state.status = data;
       state.statusError = null;
       var activity = data.activity || {};
       if (!state.job && typeof activity.job_id === "string" && activity.job_id &&
           !state.finishedJobs[activity.job_id] &&
-          (activity.lane === "index" || activity.lane === "model_check")) {
-        // Recover a job started before this page loaded (or in another tab).
+          (activity.lane === "index" || activity.lane === "model_check" || activity.lane === "download")) {
         startPolling(activity.job_id, activity.lane);
       }
     } catch (err) {
@@ -488,9 +588,115 @@
         state.rootsError = err;
       }
     }
+    renderFirstRunPanel();
     renderFolders();
     renderControls();
     renderResultsState();
+  }
+
+  async function refreshCourse() {
+    var seq = ++state.courseSeq;
+    try {
+      var result = await api("GET", "/api/course");
+      if (seq !== state.courseSeq) {
+        return;
+      }
+      var data = result.data;
+      if (data && Array.isArray(data.modules)) {
+        state.course = data;
+        state.courseError = null;
+      }
+    } catch (err) {
+      if ((err.kind === "http" || err.kind === "protocol") && seq === state.courseSeq) {
+        state.course = { modules: [] };
+        state.courseError = err;
+      }
+    }
+    renderCourseFilters();
+  }
+
+  function courseModules() {
+    return state.course && Array.isArray(state.course.modules) ? state.course.modules : [];
+  }
+
+  function validCourseWeeks() {
+    var selectedMod = byId("module-filter").value;
+    var seen = Object.create(null);
+    var weeks = [];
+    courseModules().forEach(function (mod) {
+      if (!mod || typeof mod.name !== "string") {
+        return;
+      }
+      if (selectedMod && mod.name !== selectedMod) {
+        return;
+      }
+      (Array.isArray(mod.weeks) ? mod.weeks : []).forEach(function (w) {
+        if (typeof w !== "number" || !isFinite(w)) {
+          return;
+        }
+        var n = Math.floor(w);
+        if (n < 1 || n > 99 || seen[n]) {
+          return;
+        }
+        seen[n] = true;
+        weeks.push(n);
+      });
+    });
+    weeks.sort(function (a, b) {
+      return a - b;
+    });
+    return weeks;
+  }
+
+  function populateWeekSelect(selectEl, weeks) {
+    var prev = selectEl.value;
+    clear(selectEl);
+    var anyOpt = el("option", null, "Any");
+    anyOpt.value = "";
+    append(selectEl, anyOpt);
+    var foundPrev = false;
+    weeks.forEach(function (w) {
+      var val = String(w);
+      var opt = el("option", null, "Week " + w);
+      opt.value = val;
+      if (val === prev) {
+        foundPrev = true;
+      }
+      append(selectEl, opt);
+    });
+    selectEl.value = foundPrev ? prev : "";
+  }
+
+  function renderWeekOptions() {
+    var weeks = validCourseWeeks();
+    populateWeekSelect(byId("week-from"), weeks);
+    populateWeekSelect(byId("week-to"), weeks);
+    renderFilterCount();
+  }
+
+  function renderCourseFilters() {
+    var moduleSelect = byId("module-filter");
+    var prevMod = moduleSelect.value;
+    clear(moduleSelect);
+    var allOpt = el("option", null, "All modules");
+    allOpt.value = "";
+    append(moduleSelect, allOpt);
+
+    var foundPrev = false;
+    courseModules().forEach(function (mod) {
+      if (!mod || typeof mod.name !== "string" || !mod.name) {
+        return;
+      }
+      var label = str(mod.display) || mod.name;
+      var opt = el("option", null, label);
+      opt.value = mod.name;
+      if (mod.name === prevMod) {
+        foundPrev = true;
+      }
+      append(moduleSelect, opt);
+    });
+    moduleSelect.value = foundPrev ? prevMod : "";
+    renderWeekOptions();
   }
 
   function setStatusValue(node, text, tone) {
@@ -535,7 +741,6 @@
       show(configBlock, true);
     }
 
-    // Index
     var idx = st.index;
     var labels = {
       missing: ["Not created yet", "off"],
@@ -580,7 +785,6 @@
     var idxMessage = str(idx.message);
     setText(indexDetail, idxMessage ? (indexText ? indexText + " " : "") + "Details: " + idxMessage : indexText);
 
-    // Model
     var model = st.model;
     var checking = model.state === "loading" || Boolean(state.job && state.job.operation === "model_check");
     var modelLabels = {
@@ -602,11 +806,10 @@
     } else if (model.state === "unavailable") {
       var mm = str(model.message);
       modelText = (mm ? "Details: " + mm + " " : "") +
-        "Seekr never downloads models from this page. Make the model available on this computer from a terminal, then choose Check model. Exact-words search still works.";
+        "Download the search model from the setup panel or provision it locally, then choose Check model. Exact-words search still works.";
     }
     setText(modelDetail, modelText);
 
-    // Daemon
     if (st.daemon.present) {
       setStatusValue(daemonState, "Running", "ok");
       clear(daemonDetail);
@@ -618,7 +821,7 @@
     }
   }
 
-  // ---------------------------------------------------------------- controls
+  // ---------------------------------------------------------------- controls & first-run
 
   function renderControls() {
     var update = byId("update-index");
@@ -647,7 +850,7 @@
     } else if (st.index.state === "error") {
       reason = ["The index can’t be read. Run seekr doctor first."];
     } else if (st.model.state === "unavailable") {
-      reason = ["Updating needs the local model. Check model once it’s available."];
+      reason = ["Updating needs the local model. Download or check the model once it’s available."];
     }
     var updateDisabled = reason !== null || indexRunning();
     update.disabled = updateDisabled;
@@ -666,8 +869,80 @@
     var modelChecking = Boolean(st && st.model.state === "loading");
     check.disabled = !state.connected || !st || configInvalid() || engineBusy() || modelChecking;
 
-    byId("add-folder-submit").disabled = state.addPending || !state.connected;
+    var addDisabled = state.addPending || !state.connected;
+    byId("add-folder-submit").disabled = addDisabled;
+    byId("first-run-add-folder").disabled = addDisabled;
+
+    var downloadBtn = byId("download-model-button");
+    downloadBtn.disabled = !state.connected || !st || configInvalid() || engineBusy() || state.downloadStarting;
+
+    var firstRunUpdate = byId("first-run-update-index");
+    var hasRoots = isCount(rootCount()) && rootCount() > 0;
+    show(firstRunUpdate, hasRoots && !updateDisabled);
+    firstRunUpdate.disabled = updateDisabled;
+
     applyModeAvailability();
+  }
+
+  function renderFirstRunPanel() {
+    var panel = byId("first-run-panel");
+    var st = state.status;
+    if (!st || configInvalid()) {
+      show(panel, false);
+      return;
+    }
+    var roots = rootCount();
+    var noRoots = roots === 0;
+    var modelUnavailable = Boolean(st.model && st.model.state === "unavailable");
+    var downloadActive = Boolean(state.job && state.job.operation === "download");
+    var downloadFailed = Boolean(state.lastDownload && state.lastDownload.failed);
+    var shouldShow = downloadActive || downloadFailed || (!state.firstRunDismissed && (noRoots || modelUnavailable));
+
+    show(panel, shouldShow);
+    if (!shouldShow) {
+      return;
+    }
+
+    var lede = byId("first-run-lede");
+    if (noRoots && modelUnavailable) {
+      lede.textContent = "Add a folder to search and download the local search model.";
+    } else if (noRoots) {
+      lede.textContent = "Add your notes or coursework folders below, and download the search model if you haven’t already.";
+    } else if (modelUnavailable) {
+      lede.textContent = "The local search model isn’t available yet. Download it below, or use Exact words search offline.";
+    } else {
+      lede.textContent = "Downloading the local search model and language grammars.";
+    }
+
+    var folderForm = byId("first-run-folder-form");
+    show(folderForm, noRoots || Boolean(byId("first-run-folder-status").textContent) || Boolean(byId("first-run-folder-error").textContent));
+
+    var statusWrap = byId("first-run-download-status");
+    var summary = byId("first-run-download-summary");
+    var linesEl = byId("first-run-download-lines");
+    var lines = [];
+    var summaryText = "";
+
+    if (downloadActive) {
+      var elapsed = state.job.data ? formatElapsed(state.job.data.elapsed_ms) : "";
+      summaryText = "Downloading search model" + (elapsed ? " (" + elapsed + ")" : "") + "…";
+      if (state.job.data && state.job.data.report && Array.isArray(state.job.data.report.lines)) {
+        lines = state.job.data.report.lines;
+      }
+    } else if (state.lastDownload) {
+      summaryText = state.lastDownload.summary || "";
+      lines = Array.isArray(state.lastDownload.lines) ? state.lastDownload.lines : [];
+    }
+
+    summary.textContent = summaryText;
+    if (lines.length) {
+      linesEl.textContent = lines.join("\n");
+      show(linesEl, true);
+    } else {
+      linesEl.textContent = "";
+      show(linesEl, false);
+    }
+    show(statusWrap, Boolean(summaryText || lines.length));
   }
 
   function selectedMode() {
@@ -714,9 +989,6 @@
   function startPolling(jobId, operation) {
     var current = state.job;
     if (current && current.id === jobId && current.operation === operation) {
-      // A status refresh and a start reply can both discover the same job.
-      // Keep the object the active poll belongs to so its identity check still
-      // matches, and only start a poll when nothing is pending.
       if (!state.pollInFlight && !state.jobTimer && state.connected) {
         pollJob();
       }
@@ -730,16 +1002,12 @@
     state.lastJob = null;
     renderAll();
     if (state.pollInFlight) {
-      // The poll for the replaced job will notice the change when it returns
-      // and hand control to this job.
       return;
     }
     pollJob();
   }
 
   function continueAfterReplacedJob() {
-    // A poll that belonged to a replaced job has finished. Release the shared
-    // flag, then make sure the job now being tracked gets its own poll.
     state.pollInFlight = false;
     if (state.job && state.connected && !state.jobTimer) {
       pollJob();
@@ -767,7 +1035,7 @@
         throw new ApiFailure("protocol", 200, "protocol", "The server sent an unexpected task reply.");
       }
       job.data = data;
-      if (data.operation === "index" || data.operation === "model_check") {
+      if (data.operation === "index" || data.operation === "model_check" || data.operation === "download") {
         job.operation = data.operation;
       }
       if (data.state === "running") {
@@ -788,7 +1056,7 @@
       state.pollInFlight = false;
       if (err.kind === "network") {
         renderJob();
-        return; // Polling resumes after Reconnect.
+        return;
       }
       state.job = null;
       state.finishedJobs[job.id] = true;
@@ -796,6 +1064,13 @@
         state.lastJob = { operation: job.operation, lost: true };
       } else {
         state.lastJob = { operation: job.operation, failure: err };
+      }
+      if (job.operation === "download") {
+        state.lastDownload = {
+          failed: true,
+          summary: err.message || "Download status could not be checked.",
+          lines: [],
+        };
       }
       renderAll();
       refreshStatus();
@@ -806,11 +1081,24 @@
     state.finishedJobs[job.id] = true;
     state.job = null;
     state.lastJob = { operation: job.operation, data: data };
+    if (job.operation === "download") {
+      var rep = data.report && typeof data.report === "object" ? data.report : {};
+      var lines = Array.isArray(rep.lines) ? rep.lines : [];
+      var succeeded = data.state === "succeeded";
+      state.lastDownload = {
+        failed: !succeeded,
+        summary: succeeded
+          ? "Search model downloaded. Choose Update index or Check model."
+          : (str(data.error) || "Model download failed."),
+        lines: lines,
+      };
+    }
     announce(jobSummary(job.operation, data));
     renderAll();
     refreshStatus();
-    if (job.operation === "index") {
+    if (job.operation === "index" || job.operation === "download") {
       refreshRoots();
+      refreshCourse();
     }
   }
 
@@ -821,6 +1109,12 @@
         return "Model check finished: the model is ready.";
       }
       return "Model check finished: the model is unavailable.";
+    }
+    if (operation === "download") {
+      if (data.state === "succeeded") {
+        return "Model download finished" + (took ? " in " + took : "") + ".";
+      }
+      return "Model download failed" + (data.error ? ": " + data.error : ".");
     }
     var report = data.report || {};
     if (data.state === "failed") {
@@ -874,7 +1168,9 @@
     if (job) {
       heading.textContent = "Current task";
       var isIndex = job.operation === "index";
-      append(body, el("p", "job-title", isIndex ? "Updating index…" : "Checking model…"));
+      var isDownload = job.operation === "download";
+      var titleText = isIndex ? "Updating index…" : (isDownload ? "Downloading search model…" : "Checking model…");
+      append(body, el("p", "job-title", titleText));
       if (!state.connected) {
         append(body, el("p", "job-line", "Lost contact with Seekr while this was running. Reconnect to see how it finished."));
         return;
@@ -893,12 +1189,13 @@
     heading.textContent = "Last task";
     var op = last.operation;
     if (last.startError) {
-      append(body, jobStartError(last.startError, op === "index"));
+      append(body, jobStartError(last.startError, op));
       return;
     }
     if (last.lost) {
+      var lostTitle = op === "model_check" ? "Model check" : (op === "download" ? "Model download" : "Index update");
       append(body,
-        el("p", "job-title", op === "model_check" ? "Model check" : "Index update"),
+        el("p", "job-title", lostTitle),
         el("p", "job-line", "This task’s record is no longer available, possibly because Seekr restarted. The status above shows the current state."));
       return;
     }
@@ -923,7 +1220,25 @@
         append(body,
           el("p", "job-title is-bad", "Model unavailable"),
           el("p", "job-line", str(data.error) || "The model could not be loaded."),
-          el("p", "status-detail", "Seekr never downloads models from this page. Make the model available on this computer, then check again."));
+          el("p", "status-detail", "Download the search model from the setup panel or provision it locally, then check again."));
+      }
+      return;
+    }
+
+    if (op === "download") {
+      var dlReport = data.report && typeof data.report === "object" ? data.report : {};
+      var dlLines = Array.isArray(dlReport.lines) ? dlReport.lines : [];
+      if (data.state === "succeeded") {
+        append(body,
+          el("p", "job-title", "Search model downloaded"),
+          took ? el("p", "job-line", "Finished in " + took + ".") : null);
+      } else {
+        append(body,
+          el("p", "job-title is-bad", "Model download failed"),
+          el("p", "job-line", str(data.error) || "Could not download the search model."));
+      }
+      if (dlLines.length) {
+        append(body, el("pre", "download-lines", dlLines.join("\n")));
       }
       return;
     }
@@ -959,10 +1274,12 @@
     }
   }
 
-  function jobStartError(err, isIndex) {
+  function jobStartError(err, operation) {
     var bodies = [err.message];
     var actions = [];
-    var title = isIndex ? "Couldn’t start the index update" : "Couldn’t start the model check";
+    var title = operation === "index"
+      ? "Couldn’t start the index update"
+      : (operation === "download" ? "Couldn’t start the model download" : "Couldn’t start the model check");
     if (err.code === "no_roots") {
       bodies = ["There are no folders to read yet."];
       actions.push(button("Add folder", "button-secondary", function () {
@@ -1000,6 +1317,43 @@
       announce((isIndex ? "Index update not started. " : "Model check not started. ") + (err.message || ""));
       refreshStatus();
     } finally {
+      renderControls();
+    }
+  }
+
+  async function startDownload() {
+    if (state.downloadStarting || engineBusy()) {
+      return;
+    }
+    state.downloadStarting = true;
+    state.firstRunDismissed = false;
+    state.lastDownload = { failed: false, summary: "Starting model download…", lines: [] };
+    renderFirstRunPanel();
+    renderControls();
+    try {
+      var result = await api("POST", "/api/setup/download", { rerank: false });
+      var data = result.data;
+      if (!data || typeof data.job_id !== "string" || !data.job_id) {
+        throw new ApiFailure("protocol", result.status, "protocol", "The server sent an unexpected reply.");
+      }
+      announce("Search model download started.");
+      startPolling(data.job_id, "download");
+    } catch (err) {
+      if (err.kind === "network") {
+        return;
+      }
+      state.lastDownload = {
+        failed: true,
+        summary: err.message || "Couldn’t start model download.",
+        lines: [],
+      };
+      state.lastJob = { operation: "download", startError: err };
+      renderFirstRunPanel();
+      renderJob();
+      announce("Model download not started. " + (err.message || ""));
+      refreshStatus();
+    } finally {
+      state.downloadStarting = false;
       renderControls();
     }
   }
@@ -1045,6 +1399,52 @@
     });
   }
 
+  function appendSnippetHighlights(parent, text, rawHighlights, fallbackTerms) {
+    if (!text) {
+      return;
+    }
+    if (!Array.isArray(rawHighlights)) {
+      appendHighlighted(parent, text, fallbackTerms || []);
+      return;
+    }
+    var len = text.length;
+    var spans = [];
+    rawHighlights.forEach(function (pair) {
+      if (!Array.isArray(pair) || pair.length < 2) {
+        return;
+      }
+      var start = Number(pair[0]);
+      var end = Number(pair[1]);
+      if (!isFinite(start) || !isFinite(end)) {
+        return;
+      }
+      start = Math.max(0, Math.min(len, Math.floor(start)));
+      end = Math.max(0, Math.min(len, Math.floor(end)));
+      if (start < end) {
+        spans.push([start, end]);
+      }
+    });
+    spans.sort(function (a, b) {
+      return a[0] - b[0] || a[1] - b[1];
+    });
+    var cursor = 0;
+    spans.forEach(function (span) {
+      var start = Math.max(cursor, span[0]);
+      var end = span[1];
+      if (start >= end) {
+        return;
+      }
+      if (start > cursor) {
+        append(parent, text.slice(cursor, start));
+      }
+      append(parent, el("mark", null, text.slice(start, end)));
+      cursor = end;
+    });
+    if (cursor < len) {
+      append(parent, text.slice(cursor));
+    }
+  }
+
   function intField(id, min, max, fallback, label) {
     var input = byId(id);
     var raw = input.value.trim();
@@ -1054,7 +1454,7 @@
     }
     if (!/^\d+$/.test(raw)) {
       input.setAttribute("aria-invalid", "true");
-      return { error: label + " must be a whole number from " + min + " to " + max + "." , input: input };
+      return { error: label + " must be a whole number from " + min + " to " + max + ".", input: input };
     }
     var n = parseInt(raw, 10);
     if (n < min || n > max) {
@@ -1065,9 +1465,41 @@
     return { value: n };
   }
 
+  function buildWeekFilter() {
+    var rawFrom = byId("week-from").value.trim();
+    var rawTo = byId("week-to").value.trim();
+    if (!rawFrom && !rawTo) {
+      return "";
+    }
+    if (rawFrom && rawTo) {
+      var a = parseInt(rawFrom, 10);
+      var b = parseInt(rawTo, 10);
+      if (isFinite(a) && isFinite(b)) {
+        var lo = Math.max(1, Math.min(99, Math.min(a, b)));
+        var hi = Math.max(1, Math.min(99, Math.max(a, b)));
+        return lo === hi ? String(lo) : lo + "-" + hi;
+      }
+    }
+    if (rawFrom) {
+      var start = parseInt(rawFrom, 10);
+      if (isFinite(start)) {
+        var clampedStart = Math.max(1, Math.min(99, start));
+        return clampedStart + "-99";
+      }
+    }
+    if (rawTo) {
+      var end = parseInt(rawTo, 10);
+      if (isFinite(end)) {
+        var clampedEnd = Math.max(1, Math.min(99, end));
+        return "1-" + clampedEnd;
+      }
+    }
+    return "";
+  }
+
   function buildSearchRequest() {
     var query = byId("query").value;
-    var body = { query: query, mode: selectedMode() };
+    var body = { query: query, mode: selectedMode(), spread: true };
     var limits = session.limits || {};
     var k = intField("filter-k", numberOr(limits.k_min, 1), numberOr(limits.k_max, 50), DEFAULT_K, "Most results");
     if (k.error) {
@@ -1079,6 +1511,14 @@
     }
     body.k = k.value;
     body.per_file = perFile.value;
+    var mod = byId("module-filter").value;
+    if (mod) {
+      body.module = mod;
+    }
+    var week = buildWeekFilter();
+    if (week) {
+      body.week = week;
+    }
     var path = byId("filter-path").value.trim();
     if (path) {
       body.path = path;
@@ -1116,7 +1556,6 @@
     byId("results").setAttribute("aria-busy", busy ? "true" : "false");
     submit.textContent = busy ? "Searching…" : "Search";
     if (busy) {
-      // aria-disabled (not disabled) keeps keyboard focus on the button.
       submit.setAttribute("aria-disabled", "true");
     } else {
       submit.removeAttribute("aria-disabled");
@@ -1124,9 +1563,6 @@
   }
 
   async function runSearch() {
-    // One search at a time. Aborting a fetch doesn't stop the server, which
-    // would keep the engine busy and make the next search fail with 409, so
-    // extra submissions become one follow-up sent when this search finishes.
     if (state.searchInFlight) {
       if (!state.searchQueued) {
         state.searchQueued = true;
@@ -1150,6 +1586,12 @@
     if (!body.query.trim()) {
       state.searchShown = false;
       state.searchError = null;
+      state.lastHits = [];
+      state.lastSpread = [];
+      state.visibleHits = [];
+      state.selectedSpreadKey = null;
+      state.activeHitIndex = -1;
+      closePreview();
       results.setAttribute("aria-busy", "false");
       clearHits();
       renderResultsState();
@@ -1164,7 +1606,6 @@
     setText(byId("results-meta"), "Searching…");
     try {
       var result = await api("POST", "/api/search", body);
-      // Stale guard: skip rendering if a newer search replaced this one.
       if (seq !== state.searchSeq || state.searchQueued) {
         return;
       }
@@ -1179,7 +1620,6 @@
       }
       renderSearchFailure(err, body);
     } finally {
-      // Always release: only one search is ever in flight.
       setSearchBusy(false);
       if (state.searchQueued) {
         state.searchQueued = false;
@@ -1191,12 +1631,20 @@
   function clearHits() {
     clear(byId("hit-list"));
     show(byId("hit-list"), false);
+    clear(byId("spread-strip"));
+    show(byId("spread-strip"), false);
     setText(byId("results-meta"), "");
   }
 
   function showSearchError(node) {
     state.searchShown = false;
     state.searchError = node;
+    state.lastHits = [];
+    state.lastSpread = [];
+    state.visibleHits = [];
+    state.selectedSpreadKey = null;
+    state.activeHitIndex = -1;
+    closePreview();
     clearHits();
     var holder = byId("results-state");
     clear(holder);
@@ -1264,31 +1712,141 @@
     }
   }
 
+  function spreadKey(group) {
+    var mod = typeof group.module === "string" ? group.module : "__none__";
+    var week = typeof group.week === "number" && isFinite(group.week) ? String(group.week) : "__none__";
+    return mod + "::" + week;
+  }
+
+  function spreadChipLabel(group) {
+    if (typeof group.week !== "number" || !isFinite(group.week)) {
+      return "other";
+    }
+    return group.first ? "Week " + group.week + " (first)" : "Week " + group.week;
+  }
+
+  function findSelectedSpreadGroup() {
+    if (!state.selectedSpreadKey || !Array.isArray(state.lastSpread)) {
+      return null;
+    }
+    for (var i = 0; i < state.lastSpread.length; i += 1) {
+      if (spreadKey(state.lastSpread[i]) === state.selectedSpreadKey) {
+        return state.lastSpread[i];
+      }
+    }
+    return null;
+  }
+
+  function hitMatchesSpreadGroup(hit, group) {
+    if (!group) {
+      return true;
+    }
+    if (Array.isArray(group.chunk_ids) && group.chunk_ids.indexOf(hit.chunk_id) !== -1) {
+      return true;
+    }
+    var hitMod = typeof hit.module === "string" ? hit.module : null;
+    var groupMod = typeof group.module === "string" ? group.module : null;
+    var hitWeek = typeof hit.week === "number" && isFinite(hit.week) ? hit.week : null;
+    var groupWeek = typeof group.week === "number" && isFinite(group.week) ? group.week : null;
+    return hitMod === groupMod && hitWeek === groupWeek;
+  }
+
+  function renderSpreadStrip() {
+    var strip = byId("spread-strip");
+    clear(strip);
+    var groups = Array.isArray(state.lastSpread) ? state.lastSpread : [];
+    if (!state.searchShown || !groups.length) {
+      show(strip, false);
+      return;
+    }
+    show(strip, true);
+
+    var header = el("div", "spread-head");
+    append(header, el("span", "spread-title", "Appears in"));
+    var allBtn = button("All results", "button-quiet spread-clear" + (state.selectedSpreadKey === null ? " is-active" : ""), function () {
+      if (state.selectedSpreadKey !== null) {
+        state.selectedSpreadKey = null;
+        renderSpreadStrip();
+        renderVisibleHits();
+      }
+    });
+    allBtn.setAttribute("aria-pressed", state.selectedSpreadKey === null ? "true" : "false");
+    append(header, allBtn);
+    append(strip, header);
+
+    var byModule = [];
+    var modIndex = Object.create(null);
+    groups.forEach(function (group) {
+      if (!group || typeof group !== "object") {
+        return;
+      }
+      var modKey = typeof group.module === "string" ? group.module : "__none__";
+      if (modIndex[modKey] === undefined) {
+        modIndex[modKey] = byModule.length;
+        byModule.push({ module: group.module || null, items: [] });
+      }
+      byModule[modIndex[modKey]].items.push(group);
+    });
+
+    var rows = el("div", "spread-rows");
+    byModule.forEach(function (entry) {
+      var row = el("div", "spread-row");
+      var modLabel = entry.module ? (displayModule(entry.module) || "other") : "other";
+      append(row, el("span", "spread-module", modLabel));
+      var chips = el("div", "spread-chips");
+      entry.items.forEach(function (group) {
+        var key = spreadKey(group);
+        var isActive = state.selectedSpreadKey === key;
+        var cls = "spread-chip" + (group.first ? " is-first" : "") + (isActive ? " is-active" : "");
+        var chip = el("button", cls, spreadChipLabel(group));
+        chip.type = "button";
+        chip.setAttribute("aria-pressed", isActive ? "true" : "false");
+        chip.addEventListener("click", function () {
+          state.selectedSpreadKey = state.selectedSpreadKey === key ? null : key;
+          renderSpreadStrip();
+          renderVisibleHits();
+        });
+        append(chips, chip);
+      });
+      append(row, chips);
+      append(rows, row);
+    });
+    append(strip, rows);
+  }
+
   function renderHits(body, data) {
     state.searchShown = true;
     state.searchError = null;
+    state.lastHits = (data.hits || []).filter(function (hit) {
+      return Boolean(hit && typeof hit === "object" && typeof hit.path === "string");
+    });
+    state.lastSpread = Array.isArray(data.spread) ? data.spread : [];
+    state.lastTookMs = data.took_ms;
+    state.lastQuery = body.query.trim();
+    state.lastTerms = queryTerms(body.query);
+    state.selectedSpreadKey = null;
+    state.activeHitIndex = -1;
+    closePreview();
+
+    renderSpreadStrip();
+    renderVisibleHits();
+  }
+
+  function renderVisibleHits() {
     var holder = byId("results-state");
     clear(holder);
     var list = byId("hit-list");
     clear(list);
-    var terms = queryTerms(body.query);
-    var shown = 0;
-
-    data.hits.forEach(function (hit, i) {
-      if (!hit || typeof hit !== "object" || typeof hit.path !== "string") {
-        return;
-      }
-      shown += 1;
-      append(list, renderHit(hit, i, terms));
-    });
-
     var meta = byId("results-meta");
-    var took = formatTook(data.took_ms);
-    if (shown === 0) {
+
+    var totalHits = state.lastHits.length;
+    if (totalHits === 0) {
       show(list, false);
       setText(meta, "");
+      state.visibleHits = [];
+      state.activeHitIndex = -1;
       append(holder, notice("quiet", "No passages match", [
-        ["Nothing in the index matched ", el("q", null, body.query.trim()), "."],
+        ["Nothing in the index matched ", el("q", null, state.lastQuery), "."],
         hasFilters() ? "Try clearing the filters, using fewer words, or a different match option." : "Try fewer or different words, or a different match option.",
       ], hasFilters() ? [button("Clear filters and search again", "button-quiet", function () {
         clearFilters();
@@ -1297,22 +1855,98 @@
       announce("No passages match.");
       return;
     }
+
+    var activeGroup = findSelectedSpreadGroup();
+    var filtered = activeGroup
+      ? state.lastHits.filter(function (hit) { return hitMatchesSpreadGroup(hit, activeGroup); })
+      : state.lastHits.slice();
+    state.visibleHits = filtered;
+
+    if (state.activeHitIndex >= filtered.length) {
+      state.activeHitIndex = filtered.length - 1;
+    }
+
+    if (filtered.length === 0) {
+      show(list, false);
+      setText(meta, "Showing 0 of " + plural(totalHits, "passage", "passages") + ".");
+      append(holder, notice("quiet", "No matching passages in this group", [
+        "This group was found in the broader course spread, outside the top " + formatCount(totalHits) + " results shown.",
+      ], [button("All results", "button-quiet", function () {
+        state.selectedSpreadKey = null;
+        renderSpreadStrip();
+        renderVisibleHits();
+      })]));
+      return;
+    }
+
+    filtered.forEach(function (hit, i) {
+      append(list, renderHit(hit, i, state.lastTerms));
+    });
     show(list, true);
-    var summary = plural(shown, "passage", "passages") + (took ? ", found in " + took : "") + ".";
+
+    var took = formatTook(state.lastTookMs);
+    var summary;
+    if (activeGroup) {
+      var modName = activeGroup.module ? (displayModule(activeGroup.module) || "other") : "other";
+      summary = "Showing " + formatCount(filtered.length) + " of " + plural(totalHits, "passage", "passages") +
+        " in " + modName + " · " + spreadChipLabel(activeGroup) + ".";
+    } else {
+      summary = plural(filtered.length, "passage", "passages") + (took ? ", found in " + took : "") + ".";
+    }
     setText(meta, summary);
     announce(summary);
+  }
+
+  function hitHeaderText(hit) {
+    var parts = [];
+    var mod = displayModule(hit.module);
+    if (mod) {
+      parts.push(mod);
+    }
+    if (typeof hit.week === "number" && isFinite(hit.week)) {
+      parts.push("Week " + hit.week);
+    }
+    var file = baseName(hit.path);
+    if (file) {
+      parts.push(file);
+    }
+    var loc = describeLocator(hit.locator);
+    if (loc) {
+      parts.push(loc);
+    }
+    return parts.join(" · ") || hit.path;
+  }
+
+  function hitLocationText(hit, usePosix) {
+    if (usePosix) {
+      return str(hit.posix_location) || formatPosixLocation(hit.path, hit.locator);
+    }
+    return str(hit.location) || str(hit.posix_location) || formatPosixLocation(hit.path, hit.locator);
   }
 
   function renderHit(hit, index, terms) {
     var path = hit.path;
     var locator = str(hit.locator);
+    var locDesc = describeLocator(locator);
     var li = el("li", "hit");
-    var nameId = "hit-name-" + index;
+    li.tabIndex = -1;
+    li.setAttribute("data-hit-index", String(index));
+    if (typeof hit.chunk_id === "number") {
+      li.setAttribute("data-chunk-id", String(hit.chunk_id));
+    }
+    if (index === state.activeHitIndex) {
+      li.classList.add("is-active");
+    }
+    if (state.previewOpen && state.previewChunkId === hit.chunk_id) {
+      li.classList.add("is-previewing");
+    }
 
+    var nameId = "hit-name-" + index;
     var head = el("div", "hit-head");
-    var name = el("h3", "hit-name", baseName(path));
+    var name = el("h3", "hit-name", hitHeaderText(hit));
     name.id = nameId;
     append(head, name);
+
     var kind = str(hit.kind);
     if (kind) {
       var kindLabel = Object.prototype.hasOwnProperty.call(KIND_LABELS, kind) ? KIND_LABELS[kind] : kind;
@@ -1322,39 +1956,290 @@
 
     append(li, el("p", "hit-path", path));
 
-    if (locator) {
+    if (locDesc) {
       var loc = el("p", "hit-locator");
-      append(loc, el("span", "visually-hidden", "Location: "), locator);
+      append(loc, el("span", "visually-hidden", "Location: "), locDesc);
       append(li, loc);
     }
 
     var snippet = el("p", "hit-snippet");
-    appendHighlighted(snippet, str(hit.snippet), terms);
+    appendSnippetHighlights(snippet, str(hit.snippet), hit.highlights, terms);
     append(li, snippet);
 
     var actions = el("div", "hit-actions");
-    var copyButton = el("button", "button button-quiet", "Copy location");
+    var previewBtn = el("button", "button button-quiet hit-preview", "Preview");
+    previewBtn.type = "button";
+    previewBtn.setAttribute("aria-describedby", nameId);
+    previewBtn.addEventListener("click", function (event) {
+      event.stopPropagation();
+      selectAndPreviewHit(index);
+    });
+
+    var copyButton = el("button", "button button-quiet hit-copy", "Copy location");
     copyButton.type = "button";
     copyButton.setAttribute("aria-describedby", nameId);
     var status = el("span", "copy-status");
     status.setAttribute("aria-live", "polite");
-    var locationText = locator ? path + " (" + locator + ")" : path;
-    copyButton.addEventListener("click", function () {
-      copyLocation(locationText, actions, status, index);
+    copyButton.addEventListener("click", function (event) {
+      event.stopPropagation();
+      var text = hitLocationText(hit, byId("posix-toggle").checked);
+      copyLocation(text, actions, status, "copy-field-" + index);
     });
-    append(actions, copyButton, status);
+    append(actions, previewBtn, copyButton, status);
     append(li, actions);
+
+    li.addEventListener("click", function (event) {
+      if (event.target && event.target.closest("button, a, input, label")) {
+        return;
+      }
+      selectAndPreviewHit(index);
+    });
+
     return li;
   }
 
-  async function copyLocation(text, actions, status, index) {
-    var existing = actions.querySelector(".copy-fallback");
-    if (existing) {
-      actions.removeChild(existing);
+  function updateActiveHitClasses() {
+    var nodes = byId("hit-list").querySelectorAll(".hit");
+    nodes.forEach(function (node, i) {
+      node.classList.toggle("is-active", i === state.activeHitIndex);
+      var cid = Number(node.getAttribute("data-chunk-id"));
+      node.classList.toggle("is-previewing", state.previewOpen && cid === state.previewChunkId);
+    });
+  }
+
+  function setActiveHit(index, shouldFocus) {
+    if (!state.visibleHits.length) {
+      state.activeHitIndex = -1;
+      return;
     }
-    status.textContent = "";
+    var clamped = Math.max(0, Math.min(state.visibleHits.length - 1, index));
+    state.activeHitIndex = clamped;
+    updateActiveHitClasses();
+    var target = byId("hit-list").querySelector('.hit[data-hit-index="' + clamped + '"]');
+    if (target) {
+      target.scrollIntoView({ block: "nearest" });
+      if (shouldFocus) {
+        target.focus({ preventScroll: true });
+      }
+    }
+  }
+
+  function selectAndPreviewHit(index) {
+    if (index < 0 || index >= state.visibleHits.length) {
+      return;
+    }
+    setActiveHit(index, false);
+    openPreview(state.visibleHits[index]);
+  }
+
+  // ---------------------------------------------------------------- preview & open
+
+  function revokePreviewObjectUrl() {
+    var img = byId("preview-image");
+    if (img) {
+      img.removeAttribute("src");
+      show(img, false);
+    }
+    if (state.previewObjectUrl) {
+      URL.revokeObjectURL(state.previewObjectUrl);
+      state.previewObjectUrl = null;
+    }
+  }
+
+  function activePreviewLocation() {
+    var posixChecked = byId("posix-toggle").checked;
+    var preview = state.previewData;
+    var hit = state.previewHit;
+    if (posixChecked) {
+      if (hit && str(hit.posix_location)) {
+        return hit.posix_location;
+      }
+      if (preview) {
+        return formatPosixLocation(preview.path, preview.locator);
+      }
+      if (hit) {
+        return formatPosixLocation(hit.path, hit.locator);
+      }
+      return "";
+    }
+    if (preview && str(preview.location)) {
+      return preview.location;
+    }
+    if (hit && str(hit.location)) {
+      return hit.location;
+    }
+    if (preview) {
+      return formatPosixLocation(preview.path, preview.locator);
+    }
+    return hit ? formatPosixLocation(hit.path, hit.locator) : "";
+  }
+
+  function updatePreviewLocationDisplay() {
+    byId("preview-location").textContent = activePreviewLocation();
+    var fallback = byId("preview-copy-fallback");
+    clear(fallback);
+    show(fallback, false);
+  }
+
+  function closePreview(restoreFocus) {
+    if (state.previewAbort) {
+      state.previewAbort.abort();
+      state.previewAbort = null;
+    }
+    state.previewSeq += 1;
+    state.previewOpen = false;
+    state.previewChunkId = null;
+    state.previewHit = null;
+    state.previewData = null;
+    revokePreviewObjectUrl();
+
+    byId("preview-title").textContent = "Preview";
+    byId("preview-location").textContent = "";
+    byId("preview-text").textContent = "";
+    setText(byId("preview-feedback"), "");
+    clear(byId("preview-copy-fallback"));
+    show(byId("preview-copy-fallback"), false);
+    show(byId("preview-panel"), false);
+    byId("results-and-preview").classList.remove("has-preview");
+    updateActiveHitClasses();
+
+    if (restoreFocus && state.activeHitIndex >= 0) {
+      var activeNode = byId("hit-list").querySelector('.hit[data-hit-index="' + state.activeHitIndex + '"]');
+      if (activeNode) {
+        activeNode.focus({ preventScroll: true });
+      }
+    }
+  }
+
+  async function openPreview(hit) {
+    if (!hit || typeof hit.chunk_id !== "number" || !isFinite(hit.chunk_id) || hit.chunk_id <= 0) {
+      return;
+    }
+    var chunkId = Math.floor(hit.chunk_id);
+    if (state.previewAbort) {
+      state.previewAbort.abort();
+    }
+    var controller = typeof AbortController === "function" ? new AbortController() : null;
+    state.previewAbort = controller;
+    var signal = controller ? controller.signal : undefined;
+    var seq = ++state.previewSeq;
+
+    revokePreviewObjectUrl();
+    state.previewOpen = true;
+    state.previewChunkId = chunkId;
+    state.previewHit = hit;
+    state.previewData = null;
+
+    byId("preview-title").textContent = hitHeaderText(hit);
+    updatePreviewLocationDisplay();
+    byId("preview-text").textContent = "Loading preview…";
+    setText(byId("preview-feedback"), "");
+    byId("open-button").disabled = false;
+    byId("copy-location").disabled = false;
+    show(byId("preview-panel"), true);
+    byId("results-and-preview").classList.add("has-preview");
+    updateActiveHitClasses();
+
+    try {
+      var res = await api("GET", "/api/preview?chunk=" + encodeURIComponent(String(chunkId)), undefined, { signal: signal });
+      if (seq !== state.previewSeq || !state.previewOpen) {
+        return;
+      }
+      var preview = res.data;
+      if (!preview || typeof preview !== "object" || typeof preview.text !== "string") {
+        throw new ApiFailure("protocol", res.status, "protocol", "The server sent an unexpected preview reply.");
+      }
+      state.previewData = preview;
+      byId("preview-title").textContent = hitHeaderText(hit);
+      updatePreviewLocationDisplay();
+      byId("preview-text").textContent = preview.text;
+
+      if (preview.page_image) {
+        try {
+          var imgRes = await apiBlob("/api/preview/page?chunk=" + encodeURIComponent(String(chunkId)), { signal: signal });
+          if (seq !== state.previewSeq || !state.previewOpen) {
+            return;
+          }
+          revokePreviewObjectUrl();
+          var objectUrl = URL.createObjectURL(imgRes.data);
+          state.previewObjectUrl = objectUrl;
+          var imgEl = byId("preview-image");
+          imgEl.alt = "Page preview for " + baseName(str(preview.path));
+          imgEl.src = objectUrl;
+          show(imgEl, true);
+        } catch (imgErr) {
+          if (isAbort(imgErr) || seq !== state.previewSeq || !state.previewOpen) {
+            return;
+          }
+          revokePreviewObjectUrl();
+          setText(byId("preview-feedback"), imgErr.message || "Page image could not be loaded.");
+        }
+      } else {
+        revokePreviewObjectUrl();
+      }
+    } catch (err) {
+      if (isAbort(err) || seq !== state.previewSeq || !state.previewOpen) {
+        return;
+      }
+      revokePreviewObjectUrl();
+      byId("preview-text").textContent = "";
+      setText(byId("preview-feedback"), err.message || "Could not load passage preview.");
+    }
+  }
+
+  async function openChunk(chunkId) {
+    if (typeof chunkId !== "number" || !isFinite(chunkId) || chunkId <= 0) {
+      return;
+    }
+    if (state.openPending) {
+      return;
+    }
+    var targetId = Math.floor(chunkId);
+    var openBtn = byId("open-button");
+    var feedback = byId("preview-feedback");
+    state.openPending = true;
+    openBtn.disabled = true;
+    if (state.previewOpen) {
+      setText(feedback, "Opening…");
+    }
+    try {
+      await api("POST", "/api/open", { chunk: targetId });
+      if (state.previewOpen) {
+        setText(feedback, "Opened in local app.");
+      }
+      announce("Opened file.");
+    } catch (err) {
+      if (err.kind === "network") {
+        return;
+      }
+      var msg = err.message || "Couldn’t open file.";
+      if (state.previewOpen) {
+        setText(feedback, msg);
+      } else {
+        var holder = byId("results-state");
+        clear(holder);
+        append(holder, notice("error", "Couldn’t open file", [msg]));
+      }
+      announce(msg);
+    } finally {
+      state.openPending = false;
+      openBtn.disabled = false;
+    }
+  }
+
+  async function copyLocation(text, fallbackHost, statusEl, fieldId) {
+    if (fallbackHost.classList && fallbackHost.classList.contains("preview-copy-fallback")) {
+      clear(fallbackHost);
+      show(fallbackHost, false);
+    } else {
+      var existing = fallbackHost.querySelector(".copy-fallback");
+      if (existing) {
+        fallbackHost.removeChild(existing);
+      }
+    }
+    setText(statusEl, "");
     var copied = false;
-    if (navigator.clipboard && window.isSecureContext) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function" && window.isSecureContext) {
       try {
         await navigator.clipboard.writeText(text);
         copied = true;
@@ -1363,12 +2248,10 @@
       }
     }
     if (copied) {
-      status.textContent = "Copied";
+      setText(statusEl, "Copied");
       return;
     }
-    // Fallback: show the location in a selected field the user can copy.
     var wrap = el("div", "copy-fallback");
-    var fieldId = "copy-field-" + index;
     var label = el("label", null, "Couldn’t copy automatically. The location is selected: press Ctrl+C (or ⌘C) to copy it.");
     label.htmlFor = fieldId;
     var field = el("input");
@@ -1377,11 +2260,16 @@
     field.readOnly = true;
     field.value = text;
     append(wrap, label, field);
-    append(actions, wrap);
+    append(fallbackHost, wrap);
+    if (fallbackHost.classList && fallbackHost.classList.contains("preview-copy-fallback")) {
+      show(fallbackHost, true);
+    }
     field.focus();
     field.select();
-    status.textContent = "Select and copy below";
+    setText(statusEl, "Select and copy below");
   }
+
+  // ---------------------------------------------------------------- filters
 
   function hasFilters() {
     return activeFilterCount() > 0;
@@ -1389,6 +2277,12 @@
 
   function activeFilterCount() {
     var count = 0;
+    if (byId("module-filter").value) {
+      count += 1;
+    }
+    if (byId("week-from").value || byId("week-to").value) {
+      count += 1;
+    }
     if (byId("filter-path").value.trim()) {
       count += 1;
     }
@@ -1416,6 +2310,10 @@
   }
 
   function clearFilters() {
+    byId("module-filter").value = "";
+    renderWeekOptions();
+    byId("week-from").value = "";
+    byId("week-to").value = "";
     byId("filter-path").value = "";
     byId("filter-kind").value = "";
     byId("filter-since").value = "";
@@ -1493,7 +2391,7 @@
 
     if (st.model.state === "unavailable" && !configInvalid() && idx.state === "ready") {
       append(holder, notice("caution", "Only exact-words search works right now", [
-        "The local model is unavailable, so the other match options will fail. See Local model in Index status.",
+        "The local model is unavailable, so the other match options will fail. Download it in the setup panel or check Local model in Index status.",
       ]));
     }
     if (indexRunning() && idx.state === "ready") {
@@ -1516,11 +2414,15 @@
       if (err.code === "config_invalid") {
         append(holder, notice("error", "Seekr can’t safely edit your settings file", [
           err.message,
-          ["Edit it by hand to add folders: ", el("span", "path-text", configPath())],
+          ["Edit it by hand to add or remove folders: ", el("span", "path-text", configPath())],
         ], [button("Refresh", "button-quiet", refreshAll)]));
       } else {
         append(holder, notice("error", "Couldn’t load your folders", [err.message || "The server reported an unexpected problem."], [button("Refresh", "button-quiet", refreshAll)]));
       }
+    }
+
+    if (state.rootsNotice) {
+      append(holder, state.rootsNotice);
     }
 
     var roots = state.roots && Array.isArray(state.roots.roots) ? state.roots.roots : null;
@@ -1532,10 +2434,20 @@
       show(empty, true);
     } else {
       roots.forEach(function (root) {
-        var li = el("li", null, String(root));
+        var rootStr = String(root);
+        var li = el("li", "root-item");
         if (state.newRoot && root === state.newRoot) {
-          li.className = "is-new";
+          li.className += " is-new";
         }
+        var pathSpan = el("span", "root-path", rootStr);
+        var removeBtn = el("button", "button button-quiet remove-root", "Remove");
+        removeBtn.type = "button";
+        removeBtn.setAttribute("aria-label", "Remove folder " + rootStr);
+        removeBtn.disabled = state.removePending || state.addPending || !state.connected;
+        removeBtn.addEventListener("click", function () {
+          removeFolder(rootStr);
+        });
+        append(li, pathSpan, removeBtn);
         append(list, li);
       });
       show(list, true);
@@ -1551,9 +2463,9 @@
     }
   }
 
-  function setFolderError(message) {
-    var input = byId("folder-path");
-    var error = byId("folder-path-error");
+  function setFieldError(inputId, errorId, message) {
+    var input = byId(inputId);
+    var error = byId(errorId);
     if (message) {
       input.setAttribute("aria-invalid", "true");
       setText(error, message);
@@ -1563,30 +2475,35 @@
     }
   }
 
-  async function addFolder() {
-    if (state.addPending) {
+  function setFolderError(message) {
+    setFieldError("folder-path", "folder-path-error", message);
+  }
+
+  async function submitAddRoot(options) {
+    if (state.addPending || state.removePending) {
       return;
     }
-    var input = byId("folder-path");
-    var result = byId("add-result");
+    var input = byId(options.inputId);
+    var errorId = options.errorId;
     var path = input.value.trim();
-    clear(result);
-    show(result, false);
-    setFolderError("");
+    if (options.onClear) {
+      options.onClear();
+    }
+    setFieldError(options.inputId, errorId, "");
 
     if (!path) {
-      setFolderError("Type the path of a folder.");
+      setFieldError(options.inputId, errorId, "Type the path of a folder.");
       input.focus();
       return;
     }
     var maxBytes = numberOr(session.limits && session.limits.root_path_bytes, 4096);
     if (new TextEncoder().encode(path).length > maxBytes) {
-      setFolderError("That path is too long (over " + maxBytes + " bytes).");
+      setFieldError(options.inputId, errorId, "That path is too long (over " + maxBytes + " bytes).");
       input.focus();
       return;
     }
     if (path.indexOf("\u0000") !== -1) {
-      setFolderError("That path contains an invalid character.");
+      setFieldError(options.inputId, errorId, "That path contains an invalid character.");
       input.focus();
       return;
     }
@@ -1620,56 +2537,98 @@
       }
       state.roots = data;
       state.rootsError = null;
+      state.rootsNotice = null;
       state.newRoot = added;
       input.value = "";
       renderFolders();
+      renderFirstRunPanel();
+      renderResultsState();
 
-      var parts = [];
-      parts.push(notice("info", "Folder added", [
-        ["Saved as ", el("span", "path-text", String(added || path))],
-        "Choose Update index to read its files.",
-      ]));
-      if (data.daemon_restart_required) {
-        parts.push(notice("caution", "Restart the background service", [
-          str(data.warning) || "A seekr daemon process is running. Restart it so it sees the new folder.",
-        ]));
+      if (options.onSuccess) {
+        options.onSuccess(added || path, data);
       }
-      parts.forEach(function (n) {
-        append(result, n);
-      });
-      show(result, true);
-      result.focus();
       announce("Folder added: " + (added || path) + (data.daemon_restart_required ? ". Restart the background service to use it." : "."));
       refreshStatus();
     } catch (err) {
-      handleAddFolderError(err);
+      handleAddFolderError(err, options);
     } finally {
       state.addPending = false;
       renderControls();
     }
   }
 
-  function handleAddFolderError(err) {
-    var input = byId("folder-path");
+  function addFolder() {
     var result = byId("add-result");
+    return submitAddRoot({
+      inputId: "folder-path",
+      errorId: "folder-path-error",
+      onClear: function () {
+        clear(result);
+        show(result, false);
+      },
+      onSuccess: function (addedPath, data) {
+        append(result, notice("info", "Folder added", [
+          ["Saved as ", el("span", "path-text", String(addedPath))],
+          "Choose Update index to read its files.",
+        ]));
+        if (data.daemon_restart_required) {
+          append(result, notice("caution", "Restart the background service", [
+            str(data.warning) || "A seekr daemon process is running. Restart it so it sees the new folder.",
+          ]));
+        }
+        show(result, true);
+        result.focus();
+      },
+      onOtherError: function (node) {
+        append(result, node);
+        show(result, true);
+        result.focus();
+      },
+    });
+  }
+
+  function addFolderFromFirstRun() {
+    var statusEl = byId("first-run-folder-status");
+    return submitAddRoot({
+      inputId: "first-run-folder-path",
+      errorId: "first-run-folder-error",
+      onClear: function () {
+        setText(statusEl, "");
+      },
+      onSuccess: function (addedPath, data) {
+        var msg = "Added " + addedPath + ". Choose Update index when ready.";
+        if (data.daemon_restart_required) {
+          msg += " Restart seekr daemon so it sees the new folder.";
+        }
+        setText(statusEl, msg);
+      },
+      onOtherError: function (node, err) {
+        setFieldError("first-run-folder-path", "first-run-folder-error", err.message || "Couldn’t add the folder.");
+      },
+    });
+  }
+
+  function handleAddFolderError(err, options) {
+    var input = byId(options.inputId);
+    var errorId = options.errorId;
     var fieldMessage = err.fields && typeof err.fields.path === "string" ? err.fields.path : "";
     if (err.kind === "network") {
-      setFolderError("Seekr isn’t responding. Your path is kept; reconnect and try again.");
+      setFieldError(options.inputId, errorId, "Seekr isn’t responding. Your path is kept; reconnect and try again.");
       input.focus();
       return;
     }
     if (err.code === "invalid_root" || err.code === "roots_limit" || err.code === "invalid_request") {
-      setFolderError(fieldMessage || err.message || "That path can’t be added.");
+      setFieldError(options.inputId, errorId, fieldMessage || err.message || "That path can’t be added.");
       input.focus();
       return;
     }
     if (err.code === "duplicate_root") {
-      setFolderError(err.message || "That folder is already in the list.");
+      setFieldError(options.inputId, errorId, err.message || "That folder is already in the list.");
       input.focus();
       return;
     }
     if (err.code === "stale_config") {
-      setFolderError("Your settings file changed since this page loaded. The list has been refreshed; choose Add folder again.");
+      setFieldError(options.inputId, errorId, "Your settings file changed since this page loaded. The list has been refreshed; choose Add folder again.");
       refreshRoots();
       input.focus();
       return;
@@ -1686,10 +2645,86 @@
     } else if (!err.message) {
       bodies = ["The server reported an unexpected problem (" + (err.status || "no status") + ")."];
     }
-    append(result, notice("error", title, bodies));
-    show(result, true);
-    result.focus();
+    var errNotice = notice("error", title, bodies);
+    if (options.onOtherError) {
+      options.onOtherError(errNotice, err);
+    }
     announce(title + ".");
+  }
+
+  async function removeFolder(rootPath) {
+    if (state.removePending || state.addPending) {
+      return;
+    }
+    state.removePending = true;
+    state.rootsNotice = null;
+    renderFolders();
+    renderControls();
+    try {
+      if (!state.roots || typeof state.roots.revision !== "string") {
+        await refreshRoots();
+      }
+      if (!state.roots || typeof state.roots.revision !== "string") {
+        return;
+      }
+      var response = await api("POST", "/api/roots/remove", {
+        path: rootPath,
+        revision: state.roots.revision,
+      });
+      var data = response.data;
+      if (!data || !Array.isArray(data.roots)) {
+        throw new ApiFailure("protocol", response.status, "protocol", "The server sent an unexpected reply.");
+      }
+      state.roots = data;
+      state.rootsError = null;
+      if (state.newRoot === rootPath) {
+        state.newRoot = null;
+      }
+      state.rootsNotice = notice("info", "Folder removed", [
+        ["Removed ", el("span", "path-text", rootPath), " from settings and purged its indexed entries."],
+      ]);
+      announce("Folder removed: " + rootPath + ".");
+      renderFolders();
+      renderFirstRunPanel();
+      renderResultsState();
+      refreshStatus();
+      refreshCourse();
+    } catch (err) {
+      if (err.kind === "network") {
+        state.rootsNotice = notice("error", "Seekr isn’t responding", [
+          "Reconnect, then choose Remove again.",
+        ]);
+      } else if (err.code === "daemon_active") {
+        state.rootsNotice = notice("error", "Stop the background service first", [
+          err.message || "A seekr daemon process is running and maintains the index.",
+          ["Stop ", codeText("seekr daemon"), ", then choose Refresh and try Remove again."],
+        ]);
+      } else if (err.code === "stale_config") {
+        state.rootsNotice = notice("error", "Settings file changed", [
+          "Your settings file changed since this page loaded. The folder list has been refreshed; choose Remove again.",
+        ]);
+        refreshRoots();
+      } else if (err.code === "busy") {
+        state.rootsNotice = notice("error", "Seekr is busy", [
+          err.message || "Another task is running. Try removing the folder when it finishes.",
+        ]);
+      } else if (err.code === "config_invalid") {
+        state.rootsNotice = notice("error", "Seekr can’t safely edit your settings file", [
+          err.message,
+          ["Settings file: ", el("span", "path-text", configPath())],
+        ]);
+      } else {
+        state.rootsNotice = notice("error", "Couldn’t remove the folder", [
+          err.message || "The server reported an unexpected problem.",
+        ]);
+      }
+      announce("Couldn’t remove the folder.");
+      renderFolders();
+    } finally {
+      state.removePending = false;
+      renderFolders();
+      renderControls();
+    }
   }
 
   // ---------------------------------------------------------------- views
@@ -1740,6 +2775,7 @@
 
   function renderAll() {
     renderStatus();
+    renderFirstRunPanel();
     renderControls();
     renderJob();
     renderFolders();
@@ -1753,6 +2789,91 @@
     }
     refreshStatus();
     refreshRoots();
+    refreshCourse();
+  }
+
+  // ---------------------------------------------------------------- keyboard
+
+  function isEditableTarget(target) {
+    if (!target || typeof target.tagName !== "string") {
+      return false;
+    }
+    var tag = target.tagName.toUpperCase();
+    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || Boolean(target.isContentEditable);
+  }
+
+  function isArrowBlockedTarget(target) {
+    if (!target || typeof target.tagName !== "string") {
+      return false;
+    }
+    var tag = target.tagName.toUpperCase();
+    if (tag === "SELECT" || tag === "TEXTAREA" || target.isContentEditable) {
+      return true;
+    }
+    if (tag === "INPUT") {
+      return target.id !== "query";
+    }
+    return false;
+  }
+
+  function handleKeyDown(event) {
+    var target = event.target;
+    if (event.key === "Escape" && state.previewOpen) {
+      event.preventDefault();
+      closePreview(true);
+      return;
+    }
+
+    if (event.ctrlKey || event.metaKey || event.altKey) {
+      return;
+    }
+
+    if (event.key === "/" && !isEditableTarget(target)) {
+      event.preventDefault();
+      if (state.view !== "search") {
+        setView("search", false);
+      }
+      byId("query").focus();
+      return;
+    }
+
+    if (state.view !== "search") {
+      return;
+    }
+
+    if ((event.key === "ArrowDown" || event.key === "ArrowUp") && state.visibleHits.length && !isArrowBlockedTarget(target)) {
+      event.preventDefault();
+      var delta = event.key === "ArrowDown" ? 1 : -1;
+      var nextIndex;
+      if (state.activeHitIndex < 0) {
+        nextIndex = event.key === "ArrowDown" ? 0 : state.visibleHits.length - 1;
+      } else {
+        nextIndex = state.activeHitIndex + delta;
+      }
+      setActiveHit(nextIndex, true);
+      return;
+    }
+
+    if (event.key === "Enter" && state.activeHitIndex >= 0 && state.activeHitIndex < state.visibleHits.length) {
+      var onHitCard = Boolean(target && target.classList && target.classList.contains("hit"));
+      var interactive = Boolean(target && target.closest && target.closest("input, textarea, select, button, a, summary, [contenteditable]"));
+      if (onHitCard || !interactive) {
+        event.preventDefault();
+        selectAndPreviewHit(state.activeHitIndex);
+        return;
+      }
+    }
+
+    if ((event.key === "o" || event.key === "O") && !isEditableTarget(target)) {
+      var chunkId = state.previewChunkId;
+      if (!chunkId && state.activeHitIndex >= 0 && state.activeHitIndex < state.visibleHits.length) {
+        chunkId = state.visibleHits[state.activeHitIndex].chunk_id;
+      }
+      if (typeof chunkId === "number" && isFinite(chunkId) && chunkId > 0) {
+        event.preventDefault();
+        openChunk(chunkId);
+      }
+    }
   }
 
   // ---------------------------------------------------------------- wiring
@@ -1766,10 +2887,28 @@
       event.preventDefault();
       addFolder();
     });
+    byId("first-run-folder-form").addEventListener("submit", function (event) {
+      event.preventDefault();
+      addFolderFromFirstRun();
+    });
     byId("folder-path").addEventListener("input", function () {
       if (byId("folder-path").getAttribute("aria-invalid") === "true") {
         setFolderError("");
       }
+    });
+    byId("first-run-folder-path").addEventListener("input", function () {
+      if (byId("first-run-folder-path").getAttribute("aria-invalid") === "true") {
+        setFieldError("first-run-folder-path", "first-run-folder-error", "");
+      }
+    });
+    byId("download-model-button").addEventListener("click", startDownload);
+    byId("first-run-update-index").addEventListener("click", function () {
+      startJob("index");
+    });
+    byId("first-run-dismiss").addEventListener("click", function () {
+      state.firstRunDismissed = true;
+      state.lastDownload = null;
+      renderFirstRunPanel();
     });
     document.querySelectorAll(".view-tab").forEach(function (tab) {
       tab.addEventListener("click", function () {
@@ -1781,6 +2920,21 @@
         state.forcedFromMode = null;
       });
     });
+    var rerunCourseSearch = function () {
+      if (state.searchShown && byId("query").value.trim()) {
+        runSearch();
+      }
+    };
+    byId("module-filter").addEventListener("change", function () {
+      renderWeekOptions();
+      rerunCourseSearch();
+    });
+    ["week-from", "week-to"].forEach(function (id) {
+      byId(id).addEventListener("change", function () {
+        renderFilterCount();
+        rerunCourseSearch();
+      });
+    });
     ["filter-path", "filter-kind", "filter-since", "filter-k", "filter-per-file", "filter-since-date"].forEach(function (id) {
       byId(id).addEventListener("input", renderFilterCount);
       byId(id).addEventListener("change", renderFilterCount);
@@ -1788,6 +2942,25 @@
     byId("filters-clear").addEventListener("click", function () {
       clearFilters();
       byId("filter-path").focus();
+    });
+    byId("preview-close").addEventListener("click", function () {
+      closePreview(true);
+    });
+    byId("open-button").addEventListener("click", function () {
+      if (state.previewChunkId) {
+        openChunk(state.previewChunkId);
+      }
+    });
+    byId("copy-location").addEventListener("click", function () {
+      var loc = activePreviewLocation();
+      if (loc) {
+        copyLocation(loc, byId("preview-copy-fallback"), byId("preview-feedback"), "preview-copy-field");
+      }
+    });
+    byId("posix-toggle").addEventListener("change", function () {
+      if (state.previewOpen) {
+        updatePreviewLocationDisplay();
+      }
     });
     byId("update-index").addEventListener("click", function () {
       startJob("index");
@@ -1799,6 +2972,7 @@
     byId("reconnect").addEventListener("click", function () {
       connect(true);
     });
+    document.addEventListener("keydown", handleKeyDown);
     document.addEventListener("visibilitychange", function () {
       if (document.visibilityState === "visible") {
         refreshAll();
@@ -1809,6 +2983,8 @@
         connect(true);
       }
     });
+    window.addEventListener("pagehide", revokePreviewObjectUrl);
+    window.addEventListener("beforeunload", revokePreviewObjectUrl);
 
     renderFilterCount();
     renderAll();

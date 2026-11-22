@@ -36,13 +36,40 @@
     <section class="view" id="view-search" aria-labelledby="search-heading">
       <h1 class="view-heading" id="search-heading" tabindex="-1">Search files</h1>
 
+      <section class="first-run-panel" id="first-run-panel" aria-labelledby="first-run-heading" hidden>
+        <div class="first-run-head">
+          <h2 class="first-run-title" id="first-run-heading">Set up Seekr</h2>
+          <button type="button" class="button button-quiet first-run-dismiss" id="first-run-dismiss">Dismiss</button>
+        </div>
+        <p class="first-run-lede" id="first-run-lede">Add your folders and download the local search model to search by words and meaning.</p>
+        <form class="first-run-folder-form" id="first-run-folder-form" novalidate>
+          <div class="field">
+            <label for="first-run-folder-path">Add a folder to search</label>
+            <div class="query-row">
+              <input class="path-input" id="first-run-folder-path" name="path" type="text" autocomplete="off" spellcheck="false" maxlength="4096" placeholder="~/Documents/coursework" aria-describedby="first-run-folder-error">
+              <button type="submit" class="button button-secondary" id="first-run-add-folder">Add folder</button>
+            </div>
+            <p class="field-error" id="first-run-folder-error" hidden></p>
+            <p class="status-detail" id="first-run-folder-status" hidden></p>
+          </div>
+        </form>
+        <div class="first-run-actions">
+          <button type="button" class="button button-primary" id="download-model-button">Download search model (about 130 MB) — the only time seekr uses the internet</button>
+          <button type="button" class="button button-secondary" id="first-run-update-index" hidden>Update index</button>
+        </div>
+        <div class="first-run-download-status" id="first-run-download-status" hidden>
+          <p class="status-detail" id="first-run-download-summary" aria-live="polite"></p>
+          <pre class="download-lines" id="first-run-download-lines" hidden></pre>
+        </div>
+      </section>
+
       <form class="search-form" id="search-form" novalidate>
         <div class="query-row">
           <label class="visually-hidden" for="query">Search for</label>
           <input class="query-input" id="query" name="query" type="search" autocomplete="off" spellcheck="false" maxlength="2000" placeholder="Words, a phrase, or a description of what you need" aria-describedby="query-hint">
           <button type="submit" class="button button-primary" id="search-submit">Search</button>
         </div>
-        <p class="field-hint" id="query-hint">Press Enter to search. Results show the passages that matched and where to find them.</p>
+        <p class="field-hint" id="query-hint">Press / to focus, Enter to search, ↑/↓ to move, Enter to preview, o to open, Esc to close.</p>
 
         <fieldset class="modes" id="mode-fieldset">
           <legend class="modes-legend">Match by</legend>
@@ -53,6 +80,27 @@
           </div>
           <p class="field-hint mode-note" id="mode-note" hidden></p>
         </fieldset>
+
+        <div class="course-filters" id="course-filters">
+          <div class="field">
+            <label for="module-filter">Module</label>
+            <select id="module-filter" name="module">
+              <option value="">All modules</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="week-from">Week from</label>
+            <select id="week-from" name="week_from">
+              <option value="">Any</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="week-to">Week to</label>
+            <select id="week-to" name="week_to">
+              <option value="">Any</option>
+            </select>
+          </div>
+        </div>
 
         <details class="filters" id="filters">
           <summary class="filters-summary">Filters <span class="filters-count" id="filters-count"></span></summary>
@@ -106,12 +154,40 @@
         </details>
       </form>
 
-      <section class="results" id="results" aria-labelledby="results-heading" aria-busy="false">
-        <h2 class="visually-hidden" id="results-heading">Results</h2>
-        <div class="results-state" id="results-state"></div>
-        <p class="results-meta" id="results-meta" hidden></p>
-        <ol class="hit-list" id="hit-list" hidden></ol>
-      </section>
+      <section class="spread-strip" id="spread-strip" aria-label="Appears in" hidden></section>
+
+      <div class="results-and-preview" id="results-and-preview">
+        <section class="results" id="results" aria-labelledby="results-heading" aria-busy="false">
+          <h2 class="visually-hidden" id="results-heading">Results</h2>
+          <div class="results-state" id="results-state"></div>
+          <p class="results-meta" id="results-meta" hidden></p>
+          <ol class="hit-list" id="hit-list" hidden></ol>
+        </section>
+
+        <aside class="preview-panel" id="preview-panel" aria-labelledby="preview-title" hidden>
+          <div class="preview-head">
+            <div class="preview-titles">
+              <h2 class="preview-title" id="preview-title">Preview</h2>
+              <p class="preview-location path-text" id="preview-location"></p>
+            </div>
+            <button type="button" class="button button-quiet preview-close" id="preview-close">Close</button>
+          </div>
+          <div class="preview-toolbar">
+            <button type="button" class="button button-primary" id="open-button">Open file</button>
+            <button type="button" class="button button-quiet" id="copy-location">Copy location</button>
+            <label class="posix-option">
+              <input type="checkbox" id="posix-toggle">
+              <span>POSIX path</span>
+            </label>
+          </div>
+          <p class="preview-feedback" id="preview-feedback" aria-live="polite" hidden></p>
+          <div class="preview-copy-fallback" id="preview-copy-fallback" hidden></div>
+          <div class="preview-body">
+            <img class="preview-image" id="preview-image" alt="Rendered PDF page preview" hidden>
+            <pre class="preview-text" id="preview-text"></pre>
+          </div>
+        </aside>
+      </div>
     </section>
 
     <section class="view" id="view-folders" aria-labelledby="folders-heading" hidden>

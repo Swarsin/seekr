@@ -1194,7 +1194,7 @@ def test_frozen_security_headers_on_every_response_including_errors(
         del blocked
         csp = (
             "default-src 'self'; script-src 'self'; style-src 'self'; "
-            "img-src 'self' data:; connect-src 'self'; font-src 'self'; "
+            "img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; "
             "object-src 'none'; base-uri 'none'; form-action 'self'; "
             "frame-ancestors 'none'"
         )

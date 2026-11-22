@@ -51,7 +51,7 @@ _logger = logging.getLogger(ACCESS_LOG_NAME)
 
 CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self'; "
-    "img-src 'self' data:; connect-src 'self'; font-src 'self'; "
+    "img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; "
     "object-src 'none'; base-uri 'none'; form-action 'self'; "
     "frame-ancestors 'none'"
 )
