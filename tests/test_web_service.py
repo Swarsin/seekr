@@ -23,7 +23,7 @@ from seekr.embed import FakeEmbedder
 from seekr.indexer import Indexer, SyncReport
 from seekr.lifecycle import LifecycleLock
 from seekr.models import ChunkSpec, Hit, text_sha
-from seekr.store import Store, StoredChunk
+from seekr.store import SCHEMA_VERSION, Store, StoredChunk
 from seekr.web_contract import ApiError, HitDTO, SearchRequest
 from seekr.web_service import WebService, _socket_is_live
 
@@ -535,7 +535,7 @@ def test_status_missing_empty_ready_incompatible_and_error(tmp_path: Path) -> No
         assert empty.index["state"] == "empty"
         assert empty.index["documents"] == 0
         assert empty.index["chunks"] == 0
-        assert empty.index["schema_version"] == 2
+        assert empty.index["schema_version"] == SCHEMA_VERSION
 
     ready_db = tmp_path / "ready.db"
     _add_indexed_document(ready_db)
@@ -549,7 +549,7 @@ def test_status_missing_empty_ready_incompatible_and_error(tmp_path: Path) -> No
         assert ready.index["model"] == "fake"
         assert ready.index["dim"] == 64
         assert ready.index["vector_quant"] == "int8"
-        assert ready.index["schema_version"] == 2
+        assert ready.index["schema_version"] == SCHEMA_VERSION
         assert built == []
 
     mismatch_db = tmp_path / "mismatch.db"
@@ -1012,19 +1012,28 @@ def test_search_corrupt_mismatched_and_older_schema_codes(tmp_path: Path) -> Non
             service.search(SearchRequest("alpha", mode="keyword"))
         assert _error_code(raised.value) == "incompatible_index"
 
-    older_db = tmp_path / "older.db"
-    _add_indexed_document(older_db)
-    connection = sqlite3.connect(older_db)
-    try:
-        connection.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
-        connection.commit()
-    finally:
-        connection.close()
-    with _service(_write_config(tmp_path, db_path=older_db), tmp_path) as service:
-        with pytest.raises(ApiError) as raised:
-            service.search(SearchRequest("alpha", mode="keyword"))
-        assert _error_code(raised.value) == "incompatible_index"
-        assert service.status().index["state"] == "incompatible"
+    for older_version in ("1", "2"):
+        older_db = tmp_path / f"older-v{older_version}.db"
+        _add_indexed_document(older_db)
+        connection = sqlite3.connect(older_db)
+        try:
+            connection.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (older_version,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with _service(_write_config(tmp_path, db_path=older_db), tmp_path) as service:
+            with pytest.raises(ApiError) as raised:
+                service.search(SearchRequest("alpha", mode="keyword"))
+            assert _error_code(raised.value) == "incompatible_index"
+            assert "run `seekr index` once to upgrade it" in raised.value.message
+            assert "reindex" not in raised.value.message.lower()
+            status = service.status()
+            assert status.index["state"] == "incompatible"
+            assert "run `seekr index` once to upgrade it" in str(status.index["message"])
+            assert "reindex" not in str(status.index["message"]).lower()
 
 
 @pytest.mark.parametrize("table", ["chunks_fts", "chunks_vec"])

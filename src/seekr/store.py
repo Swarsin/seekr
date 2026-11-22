@@ -25,7 +25,7 @@ _FETCH_BATCH = 800
 # sqlite-vec's vec0 KNN scan accepts k values up to this limit.
 _VEC0_MAX_K = 4096
 VECTOR_QUANTS = frozenset({"float32", "int8"})
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -34,7 +34,9 @@ CREATE TABLE IF NOT EXISTS documents (
     mtime_ns INTEGER NOT NULL,
     size INTEGER NOT NULL,
     sha256 TEXT NOT NULL,
-    kind TEXT NOT NULL
+    kind TEXT NOT NULL,
+    module TEXT,
+    week INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -124,9 +126,25 @@ def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
     )
 
 
+def _create_module_week_index(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS documents_module_week_idx ON documents(module, week)"
+    )
+
+
+def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(documents)")}
+    if "module" not in columns:
+        conn.execute("ALTER TABLE documents ADD COLUMN module TEXT")
+    if "week" not in columns:
+        conn.execute("ALTER TABLE documents ADD COLUMN week INTEGER")
+    _create_module_week_index(conn)
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: _migrate_0_to_1,
     1: _migrate_1_to_2,
+    2: _migrate_2_to_3,
 }
 
 
@@ -149,6 +167,8 @@ class DocRow:
     size: int
     sha256: str
     kind: str
+    module: str | None = None
+    week: int | None = None
 
 
 @dataclass(frozen=True)
@@ -162,6 +182,8 @@ class ChunkRow:
     text: str
     locator: str
     loc_start: float
+    module: str | None = None
+    week: int | None = None
 
 
 def _load_vector_extension(conn: sqlite3.Connection) -> None:
@@ -248,9 +270,11 @@ def _document_filter_clause(
     kind: str | None = None,
     since_mtime_ns: int | None = None,
     exclude_path: str | None = None,
+    module: str | None = None,
+    week_range: tuple[int, int] | None = None,
     alias: str = "d",
 ) -> tuple[str, tuple[object, ...]]:
-    """Combine document-level path, kind, mtime and exclusion SQL predicates."""
+    """Combine document-level path, kind, mtime, label and exclusion SQL predicates."""
     clauses: list[str] = []
     params: list[object] = []
     prefix_sql, prefix_params = _path_prefix_clause(path_prefix, column=f"{alias}.path")
@@ -266,7 +290,27 @@ def _document_filter_clause(
     if exclude_path is not None:
         clauses.append(f"{alias}.path != ?")
         params.append(str(exclude_path))
+    if module is not None:
+        clauses.append(f"{alias}.module = ?")
+        params.append(str(module))
+    if week_range is not None:
+        start_week, end_week = week_range
+        clauses.append(f"{alias}.week BETWEEN ? AND ?")
+        params.extend((int(start_week), int(end_week)))
     return " AND ".join(clauses), tuple(params)
+
+
+def _doc_row_from_sql(row: tuple[Any, ...]) -> DocRow:
+    return DocRow(
+        id=int(row[0]),
+        path=str(row[1]),
+        mtime_ns=int(row[2]),
+        size=int(row[3]),
+        sha256=str(row[4]),
+        kind=str(row[5]),
+        module=str(row[6]) if row[6] is not None else None,
+        week=int(row[7]) if row[7] is not None else None,
+    )
 
 
 def _rollback(conn: sqlite3.Connection) -> None:
@@ -404,8 +448,8 @@ class Store:
         if stored_version < SCHEMA_VERSION:
             raise SchemaVersionError(
                 f"index database uses schema version {stored_version}, which is older "
-                f"than supported version {SCHEMA_VERSION}; run `seekr reindex` to "
-                "rebuild it (read-only mode does not migrate)"
+                f"than supported version {SCHEMA_VERSION}; run `seekr index` once to "
+                "upgrade it (read-only mode does not migrate)"
             )
 
         stored_model = rows.get("embed_model")
@@ -662,6 +706,7 @@ class Store:
                 ),
             )
             _migrate_1_to_2(conn)
+            _create_module_week_index(conn)
             conn.execute("COMMIT")
         except BaseException:
             _rollback(conn)
@@ -677,23 +722,38 @@ class Store:
         size: int,
         sha256: str,
         kind: str,
+        *,
+        module: str | None = None,
+        week: int | None = None,
     ) -> int:
         """Insert a document or update its metadata, returning its stable id."""
         self._reject_write()
+        module_val = None if module is None else str(module)
+        week_val = None if week is None else int(week)
         with self._lock:
             conn = self._connection()
             with self.transaction(write=True):
                 conn.execute(
                     """
-                    INSERT INTO documents(path, mtime_ns, size, sha256, kind)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO documents(path, mtime_ns, size, sha256, kind, module, week)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(path) DO UPDATE SET
                         mtime_ns = excluded.mtime_ns,
                         size = excluded.size,
                         sha256 = excluded.sha256,
-                        kind = excluded.kind
+                        kind = excluded.kind,
+                        module = excluded.module,
+                        week = excluded.week
                     """,
-                    (str(path), int(mtime_ns), int(size), sha256, kind),
+                    (
+                        str(path),
+                        int(mtime_ns),
+                        int(size),
+                        sha256,
+                        kind,
+                        module_val,
+                        week_val,
+                    ),
                 )
                 row = conn.execute("SELECT id FROM documents WHERE path = ?", (str(path),))
                 found = row.fetchone()
@@ -701,29 +761,52 @@ class Store:
                 raise RuntimeError("document disappeared during upsert")
             return int(found[0])
 
+    def set_document_labels(
+        self, labels: Iterable[tuple[str, str | None, int | None]]
+    ) -> int:
+        """Update module and week labels for existing documents in one write transaction."""
+        self._reject_write()
+        items = [
+            (
+                None if module is None else str(module),
+                None if week is None else int(week),
+                str(path),
+            )
+            for path, module, week in labels
+        ]
+        if not items:
+            with self._lock:
+                self._connection()
+            return 0
+        updated = 0
+        with self._lock, self.transaction(write=True):
+            conn = self._connection()
+            for module_val, week_val, path_val in items:
+                cursor = conn.execute(
+                    "UPDATE documents SET module = ?, week = ? WHERE path = ?",
+                    (module_val, week_val, path_val),
+                )
+                if cursor.rowcount > 0:
+                    updated += int(cursor.rowcount)
+        return updated
+
     def get_document(self, path: str) -> DocRow | None:
         """Return the document stored at ``path``, if any."""
         with self._lock:
             conn = self._connection()
             row = conn.execute(
-                "SELECT id, path, mtime_ns, size, sha256, kind FROM documents WHERE path = ?",
+                "SELECT id, path, mtime_ns, size, sha256, kind, module, week "
+                "FROM documents WHERE path = ?",
                 (str(path),),
             ).fetchone()
         if row is None:
             return None
-        return DocRow(
-            id=int(row[0]),
-            path=str(row[1]),
-            mtime_ns=int(row[2]),
-            size=int(row[3]),
-            sha256=str(row[4]),
-            kind=str(row[5]),
-        )
+        return _doc_row_from_sql(row)
 
     def get_documents_metadata(self, prefix: str | None = None) -> dict[str, DocRow]:
         """Return indexed document rows keyed by path, optionally under *prefix*."""
         clause, params = _path_prefix_clause(prefix)
-        sql = "SELECT id, path, mtime_ns, size, sha256, kind FROM documents"
+        sql = "SELECT id, path, mtime_ns, size, sha256, kind, module, week FROM documents"
         if clause:
             sql += f" WHERE {clause}"
         with self._lock:
@@ -731,15 +814,8 @@ class Store:
             rows = conn.execute(sql, params).fetchall()
         docs: dict[str, DocRow] = {}
         for row in rows:
-            path = str(row[1])
-            docs[path] = DocRow(
-                id=int(row[0]),
-                path=path,
-                mtime_ns=int(row[2]),
-                size=int(row[3]),
-                sha256=str(row[4]),
-                kind=str(row[5]),
-            )
+            doc = _doc_row_from_sql(row)
+            docs[doc.path] = doc
         return docs
 
     def move_document(self, src: str, dst: str, *, mtime_ns: int, size: int) -> int:
@@ -838,6 +914,48 @@ class Store:
                 conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
                 conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
 
+    def delete_documents_under(self, prefix: str) -> int:
+        """Delete documents under *prefix* along with their chunks, FTS and vectors."""
+        self._reject_write()
+        clause, params = _path_prefix_clause(prefix)
+        if not clause:
+            with self._lock:
+                self._connection()
+            return 0
+        with self._lock, self.transaction(write=True):
+            conn = self._connection()
+            doc_ids = [
+                int(row[0])
+                for row in conn.execute(f"SELECT id FROM documents WHERE {clause}", params)
+            ]
+            if not doc_ids:
+                return 0
+            chunk_ids: list[int] = []
+            for start in range(0, len(doc_ids), _FETCH_BATCH):
+                batch = doc_ids[start : start + _FETCH_BATCH]
+                placeholders = ", ".join("?" for _ in batch)
+                chunk_ids.extend(
+                    int(row[0])
+                    for row in conn.execute(
+                        f"SELECT id FROM chunks WHERE doc_id IN ({placeholders}) ORDER BY id",
+                        batch,
+                    )
+                )
+            if chunk_ids:
+                self._delete_vectors(conn, chunk_ids)
+            for start in range(0, len(doc_ids), _DELETE_BATCH):
+                batch = doc_ids[start : start + _DELETE_BATCH]
+                placeholders = ", ".join("?" for _ in batch)
+                conn.execute(
+                    f"DELETE FROM chunks WHERE doc_id IN ({placeholders})",
+                    batch,
+                )
+                conn.execute(
+                    f"DELETE FROM documents WHERE id IN ({placeholders})",
+                    batch,
+                )
+        return len(doc_ids)
+
     @staticmethod
     def _delete_vectors(conn: sqlite3.Connection, chunk_ids: list[int]) -> None:
         for start in range(0, len(chunk_ids), _DELETE_BATCH):
@@ -858,6 +976,43 @@ class Store:
             sql += " ORDER BY path"
             rows = conn.execute(sql, params).fetchall()
         return [str(row[0]) for row in rows]
+
+    def list_modules(self) -> list[str]:
+        """Return distinct non-null module labels sorted case-insensitively."""
+        with self._lock:
+            conn = self._connection()
+            rows = conn.execute(
+                "SELECT DISTINCT module FROM documents WHERE module IS NOT NULL"
+            ).fetchall()
+        modules = [str(row[0]) for row in rows]
+        modules.sort(key=lambda name: (name.casefold(), name))
+        return modules
+
+    def course_summary(self) -> list[tuple[str | None, int | None, int]]:
+        """Return ``(module, week, file_count)`` sorted by module then week, NULLs last."""
+        with self._lock:
+            conn = self._connection()
+            rows = conn.execute(
+                "SELECT module, week, COUNT(*) FROM documents GROUP BY module, week"
+            ).fetchall()
+        summary = [
+            (
+                str(row[0]) if row[0] is not None else None,
+                int(row[1]) if row[1] is not None else None,
+                int(row[2]),
+            )
+            for row in rows
+        ]
+        summary.sort(
+            key=lambda item: (
+                item[0] is None,
+                (item[0] or "").casefold(),
+                item[0] or "",
+                item[1] is None,
+                item[1] if item[1] is not None else 0,
+            )
+        )
+        return summary
 
     # -- search primitives -------------------------------------------------
 
@@ -912,12 +1067,15 @@ class Store:
         path_prefix: str | None = None,
         kind: str | None = None,
         since_mtime_ns: int | None = None,
+        module: str | None = None,
+        week_range: tuple[int, int] | None = None,
     ) -> list[tuple[int, float]]:
         """Return ``(chunk_id, bm25)`` pairs, best (lowest bm25) first.
 
-        Document filters (``path_prefix``, ``kind``, ``since_mtime_ns``) are
-        applied before the SQL limit, so returned rows are the best matching
-        hits rather than global hits filtered afterwards.
+        Document filters (``path_prefix``, ``kind``, ``since_mtime_ns``,
+        ``module``, ``week_range``) are applied before the SQL limit, so
+        returned rows are the best matching hits rather than global hits
+        filtered afterwards.
         """
         if limit <= 0 or not isinstance(match_query, str) or not match_query.strip():
             return []
@@ -925,6 +1083,8 @@ class Store:
             path_prefix=path_prefix,
             kind=kind,
             since_mtime_ns=since_mtime_ns,
+            module=module,
+            week_range=week_range,
             alias="d",
         )
         with self._lock:
@@ -979,6 +1139,8 @@ class Store:
         kind: str | None = None,
         since_mtime_ns: int | None = None,
         exclude_path: str | None = None,
+        module: str | None = None,
+        week_range: tuple[int, int] | None = None,
         value_expr: str = "?",
     ) -> list[tuple[object, ...]]:
         """Exact vector search using sqlite-vec's scalar L2 distance."""
@@ -987,6 +1149,8 @@ class Store:
             kind=kind,
             since_mtime_ns=since_mtime_ns,
             exclude_path=exclude_path,
+            module=module,
+            week_range=week_range,
             alias="d",
         )
         if clause:
@@ -1022,6 +1186,8 @@ class Store:
         kind: str | None = None,
         since_mtime_ns: int | None = None,
         exclude_path: str | None = None,
+        module: str | None = None,
+        week_range: tuple[int, int] | None = None,
     ) -> list[tuple[int, float]]:
         """Return ``(chunk_id, distance)`` pairs, nearest first.
 
@@ -1046,6 +1212,8 @@ class Store:
             or kind is not None
             or since_mtime_ns is not None
             or exclude_path is not None
+            or module is not None
+            or week_range is not None
         )
         with self._lock:
             conn = self._connection()
@@ -1058,6 +1226,8 @@ class Store:
                     kind=kind,
                     since_mtime_ns=since_mtime_ns,
                     exclude_path=exclude_path,
+                    module=module,
+                    week_range=week_range,
                     value_expr=value_expr,
                 )
             else:
@@ -1104,7 +1274,9 @@ class Store:
                 placeholders = ", ".join("?" for _ in batch)
                 rows = conn.execute(
                     f"""
-                    SELECT c.id, c.doc_id, d.path, d.kind, c.text, c.locator, c.loc_start
+                    SELECT
+                        c.id, c.doc_id, d.path, d.kind, c.text, c.locator, c.loc_start,
+                        d.module, d.week
                     FROM chunks AS c
                     JOIN documents AS d ON d.id = c.doc_id
                     WHERE c.id IN ({placeholders})
@@ -1122,6 +1294,8 @@ class Store:
                         text=str(row[4]),
                         locator=str(row[5]),
                         loc_start=float(row[6]),
+                        module=str(row[7]) if row[7] is not None else None,
+                        week=int(row[8]) if row[8] is not None else None,
                     )
         return chunks
 
@@ -1160,6 +1334,29 @@ class Store:
             "vector_quant": self._vector_quant,
             "schema_version": self._schema_version,
         }
+
+    def get_meta_value(self, key: str) -> str | None:
+        """Return a metadata value from the ``meta`` table, or ``None``."""
+        with self._lock:
+            conn = self._connection()
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (str(key),),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row[0])
+
+    def set_meta_value(self, key: str, value: str) -> None:
+        """Insert or update a metadata key/value pair in the ``meta`` table."""
+        self._reject_write()
+        with self._lock, self.transaction(write=True):
+            conn = self._connection()
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(key), str(value)),
+            )
 
     def set_last_error_count(self, n: int) -> None:
         """Persist the number of errors from the most recent indexing run."""

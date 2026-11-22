@@ -15,7 +15,7 @@ from seekr.cli import app
 from seekr.config import Config
 from seekr.embed import FakeEmbedder
 from seekr.indexer import Indexer
-from seekr.store import Store
+from seekr.store import SCHEMA_VERSION, Store
 
 _HAS_TYPER = importlib.util.find_spec("typer") is not None
 _HAS_NUMPY = importlib.util.find_spec("numpy") is not None
@@ -93,7 +93,10 @@ class PolishedStatusTests(unittest.TestCase):
             self.assertIn("chunks: 2", text_res.output)
             self.assertIn("last error count: 1", text_res.output)
             self.assertIn("database:", text_res.output)
-            self.assertIn("model: fake (dim=8, quant=int8, schema=v2)", text_res.output)
+            self.assertIn(
+                f"model: fake (dim=8, quant=int8, schema=v{SCHEMA_VERSION})",
+                text_res.output,
+            )
             self.assertIn("by kind: code=1, markdown=1", text_res.output)
             self.assertIn(f"daemon: running ({sock})", text_res.output)
 
@@ -107,7 +110,7 @@ class PolishedStatusTests(unittest.TestCase):
             self.assertEqual(parsed["embed_model"], "fake")
             self.assertEqual(parsed["dim"], 8)
             self.assertEqual(parsed["vector_quant"], "int8")
-            self.assertEqual(parsed["schema_version"], 2)
+            self.assertEqual(parsed["schema_version"], SCHEMA_VERSION)
             self.assertEqual(parsed["daemon"], {"running": True, "socket": str(sock)})
             self.assertGreater(parsed["size_bytes"], 0)
 

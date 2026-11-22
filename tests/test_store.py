@@ -1243,6 +1243,405 @@ class ReadOnlyStoreTests(_FakeBackendTestCase):
         self.assertEqual(writable.stats()["documents"], 1)
 
 
+@unittest.skipUnless(_HAS_NUMPY and _HAS_FTS5, "numpy and FTS5 are required")
+class SchemaV3Tests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db_path = Path(self._tmp.name) / "index.db"
+        self._stores: list[Store] = []
+
+    def tearDown(self) -> None:
+        for store in reversed(self._stores):
+            store.close()
+
+    def _use_fake_backend(self) -> None:
+        cm = _fake_vector_backend()
+        cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
+
+    def _open_fake_store(
+        self,
+        db_path: Path | None = None,
+        model: str = "test/model",
+        dim: int = 8,
+        *,
+        read_only: bool = False,
+    ) -> Store:
+        self._use_fake_backend()
+        store = Store(db_path or self.db_path, model, dim, read_only=read_only)
+        self._stores.append(store)
+        return store
+
+    @staticmethod
+    def _create_v2_db(db_path: Path, docs: list[tuple[str, list[StoredChunk]]]) -> None:
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE documents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path TEXT NOT NULL UNIQUE,
+                    mtime_ns INTEGER NOT NULL,
+                    size INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    kind TEXT NOT NULL
+                );
+                CREATE INDEX documents_kind_mtime_idx ON documents(kind, mtime_ns);
+                CREATE TABLE chunks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                    text TEXT NOT NULL,
+                    text_sha TEXT NOT NULL,
+                    locator TEXT NOT NULL,
+                    loc_start REAL NOT NULL
+                );
+                CREATE INDEX chunks_doc_id_idx ON chunks(doc_id);
+                CREATE INDEX chunks_text_sha_idx ON chunks(text_sha);
+                CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                    text,
+                    content='chunks',
+                    content_rowid='id',
+                    tokenize='porter unicode61'
+                );
+                CREATE TRIGGER chunks_fts_ai AFTER INSERT ON chunks BEGIN
+                    INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
+                END;
+                CREATE TRIGGER chunks_fts_ad AFTER DELETE ON chunks BEGIN
+                    INSERT INTO chunks_fts(chunks_fts, rowid, text)
+                    VALUES ('delete', old.id, old.text);
+                END;
+                CREATE TRIGGER chunks_fts_au AFTER UPDATE ON chunks BEGIN
+                    INSERT INTO chunks_fts(chunks_fts, rowid, text)
+                    VALUES ('delete', old.id, old.text);
+                    INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
+                END;
+                CREATE TABLE meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE chunks_vec (
+                    rowid INTEGER PRIMARY KEY,
+                    embedding BLOB NOT NULL
+                );
+                """
+            )
+            conn.executemany(
+                "INSERT INTO meta(key, value) VALUES (?, ?)",
+                (
+                    ("embed_model", "test/model"),
+                    ("dim", "8"),
+                    ("vector_quant", "float32"),
+                    ("schema_version", "2"),
+                ),
+            )
+            for path, chunks in docs:
+                cur = conn.execute(
+                    "INSERT INTO documents(path, mtime_ns, size, sha256, kind) "
+                    "VALUES (?, 1, 10, ?, 'markdown')",
+                    (path, "a" * 64),
+                )
+                doc_id = int(cur.lastrowid)
+                for chunk in chunks:
+                    c_cur = conn.execute(
+                        "INSERT INTO chunks(doc_id, text, text_sha, locator, loc_start) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            doc_id,
+                            chunk.spec.text,
+                            chunk.text_sha,
+                            chunk.spec.locator,
+                            float(chunk.spec.loc_start),
+                        ),
+                    )
+                    conn.execute(
+                        "INSERT INTO chunks_vec(rowid, embedding) VALUES (?, ?)",
+                        (int(c_cur.lastrowid), chunk.vector.tobytes()),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_fresh_db_is_v3_with_label_columns(self) -> None:
+        self.assertEqual(SCHEMA_VERSION, 3)
+        store = self._open_fake_store()
+        self.assertEqual(store.schema_version, 3)
+        store.close()
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cols = {row[1]: row[2] for row in conn.execute("PRAGMA table_info(documents)")}
+            idx = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' "
+                "AND name='documents_module_week_idx'"
+            ).fetchone()
+            meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+        finally:
+            conn.close()
+
+        self.assertEqual(meta["schema_version"], "3")
+        self.assertIn("module", cols)
+        self.assertIn("week", cols)
+        self.assertIsNotNone(idx)
+
+    def test_v2_db_migrates_without_touching_chunks(self) -> None:
+        import numpy as np
+
+        c1 = _stored_chunk("v2 first chunk", 1)
+        c2 = _stored_chunk("v2 second chunk", 2)
+        self._create_v2_db(self.db_path, [("/c/a.md", [c1]), ("/c/b.md", [c2])])
+        before_vec_ids = _raw_vector_ids(self.db_path)
+
+        store = self._open_fake_store()
+        self.assertEqual(store.schema_version, 3)
+        self.assertEqual(store.stats(), {"documents": 2, "chunks": 2})
+        self.assertEqual(_raw_vector_ids(self.db_path), before_vec_ids)
+
+        doc_a = store.get_document("/c/a.md")
+        doc_b = store.get_document("/c/b.md")
+        assert doc_a is not None and doc_b is not None
+        self.assertIsNone(doc_a.module)
+        self.assertIsNone(doc_a.week)
+        self.assertIsNone(doc_b.module)
+        self.assertIsNone(doc_b.week)
+
+        self.assertEqual(len(store.keyword_search('"first"', 10)), 1)
+        self.assertEqual(len(store.keyword_search('"second"', 10)), 1)
+        v1 = store.find_vector_by_text_sha(c1.text_sha)
+        v2 = store.find_vector_by_text_sha(c2.text_sha)
+        assert v1 is not None and v2 is not None
+        self.assertTrue(np.allclose(v1, c1.vector))
+        self.assertTrue(np.allclose(v2, c2.vector))
+
+        store.close()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            idx = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' "
+                "AND name='documents_module_week_idx'"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(idx)
+
+    def test_read_only_v2_index_asks_for_index_not_reindex(self) -> None:
+        self._create_v2_db(self.db_path, [("/c/a.md", [_stored_chunk("legacy chunk", 1)])])
+        self._use_fake_backend()
+
+        with self.assertRaises(SchemaVersionError) as ctx:
+            Store(self.db_path, "test/model", 8, read_only=True)
+
+        self.assertIn("run `seekr index` once to upgrade it", str(ctx.exception))
+        self.assertNotIn("reindex", str(ctx.exception).lower())
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            version = conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(documents)")}
+        finally:
+            conn.close()
+        self.assertEqual(version, ("2",))
+        self.assertNotIn("module", cols)
+
+    def test_upsert_and_set_labels(self) -> None:
+        store = self._open_fake_store()
+        doc_id = store.upsert_document(
+            "/c/ml/week1/a.md", 1, 1, "s", "markdown", module="ml", week=1
+        )
+        store.replace_chunks(doc_id, [_stored_chunk("labelled chunk", 1)])
+
+        doc = store.get_document("/c/ml/week1/a.md")
+        assert doc is not None
+        self.assertEqual(doc.module, "ml")
+        self.assertEqual(doc.week, 1)
+
+        updated = store.set_document_labels(
+            [("/c/ml/week1/a.md", "ml", 2), ("/c/missing.md", "ds", 1)]
+        )
+        self.assertEqual(updated, 1)
+        doc2 = store.get_document("/c/ml/week1/a.md")
+        assert doc2 is not None
+        self.assertEqual(doc2.module, "ml")
+        self.assertEqual(doc2.week, 2)
+
+        meta_docs = store.get_documents_metadata()
+        self.assertEqual(meta_docs["/c/ml/week1/a.md"].week, 2)
+
+        chunk_id = store.keyword_search('"labelled"', 10)[0][0]
+        chunk = store.fetch_chunks([chunk_id])[chunk_id]
+        self.assertEqual(chunk.module, "ml")
+        self.assertEqual(chunk.week, 2)
+
+        self.assertEqual(store.set_document_labels([]), 0)
+
+        store.upsert_document("/c/ml/week1/a.md", 2, 2, "t", "markdown")
+        cleared = store.get_document("/c/ml/week1/a.md")
+        assert cleared is not None
+        self.assertIsNone(cleared.module)
+        self.assertIsNone(cleared.week)
+        store.close()
+
+        ro = self._open_fake_store(read_only=True)
+        with self.assertRaisesRegex(RuntimeError, "store is read-only"):
+            ro.set_document_labels([("/c/ml/week1/a.md", "ml", 1)])
+
+    def test_keyword_filters_by_module_and_week_range(self) -> None:
+        store = self._open_fake_store()
+        docs = [
+            ("/c/ml/week1/a.md", "ml", 1),
+            ("/c/ml/week3/b.md", "ml", 3),
+            ("/c/ds/week1/c.md", "ds", 1),
+            ("/c/misc/d.md", None, None),
+        ]
+        for idx, (path, module, week) in enumerate(docs, start=1):
+            doc_id = store.upsert_document(
+                path, 1, 10, f"{idx}" * 64, "markdown", module=module, week=week
+            )
+            store.replace_chunks(doc_id, [_stored_chunk("gradient descent", idx)])
+
+        def paths_of(hits: list[tuple[int, float]]) -> list[str]:
+            fetched = store.fetch_chunks([cid for cid, _ in hits])
+            return [fetched[cid].path for cid, _ in hits]
+
+        ids = store.keyword_search('"gradient"', 10, module="ml", week_range=(2, 4))
+        self.assertEqual(paths_of(ids), ["/c/ml/week3/b.md"])
+        self.assertEqual(
+            sorted(paths_of(store.keyword_search('"gradient"', 10, module="ml"))),
+            ["/c/ml/week1/a.md", "/c/ml/week3/b.md"],
+        )
+        self.assertEqual(
+            sorted(paths_of(store.keyword_search('"gradient"', 10, week_range=(1, 1)))),
+            ["/c/ds/week1/c.md", "/c/ml/week1/a.md"],
+        )
+
+    @unittest.skipUnless(
+        _HAS_SQLITE_VEC and _HAS_NUMPY and _HAS_FTS5,
+        "sqlite-vec, numpy and FTS5 are required",
+    )
+    def test_vector_filters_by_module(self) -> None:
+        import numpy as np
+
+        store = Store(self.db_path, "test/model", 8)
+        self._stores.append(store)
+
+        query = np.zeros(8, dtype=np.float32)
+        query[0] = 1.0
+        ds_vec = query.copy()
+        ml_w1_vec = np.zeros(8, dtype=np.float32)
+        ml_w1_vec[1] = 1.0
+        ml_w3_vec = np.zeros(8, dtype=np.float32)
+        ml_w3_vec[0] = 0.6
+        ml_w3_vec[1] = 0.8
+
+        ds_id = store.upsert_document(
+            "/c/ds/week1/a.md", 1, 10, "a" * 64, "markdown", module="ds", week=1
+        )
+        store.replace_chunks(ds_id, [_stored_chunk_with_vector("ds nearest", ds_vec)])
+
+        ml_w1_id = store.upsert_document(
+            "/c/ml/week1/b.md", 1, 10, "b" * 64, "markdown", module="ml", week=1
+        )
+        store.replace_chunks(ml_w1_id, [_stored_chunk_with_vector("ml week 1", ml_w1_vec)])
+
+        ml_w3_id = store.upsert_document(
+            "/c/ml/week3/c.md", 1, 10, "c" * 64, "markdown", module="ml", week=3
+        )
+        store.replace_chunks(ml_w3_id, [_stored_chunk_with_vector("ml week 3", ml_w3_vec)])
+
+        hits_ml = store.vector_search(query, 1, module="ml")
+        fetched = store.fetch_chunks([cid for cid, _ in hits_ml])
+        self.assertEqual([fetched[cid].path for cid, _ in hits_ml], ["/c/ml/week3/c.md"])
+
+        hits_ml_w1 = store.vector_search(query, 10, module="ml", week_range=(1, 2))
+        fetched_w1 = store.fetch_chunks([cid for cid, _ in hits_ml_w1])
+        self.assertEqual([fetched_w1[cid].path for cid, _ in hits_ml_w1], ["/c/ml/week1/b.md"])
+
+        hits_week_only = store.vector_search(query, 10, week_range=(2, 4))
+        fetched_week = store.fetch_chunks([cid for cid, _ in hits_week_only])
+        self.assertEqual(
+            [fetched_week[cid].path for cid, _ in hits_week_only], ["/c/ml/week3/c.md"]
+        )
+
+    def test_list_modules_and_course_summary(self) -> None:
+        store = self._open_fake_store()
+        store.upsert_document("/c/ml/w1/a.md", 1, 1, "a" * 64, "markdown", module="ml", week=1)
+        store.upsert_document("/c/ml/w3/b.md", 1, 1, "b" * 64, "markdown", module="ml", week=3)
+        store.upsert_document("/c/ml/w3/c.md", 1, 1, "c" * 64, "markdown", module="ml", week=3)
+        store.upsert_document("/c/ml/notes.md", 1, 1, "d" * 64, "markdown", module="ml", week=None)
+        store.upsert_document("/c/ds/w1/d.md", 1, 1, "e" * 64, "markdown", module="ds", week=1)
+        store.upsert_document("/c/misc.md", 1, 1, "f" * 64, "markdown", module=None, week=None)
+
+        self.assertEqual(store.list_modules(), ["ds", "ml"])
+        summary = store.course_summary()
+        self.assertEqual(summary[0], ("ds", 1, 1))
+        self.assertEqual(summary[-1][0], None)
+        self.assertEqual(
+            summary,
+            [
+                ("ds", 1, 1),
+                ("ml", 1, 1),
+                ("ml", 3, 2),
+                ("ml", None, 1),
+                (None, None, 1),
+            ],
+        )
+
+        # Case-insensitive sorting for mixed-case module names.
+        case_path = Path(self._tmp.name) / "case.db"
+        case_store = self._open_fake_store(db_path=case_path)
+        case_store.upsert_document("/r/beta/a.md", 1, 1, "a" * 64, "markdown", module="beta")
+        case_store.upsert_document("/r/Alpha/b.md", 1, 1, "b" * 64, "markdown", module="Alpha")
+        case_store.upsert_document("/r/gamma/c.md", 1, 1, "c" * 64, "markdown", module="gamma")
+        self.assertEqual(case_store.list_modules(), ["Alpha", "beta", "gamma"])
+
+    def test_meta_value_roundtrip(self) -> None:
+        store = self._open_fake_store()
+        self.assertIsNone(store.get_meta_value("labels_sig"))
+        store.set_meta_value("labels_sig", "abc123")
+        self.assertEqual(store.get_meta_value("labels_sig"), "abc123")
+        store.set_meta_value("labels_sig", "def456")
+        self.assertEqual(store.get_meta_value("labels_sig"), "def456")
+        store.close()
+
+        ro = self._open_fake_store(read_only=True)
+        self.assertEqual(ro.get_meta_value("labels_sig"), "def456")
+        with self.assertRaisesRegex(RuntimeError, "store is read-only"):
+            ro.set_meta_value("labels_sig", "nope")
+
+    def test_delete_documents_under(self) -> None:
+        store = self._open_fake_store()
+        for path, text in (
+            ("/c/ml/w1/a.md", "mloneword"),
+            ("/c/ml/w2/b.md", "mltwoword"),
+            ("/c/ml2/c.md", "mlotherword"),
+            ("/c/ds/d.md", "dsoneword"),
+        ):
+            _add_document(store, path, _stored_chunk(text, 1))
+
+        self.assertEqual(store.delete_documents_under(""), 0)
+        self.assertEqual(store.delete_documents_under("/"), 0)
+        self.assertEqual(store.stats(), {"documents": 4, "chunks": 4})
+
+        deleted = store.delete_documents_under("/c/ml")
+        self.assertEqual(deleted, 2)
+        self.assertEqual(store.stats(), {"documents": 2, "chunks": 2})
+        self.assertEqual(store.list_paths(), ["/c/ds/d.md", "/c/ml2/c.md"])
+        self.assertEqual(store.keyword_search("mloneword", 10), [])
+        self.assertEqual(store.keyword_search("mltwoword", 10), [])
+        self.assertIsNone(store.find_vector_by_text_sha(text_sha("mloneword")))
+        self.assertIsNone(store.find_vector_by_text_sha(text_sha("mltwoword")))
+        self.assertEqual(len(_raw_vector_ids(self.db_path)), 2)
+        self.assertEqual(len(store.keyword_search("mlotherword", 10)), 1)
+        self.assertEqual(store.delete_documents_under("/c/ml"), 0)
+        store.close()
+
+        ro = self._open_fake_store(read_only=True)
+        with self.assertRaisesRegex(RuntimeError, "store is read-only"):
+            ro.delete_documents_under("/c/ds")
+
+
 class VectorExtensionLoaderTests(unittest.TestCase):
     def test_loader_enables_and_disables_extension_loading(self) -> None:
         events: list[object] = []

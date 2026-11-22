@@ -778,7 +778,7 @@ class WebService:
                 schema_version=schema_version,
                 message=(
                     f"index uses schema version {schema_version}, older than supported "
-                    f"version {SCHEMA_VERSION}; run `seekr reindex`"
+                    f"version {SCHEMA_VERSION}; run `seekr index` once to upgrade it"
                 ),
             )
 
