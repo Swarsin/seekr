@@ -20,7 +20,7 @@ from seekr import cli_search, client, daemon
 from seekr.cli import app
 from seekr.config import Config
 from seekr.embed import FakeEmbedder
-from seekr.filters import normalise_kind, parse_since
+from seekr.filters import normalise_kind, parse_since, parse_week, resolve_module
 from seekr.indexer import Indexer
 from seekr.models import Hit, HitExplain
 from seekr.search import Searcher
@@ -552,3 +552,151 @@ class CliSimilarTests(unittest.TestCase):
             err_res = CliRunner().invoke(app, ["similar", "/docs/missing.md"])
         self.assertEqual(err_res.exit_code, 1)
         self.assertIn("file not found", err_res.output)
+
+
+class ModuleWeekFilterTests(unittest.TestCase):
+    def test_parse_week(self) -> None:
+        self.assertIsNone(parse_week(None))
+        self.assertIsNone(parse_week("   "))
+        self.assertEqual(parse_week("4"), (4, 4))
+        self.assertEqual(parse_week(" 3 - 5 "), (3, 5))
+        self.assertEqual(parse_week("1-99"), (1, 99))
+        for bad in ("5-3", "0", "abc", "100", "3-", "0-4", "1-100"):
+            with (
+                self.subTest(bad=bad),
+                self.assertRaisesRegex(ValueError, f"invalid --week value {bad!r}"),
+            ):
+                parse_week(bad)
+        with self.assertRaises(TypeError):
+            parse_week(4)  # type: ignore[arg-type]
+
+    def test_resolve_module(self) -> None:
+        known = ["machine-learning", "maths", "data-structures"]
+        self.assertIsNone(resolve_module(None, known))
+        self.assertIsNone(resolve_module("   ", known))
+        self.assertIsNone(resolve_module(None, []))
+        self.assertEqual(resolve_module("Machine Learning", known), "machine-learning")
+        self.assertEqual(resolve_module("data", known), "data-structures")
+        self.assertEqual(resolve_module("ml", ["ml", "ml-labs"]), "ml")
+        self.assertEqual(resolve_module("módulo ü", ["Módulo Ü", "4CCS1ML"]), "Módulo Ü")
+        self.assertEqual(resolve_module("4ccs1ml", ["Módulo Ü", "4CCS1ML"]), "4CCS1ML")
+        with self.assertRaisesRegex(
+            ValueError, "ambiguous; matches: machine-learning, machine_learning"
+        ):
+            resolve_module("Machine Learning", ["machine_learning", "machine-learning"])
+        with self.assertRaisesRegex(ValueError, "ambiguous; matches: machine-learning, maths"):
+            resolve_module("ma", known)
+        with self.assertRaisesRegex(
+            ValueError,
+            "unknown module 'xyz'; known modules: data-structures, machine-learning, maths",
+        ):
+            resolve_module("xyz", known)
+        with self.assertRaisesRegex(ValueError, "unknown module '---'"):
+            resolve_module("---", known)
+        with self.assertRaisesRegex(
+            ValueError, r"no modules are labelled yet; run `seekr index` first"
+        ):
+            resolve_module("ml", [])
+        with self.assertRaises(TypeError):
+            resolve_module(123, known)  # type: ignore[arg-type]
+
+    @unittest.skipUnless(_NEEDS_REAL_STORE, "numpy, sqlite-vec and FTS5 are required")
+    def test_searcher_filters_and_hit_labels(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="seekr-mw-") as tmp:
+            base = Path(tmp)
+            root = base / "course"
+            (root / "ml" / "week1").mkdir(parents=True)
+            (root / "ml" / "week3").mkdir(parents=True)
+            (root / "ds" / "week1").mkdir(parents=True)
+            (root / "machine-learning" / "week2").mkdir(parents=True)
+
+            ml_w1 = root / "ml" / "week1" / "intro.md"
+            ml_w3 = root / "ml" / "week3" / "descent.md"
+            ds_w1 = root / "ds" / "week1" / "trees.md"
+            ml_long_w2 = root / "machine-learning" / "week2" / "notes.md"
+            ml_w1.write_text("gradient basics in week one", encoding="utf-8")
+            ml_w3.write_text("gradient descent optimisation in week three", encoding="utf-8")
+            ds_w1.write_text("gradient of tree cost in data structures", encoding="utf-8")
+            ml_long_w2.write_text("gradient flow in machine learning week two", encoding="utf-8")
+
+            cfg = Config(roots=(root,), db_path=base / "index.db", embed_model="fake")
+            embedder = FakeEmbedder(dim=8)
+            store = Store(cfg.db_path, "fake", 8, vector_quant="int8")
+            try:
+                Indexer(store, embedder, cfg).sync([root])
+                searcher = Searcher(store, embedder)
+
+                for mode in ("keyword", "vector", "hybrid"):
+                    with self.subTest(mode=mode):
+                        hits = searcher.get_hits(
+                            "gradient",
+                            k=10,
+                            mode=mode,  # type: ignore[arg-type]
+                            module="ml",
+                            week_range=(2, 3),
+                        )
+                        self.assertEqual([(h.module, h.week) for h in hits], [("ml", 3)])
+
+                search_hits = searcher.search(
+                    "gradient", k=10, mode="hybrid", module="ML", week_range=(2, 3)
+                )
+                self.assertEqual([(h.module, h.week) for h in search_hits], [("ml", 3)])
+
+                display_hits = searcher.get_hits(
+                    "gradient", k=10, mode="hybrid", module="Machine Learning"
+                )
+                self.assertEqual(
+                    [(h.module, h.week) for h in display_hits],
+                    [("machine-learning", 2)],
+                )
+
+                week1_hits = searcher.get_hits(
+                    "gradient", k=10, mode="hybrid", week_range=(1, 1)
+                )
+                self.assertEqual(
+                    {(h.module, h.week) for h in week1_hits},
+                    {("ml", 1), ("ds", 1)},
+                )
+
+                query_vecs = store.get_document_vectors(str(ds_w1.resolve()))
+                sim_hits = searcher.similar(
+                    query_vecs, k=10, module="ml", week_range=(2, 3)
+                )
+                self.assertEqual([(h.module, h.week) for h in sim_hits], [("ml", 3)])
+                sim_prefix_hits = searcher.similar(query_vecs, k=10, module="mach")
+                self.assertEqual(
+                    [(h.module, h.week) for h in sim_prefix_hits],
+                    [("machine-learning", 2)],
+                )
+
+                with self.assertRaisesRegex(ValueError, "ambiguous; matches: machine-learning, ml"):
+                    searcher.get_hits("gradient", module="m")
+
+                with self.assertRaisesRegex(ValueError, "unknown module 'bio'"):
+                    searcher.get_hits("gradient", module="bio")
+                with self.assertRaisesRegex(ValueError, "unknown module 'bio'"):
+                    searcher.similar(query_vecs, module="bio")
+                for bad_range in ((3, 2), (0, 2), (1, 100), (True, 2), "12"):
+                    with self.subTest(bad_range=bad_range):
+                        with self.assertRaises(ValueError):
+                            searcher.get_hits(
+                                "gradient", week_range=bad_range  # type: ignore[arg-type]
+                            )
+                        with self.assertRaises(ValueError):
+                            searcher.similar(
+                                query_vecs, week_range=bad_range  # type: ignore[arg-type]
+                            )
+            finally:
+                store.close()
+
+            empty_store = Store(base / "empty.db", "fake", 8, vector_quant="int8")
+            try:
+                empty_searcher = Searcher(empty_store, embedder)
+                with self.assertRaisesRegex(ValueError, "no modules are labelled yet"):
+                    empty_searcher.get_hits("gradient", module="ml")
+                with self.assertRaisesRegex(ValueError, "no modules are labelled yet"):
+                    empty_searcher.similar(
+                        [embedder.embed_query("gradient")], module="ml"
+                    )
+            finally:
+                empty_store.close()

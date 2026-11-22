@@ -15,7 +15,7 @@ import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Literal
 
-from .filters import normalise_kind
+from .filters import normalise_kind, resolve_module
 from .logging_config import log_event
 from .models import Hit, HitExplain
 
@@ -147,6 +147,73 @@ def _snapshot(store: Store):
     return nullcontext()
 
 
+def _normalise_week_range(
+    week_range: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    if week_range is None:
+        return None
+    if not isinstance(week_range, (tuple, list)) or len(week_range) != 2:
+        raise ValueError("week_range must be a (low, high) pair with 1 <= low <= high <= 99")
+    low, high = week_range
+    if (
+        isinstance(low, bool)
+        or isinstance(high, bool)
+        or not isinstance(low, int)
+        or not isinstance(high, int)
+        or not (1 <= low <= high <= 99)
+    ):
+        raise ValueError("week_range must be a (low, high) pair with 1 <= low <= high <= 99")
+    return (low, high)
+
+
+def _resolve_module_filter(store: Store, module: str | None) -> str | None:
+    if module is None:
+        return None
+    if not isinstance(module, str):
+        raise TypeError("module filter must be a string")
+    if not module.strip():
+        return None
+    return resolve_module(module, store.list_modules())
+
+
+def _validate_filters(
+    store: Store,
+    *,
+    kind: str | None,
+    since_mtime_ns: int | None,
+    module: str | None,
+    week_range: tuple[int, int] | None,
+) -> tuple[str | None, str | None, tuple[int, int] | None]:
+    kind_val = normalise_kind(kind)
+    if since_mtime_ns is not None and (
+        isinstance(since_mtime_ns, bool) or not isinstance(since_mtime_ns, int)
+    ):
+        raise ValueError("since_mtime_ns must be an integer or None")
+    week_range_val = _normalise_week_range(week_range)
+    module_val = _resolve_module_filter(store, module)
+    return kind_val, module_val, week_range_val
+
+
+def _filter_kwargs(
+    *,
+    path_prefix: str | None = None,
+    kind: str | None = None,
+    since_mtime_ns: int | None = None,
+    exclude_path: str | None = None,
+    module: str | None = None,
+    week_range: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    entries = {
+        "path_prefix": path_prefix,
+        "kind": kind,
+        "since_mtime_ns": since_mtime_ns,
+        "exclude_path": exclude_path,
+        "module": module,
+        "week_range": week_range,
+    }
+    return {key: val for key, val in entries.items() if val is not None}
+
+
 def _keyword_search(
     store: Store,
     match_query: str,
@@ -154,14 +221,16 @@ def _keyword_search(
     path_prefix: str | None,
     kind: str | None = None,
     since_mtime_ns: int | None = None,
+    module: str | None = None,
+    week_range: tuple[int, int] | None = None,
 ) -> list[tuple[int, float]]:
-    kwargs: dict[str, Any] = {}
-    if path_prefix is not None:
-        kwargs["path_prefix"] = path_prefix
-    if kind is not None:
-        kwargs["kind"] = kind
-    if since_mtime_ns is not None:
-        kwargs["since_mtime_ns"] = since_mtime_ns
+    kwargs = _filter_kwargs(
+        path_prefix=path_prefix,
+        kind=kind,
+        since_mtime_ns=since_mtime_ns,
+        module=module,
+        week_range=week_range,
+    )
     return list(store.keyword_search(match_query, limit, **kwargs))
 
 
@@ -172,14 +241,16 @@ def _vector_search(
     path_prefix: str | None,
     kind: str | None = None,
     since_mtime_ns: int | None = None,
+    module: str | None = None,
+    week_range: tuple[int, int] | None = None,
 ) -> list[tuple[int, float]]:
-    kwargs: dict[str, Any] = {}
-    if path_prefix is not None:
-        kwargs["path_prefix"] = path_prefix
-    if kind is not None:
-        kwargs["kind"] = kind
-    if since_mtime_ns is not None:
-        kwargs["since_mtime_ns"] = since_mtime_ns
+    kwargs = _filter_kwargs(
+        path_prefix=path_prefix,
+        kind=kind,
+        since_mtime_ns=since_mtime_ns,
+        module=module,
+        week_range=week_range,
+    )
     return list(store.vector_search(query_vector, limit, **kwargs))
 
 
@@ -192,6 +263,8 @@ def _ranked_candidates(
     path_prefix: str | None,
     kind: str | None = None,
     since_mtime_ns: int | None = None,
+    module: str | None = None,
+    week_range: tuple[int, int] | None = None,
 ) -> tuple[
     list[tuple[int, float]],
     dict[int, tuple[int, float]],
@@ -200,22 +273,23 @@ def _ranked_candidates(
 ]:
     """Return candidates plus per-retriever rank/score metadata.
 
-    Document filters (``path_prefix``, ``kind``, ``since_mtime_ns``) are
-    forwarded to both store retrievers, which apply them before their limit.
-    The Searcher therefore never re-scopes or grows a global candidate window.
+    Document filters (``path_prefix``, ``kind``, ``since_mtime_ns``,
+    ``module``, ``week_range``) are forwarded to both store retrievers, which
+    apply them before their limit.  The Searcher therefore never re-scopes or
+    grows a global candidate window.
     """
     keyword_pairs: list[tuple[int, float]] = []
     vector_pairs: list[tuple[int, float]] = []
 
     if mode in ("keyword", "hybrid") and match_query:
         keyword_pairs = _keyword_search(
-            store, match_query, limit, path_prefix, kind, since_mtime_ns
+            store, match_query, limit, path_prefix, kind, since_mtime_ns, module, week_range
         )
 
     if mode in ("vector", "hybrid"):
         assert query_vector is not None
         vector_pairs = _vector_search(
-            store, query_vector, limit, path_prefix, kind, since_mtime_ns
+            store, query_vector, limit, path_prefix, kind, since_mtime_ns, module, week_range
         )
 
     keyword_info: dict[int, tuple[int, float]] = {}
@@ -348,6 +422,8 @@ def _build_hits(
                 score=float(score),
                 kind=chunk.kind,
                 explain=hit_explain,
+                module=chunk.module,
+                week=chunk.week,
             )
         )
     return hits
@@ -378,6 +454,8 @@ class Searcher:
         explain: bool = False,
         kind: str | None = None,
         since_mtime_ns: int | None = None,
+        module: str | None = None,
+        week_range: tuple[int, int] | None = None,
     ) -> list[Hit]:
         """Return up to ``k`` hits, capped per file and optionally filtered."""
         return self.get_hits(
@@ -390,6 +468,8 @@ class Searcher:
             explain=explain,
             kind=kind,
             since_mtime_ns=since_mtime_ns,
+            module=module,
+            week_range=week_range,
         )
 
     def get_hits(
@@ -404,6 +484,8 @@ class Searcher:
         explain: bool = False,
         kind: str | None = None,
         since_mtime_ns: int | None = None,
+        module: str | None = None,
+        week_range: tuple[int, int] | None = None,
     ) -> list[Hit]:
         """Pure retrieval entry point shared by the CLI and future ``pick``."""
         if mode not in SEARCH_MODES:
@@ -413,11 +495,13 @@ class Searcher:
             )
         if rerank and self.reranker is None:
             raise ValueError("rerank=True requires a reranker")
-        kind_val = normalise_kind(kind)
-        if since_mtime_ns is not None and (
-            isinstance(since_mtime_ns, bool) or not isinstance(since_mtime_ns, int)
-        ):
-            raise ValueError("since_mtime_ns must be an integer or None")
+        kind_val, module_val, week_range_val = _validate_filters(
+            self.store,
+            kind=kind,
+            since_mtime_ns=since_mtime_ns,
+            module=module,
+            week_range=week_range,
+        )
         started = time.monotonic()
         if k <= 0 or per_file <= 0:
             log_event(
@@ -494,6 +578,8 @@ class Searcher:
                 prefix,
                 kind_val,
                 since_mtime_ns,
+                module_val,
+                week_range_val,
             )
             chunks = self.store.fetch_chunks(
                 [chunk_id for chunk_id, _ in candidates]
@@ -547,13 +633,17 @@ class Searcher:
         kind: str | None = None,
         since_mtime_ns: int | None = None,
         exclude_path: str | None = None,
+        module: str | None = None,
+        week_range: tuple[int, int] | None = None,
     ) -> list[Hit]:
         """Return up to ``k`` chunks semantically similar to ``query_vectors``."""
-        kind_val = normalise_kind(kind)
-        if since_mtime_ns is not None and (
-            isinstance(since_mtime_ns, bool) or not isinstance(since_mtime_ns, int)
-        ):
-            raise ValueError("since_mtime_ns must be an integer or None")
+        kind_val, module_val, week_range_val = _validate_filters(
+            self.store,
+            kind=kind,
+            since_mtime_ns=since_mtime_ns,
+            module=module,
+            week_range=week_range,
+        )
         started = time.monotonic()
         if k <= 0 or per_file <= 0 or not query_vectors or not _store_has_chunks(self.store):
             log_event(
@@ -577,15 +667,14 @@ class Searcher:
 
         prefix = _normalise_path_prefix(path_prefix)
         limit = max(_MIN_CANDIDATES, _CANDIDATES_PER_K * k)
-        vec_kwargs: dict[str, Any] = {}
-        if prefix is not None:
-            vec_kwargs["path_prefix"] = prefix
-        if kind_val is not None:
-            vec_kwargs["kind"] = kind_val
-        if since_mtime_ns is not None:
-            vec_kwargs["since_mtime_ns"] = since_mtime_ns
-        if exclude_path is not None:
-            vec_kwargs["exclude_path"] = exclude_path
+        vec_kwargs = _filter_kwargs(
+            path_prefix=prefix,
+            kind=kind_val,
+            since_mtime_ns=since_mtime_ns,
+            exclude_path=exclude_path,
+            module=module_val,
+            week_range=week_range_val,
+        )
 
         with _snapshot(self.store):
             vector_pairs = list(self.store.vector_search(centroid, limit, **vec_kwargs))
@@ -608,6 +697,8 @@ class Searcher:
                     snippet=chunk.text[:_SNIPPET_CHARS],
                     score=float(sim_score),
                     kind=chunk.kind,
+                    module=chunk.module,
+                    week=chunk.week,
                 )
             )
         log_event(

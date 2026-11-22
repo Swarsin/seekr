@@ -49,6 +49,8 @@ class Hit:
     score: float
     kind: str
     explain: HitExplain | None = None
+    module: str | None = None
+    week: int | None = None
 
 
 def text_sha(text: str) -> str:
