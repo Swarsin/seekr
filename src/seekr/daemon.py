@@ -302,7 +302,22 @@ def _handle_request(
             stats = dict(stats_fn())
         except Exception as exc:  # noqa: BLE001 - store is an injected backend
             return {"ok": False, "error": f"cannot read status: {_error_text(exc)}"}
-        return {"ok": True, "stats": stats}
+        response: dict[str, Any] = {"ok": True, "stats": stats}
+        raw_meta = getattr(searcher, "daemon_metadata", None)
+        if isinstance(raw_meta, Mapping):
+            polled_roots = raw_meta.get("polled_roots")
+            if isinstance(polled_roots, Sequence) and not isinstance(
+                polled_roots, (str, bytes)
+            ):
+                response["polled_roots"] = [str(root) for root in polled_roots]
+            poll_interval = raw_meta.get("poll_interval_seconds")
+            if (
+                isinstance(poll_interval, int)
+                and not isinstance(poll_interval, bool)
+                and poll_interval >= 1
+            ):
+                response["poll_interval_seconds"] = poll_interval
+        return response
     if op != "search":
         return {"ok": False, "error": f"unknown op: {op!r}"}
 

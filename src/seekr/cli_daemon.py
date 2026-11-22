@@ -140,7 +140,7 @@ def run_daemon(
             )
             try:
                 searcher = Searcher(store, active_embedder, None)
-                searcher.daemon_metadata = {  # type: ignore[attr-defined]
+                daemon_meta: dict[str, Any] = {
                     "db_path": str(
                         Path(selected_cfg.db_path).expanduser().resolve(strict=False)
                     ),
@@ -149,6 +149,7 @@ def run_daemon(
                     "vector_quant": selected_cfg.vector_quant,
                     "rerank_model": selected_cfg.rerank_model,
                 }
+                searcher.daemon_metadata = daemon_meta  # type: ignore[attr-defined]
                 indexer = Indexer(store, active_embedder, selected_cfg)
 
                 # Start the observer first but hold the writer until the initial
@@ -167,7 +168,14 @@ def run_daemon(
                     indexer,
                     list(selected_cfg.roots),
                     debounce_s,
+                    poll_interval=selected_cfg.poll_interval_seconds,
                 )
+                polled = getattr(watcher, "polled_roots", ())
+                if isinstance(polled, (tuple, list)):
+                    daemon_meta["polled_roots"] = [str(root) for root in polled]
+                    daemon_meta["poll_interval_seconds"] = (
+                        selected_cfg.poll_interval_seconds
+                    )
                 watcher.start(paused=True)
                 sync_report = indexer.sync(list(selected_cfg.roots))
                 if sync_report is not None:

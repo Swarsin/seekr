@@ -273,7 +273,22 @@ class ProtocolTests(unittest.TestCase):
 
         self.assertTrue(response["ok"])
         self.assertEqual(response["stats"], {"documents": 2, "chunks": 5})
+        self.assertNotIn("polled_roots", response)
         self.assertEqual(searcher.store.stats_calls, 1)
+
+    def test_status_includes_polling_metadata_when_present(self) -> None:
+        searcher = _FakeSearcher(
+            metadata={
+                "polled_roots": ["/mnt/c/notes"],
+                "poll_interval_seconds": 25,
+            }
+        )
+        with _running_server(searcher, self.tmp) as (sock_path, *_):
+            response = _request(sock_path, {"op": "status"})
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["polled_roots"], ["/mnt/c/notes"])
+        self.assertEqual(response["poll_interval_seconds"], 25)
 
     def test_malformed_json_and_unknown_op_keep_connection_usable(self) -> None:
         with (
@@ -958,6 +973,47 @@ class DaemonRunnerTests(unittest.TestCase):
         )
         self.assertEqual(searcher.daemon_metadata["dim"], 12)
         self.assertEqual(searcher.daemon_metadata["vector_quant"], cfg.vector_quant)
+
+    def test_run_daemon_passes_poll_interval_to_watcher(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(
+                roots=(Path(tmp),),
+                db_path=Path(tmp) / "index.db",
+                poll_interval_seconds=42,
+            )
+            embedder = mock.Mock()
+            embedder.dim = 8
+            store = mock.Mock()
+            searcher = mock.Mock()
+            indexer = mock.Mock()
+            indexer.sync.return_value = None
+            watcher = mock.Mock()
+            watcher.polled_roots = ()
+
+            @contextlib.contextmanager
+            def lock(path, *, shared=True):
+                yield object()
+
+            with (
+                mock.patch("seekr.cli_daemon.Store", return_value=store),
+                mock.patch("seekr.cli_daemon.Searcher", return_value=searcher),
+                mock.patch("seekr.cli_daemon.Indexer", return_value=indexer),
+                mock.patch("seekr.cli_daemon.Watcher", return_value=watcher) as watcher_cls,
+                mock.patch("seekr.cli_daemon.serve"),
+                mock.patch("seekr.cli_daemon.lifecycle_lock", side_effect=lock),
+                mock.patch(
+                    "seekr.cli_daemon.socket_path",
+                    return_value=Path(tmp) / "seekr.sock",
+                ),
+            ):
+                cli_daemon.run_daemon(
+                    cfg=cfg,
+                    embedder=embedder,
+                    stop_event=threading.Event(),
+                    handle_signals=False,
+                )
+
+        self.assertEqual(watcher_cls.call_args.kwargs["poll_interval"], 42)
 
 
 class ServiceUnitTests(unittest.TestCase):

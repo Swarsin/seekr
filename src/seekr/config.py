@@ -18,6 +18,7 @@ DEFAULT_MAX_FILE_BYTES = 20_000_000
 DEFAULT_CHUNK_TARGET_WORDS = 300
 DEFAULT_CHUNK_MAX_WORDS = 450
 DEFAULT_CHUNK_OVERLAP_WORDS = 50
+DEFAULT_POLL_INTERVAL_SECONDS = 15
 DEFAULT_IGNORE_GLOBS: tuple[str, ...] = (
     ".git",
     "node_modules",
@@ -64,6 +65,7 @@ class Config:
     chunk_overlap_words: int = DEFAULT_CHUNK_OVERLAP_WORDS
     week_pattern: str = DEFAULT_WEEK_PATTERN
     course_structure: bool = True
+    poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
 
     def __post_init__(self) -> None:
         if not isinstance(self.roots, tuple) or not all(
@@ -118,6 +120,13 @@ class Config:
             raise ConfigError(f"week_pattern is invalid: {exc}") from exc
         if not isinstance(self.course_structure, bool):
             raise ConfigError("course_structure must be a boolean")
+        if (
+            not isinstance(self.poll_interval_seconds, int)
+            or isinstance(self.poll_interval_seconds, bool)
+        ):
+            raise ConfigError("poll_interval_seconds must be an integer")
+        if self.poll_interval_seconds < 1:
+            raise ConfigError("poll_interval_seconds must be >= 1")
 
 
 def _read_toml(path: Path) -> dict[str, Any]:
@@ -199,5 +208,7 @@ def load_config(path: Path | None = None) -> Config:
         values["week_pattern"] = data["week_pattern"]
     if "course_structure" in data:
         values["course_structure"] = data["course_structure"]
+    if "poll_interval_seconds" in data:
+        values["poll_interval_seconds"] = data["poll_interval_seconds"]
 
     return Config(**values)

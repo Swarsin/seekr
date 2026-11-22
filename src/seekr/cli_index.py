@@ -21,6 +21,7 @@ from typing import Any
 
 import typer
 
+from . import platform_info
 from .config import Config, load_config
 from .course import display_module
 from .embed import Embedder, build_embedder
@@ -180,6 +181,61 @@ def _format_daemon_status(daemon_running: bool, sock: Path) -> str:
     return f"daemon: stopped ({sock})"
 
 
+def _resolve_root(root: Path) -> Path:
+    expanded = Path(root).expanduser()
+    try:
+        return expanded.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return expanded
+
+
+def _polled_watch_info(
+    daemon_running: bool, sock: Path, cfg: Config
+) -> tuple[list[Path], int]:
+    if not daemon_running:
+        return [], cfg.poll_interval_seconds
+    from .client import DaemonError, try_daemon_status
+
+    try:
+        payload = try_daemon_status(sock_path=sock, timeout=0.5)
+    except DaemonError:
+        payload = None
+
+    if payload is not None and "polled_roots" in payload:
+        raw_roots = payload["polled_roots"]
+        raw_interval = payload.get(
+            "poll_interval_seconds", cfg.poll_interval_seconds
+        )
+        if isinstance(raw_roots, list) and all(
+            isinstance(item, str) for item in raw_roots
+        ):
+            interval = (
+                raw_interval
+                if isinstance(raw_interval, int)
+                and not isinstance(raw_interval, bool)
+                and raw_interval >= 1
+                else cfg.poll_interval_seconds
+            )
+            return [Path(item) for item in raw_roots], interval
+
+    mounts = platform_info.read_mounts()
+    polled: list[Path] = []
+    for root in cfg.roots:
+        resolved = _resolve_root(root)
+        if platform_info.is_slow_path(resolved, mounts) or (
+            platform_info.is_slow_path(Path(root).expanduser(), mounts)
+        ):
+            polled.append(resolved)
+    return polled, cfg.poll_interval_seconds
+
+
+def _echo_daemon_status(daemon_running: bool, sock: Path, cfg: Config) -> None:
+    typer.echo(_format_daemon_status(daemon_running, sock))
+    polled_roots, poll_interval = _polled_watch_info(daemon_running, sock, cfg)
+    for root in polled_roots:
+        typer.echo(f"watch: {root} (polling every {poll_interval}s)")
+
+
 def _db_size_bytes(db_path: Path) -> int:
     total = 0
     for candidate in (
@@ -263,7 +319,7 @@ def status(
                     typer.echo("last error count: 0")
                     typer.echo(f"database: {db_path} (not initialized)")
                     typer.echo(f"model: {cfg.embed_model} (quant={cfg.vector_quant})")
-                    typer.echo(_format_daemon_status(daemon_running, sock))
+                    _echo_daemon_status(daemon_running, sock, cfg)
                     return
                 dim = _build_embedder(cfg).dim
 
@@ -333,7 +389,7 @@ def status(
         typer.echo(f"by kind: {summary}")
     for line in _format_course_lines(course_rows):
         typer.echo(line)
-    typer.echo(_format_daemon_status(daemon_running, sock))
+    _echo_daemon_status(daemon_running, sock, cfg)
 
 
 def register(app: typer.Typer) -> None:

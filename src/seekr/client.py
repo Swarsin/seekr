@@ -22,7 +22,12 @@ from typing import Any
 from .daemon import MAX_RESPONSE_BYTES, socket_path, socket_path_problem
 from .models import Hit, HitExplain
 
-__all__ = ["DaemonError", "DaemonMismatchError", "try_daemon_search"]
+__all__ = [
+    "DaemonError",
+    "DaemonMismatchError",
+    "try_daemon_search",
+    "try_daemon_status",
+]
 
 _NO_LISTENER_ERRNOS = frozenset(
     {
@@ -234,24 +239,12 @@ def _hit_from_dict(payload: object) -> Hit:
     )
 
 
-def try_daemon_search(
-    params: dict[str, Any],
-    sock_path: Path | None = None,
-    timeout: float = 2.0,
-    *,
-    expected: Mapping[str, Any] | None = None,
-) -> list[Hit] | None:
-    """Ask a running daemon for results, or return ``None`` when none listens."""
+def _send_request(
+    payload: Mapping[str, Any],
+    sock_path: Path | None,
+    timeout: float,
+) -> dict[str, Any] | None:
     path = socket_path() if sock_path is None else Path(sock_path)
-    try:
-        payload = dict(params)
-    except (TypeError, ValueError) as exc:
-        raise DaemonError("daemon request must be a mapping") from exc
-    payload.setdefault("op", "search")
-    expectation = _expected_payload(expected)
-    if expectation is not None:
-        payload["expect"] = expectation
-
     try:
         encoded = (
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -304,7 +297,7 @@ def try_daemon_search(
         response = json.loads(line)
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
         raise DaemonError(f"seekr daemon returned malformed JSON: {exc}") from exc
-    if not isinstance(response, Mapping):
+    if not isinstance(response, dict):
         raise DaemonError("seekr daemon response is not a JSON object")
 
     if response.get("ok") is not True:
@@ -313,6 +306,38 @@ def try_daemon_search(
         if message.startswith("config mismatch"):
             raise DaemonMismatchError(message)
         raise DaemonError(message)
+
+    return response
+
+
+def try_daemon_status(
+    sock_path: Path | None = None,
+    timeout: float = 0.5,
+) -> dict[str, Any] | None:
+    """Query a running daemon for its status payload, or return ``None``."""
+    return _send_request({"op": "status"}, sock_path, timeout)
+
+
+def try_daemon_search(
+    params: dict[str, Any],
+    sock_path: Path | None = None,
+    timeout: float = 2.0,
+    *,
+    expected: Mapping[str, Any] | None = None,
+) -> list[Hit] | None:
+    """Ask a running daemon for results, or return ``None`` when none listens."""
+    try:
+        payload = dict(params)
+    except (TypeError, ValueError) as exc:
+        raise DaemonError("daemon request must be a mapping") from exc
+    payload.setdefault("op", "search")
+    expectation = _expected_payload(expected)
+    if expectation is not None:
+        payload["expect"] = expectation
+
+    response = _send_request(payload, sock_path, timeout)
+    if response is None:
+        return None
 
     hits = response.get("hits")
     if not isinstance(hits, list):

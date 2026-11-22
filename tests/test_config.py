@@ -203,6 +203,31 @@ class ConfigLoadingTests(unittest.TestCase):
                 with self.subTest(toml=toml), self.assertRaises(ConfigError):
                     load_config(cfg_path)
 
+    def test_poll_interval_seconds_default_and_validation(self) -> None:
+        self.assertEqual(Config().poll_interval_seconds, 15)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = self._write(Path(tmp), "poll_interval_seconds = 30\n")
+            cfg = load_config(cfg_path)
+            self.assertEqual(cfg.poll_interval_seconds, 30)
+
+            for bad_toml in (
+                "poll_interval_seconds = 0\n",
+                "poll_interval_seconds = -5\n",
+                "poll_interval_seconds = true\n",
+                'poll_interval_seconds = "15"\n',
+                "poll_interval_seconds = 1.5\n",
+            ):
+                bad_path = self._write(Path(tmp), bad_toml)
+                with self.subTest(toml=bad_toml), self.assertRaises(ConfigError) as raised:
+                    load_config(bad_path)
+                self.assertIn("poll_interval_seconds", str(raised.exception))
+
+        for bad_val in (0, -1, True, False, "15", 1.5, None):
+            with self.subTest(value=bad_val), self.assertRaises(ConfigError) as raised:
+                Config(poll_interval_seconds=bad_val)  # type: ignore[arg-type]
+            self.assertIn("poll_interval_seconds", str(raised.exception))
+
 
 class ModelTests(unittest.TestCase):
     def test_text_sha_ignores_case_and_whitespace(self) -> None:

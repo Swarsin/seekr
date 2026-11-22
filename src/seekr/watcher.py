@@ -17,10 +17,13 @@ import os
 import stat
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from . import platform_info
+from .platform_info import Mount
 
 __all__ = ["Watcher", "WatcherError"]
 
@@ -84,6 +87,9 @@ class Watcher:
         debounce_s: float = 1.0,
         *,
         observer_factory: Callable[[], Any] | None = None,
+        poll_interval: float = 15.0,
+        mounts: Sequence[Mount] | None = None,
+        polling_observer_factory: Callable[[float], Any] | None = None,
     ) -> None:
         try:
             debounce = float(debounce_s)
@@ -91,12 +97,35 @@ class Watcher:
             raise WatcherError("debounce_s must be a non-negative number") from exc
         if not math.isfinite(debounce) or debounce < 0:
             raise WatcherError("debounce_s must be a non-negative finite number")
+        if isinstance(poll_interval, bool) or not isinstance(
+            poll_interval, (int, float)
+        ):
+            raise WatcherError("poll_interval must be a positive finite number")
+        poll_interval_s = float(poll_interval)
+        if not math.isfinite(poll_interval_s) or poll_interval_s <= 0:
+            raise WatcherError("poll_interval must be a positive finite number")
 
         self._indexer = indexer
         self._roots = tuple(Path(root).expanduser() for root in roots)
         self._resolved_roots = tuple(self._resolve(root) for root in self._roots)
+        active_mounts = tuple(
+            platform_info.read_mounts() if mounts is None else mounts
+        )
+        native_roots: list[Path] = []
+        polled_roots: list[Path] = []
+        for root, resolved in zip(self._roots, self._resolved_roots, strict=True):
+            if platform_info.is_slow_path(resolved, active_mounts) or (
+                platform_info.is_slow_path(root, active_mounts)
+            ):
+                polled_roots.append(resolved)
+            else:
+                native_roots.append(resolved)
+        self._native_roots = tuple(native_roots)
+        self._polled_roots = tuple(polled_roots)
         self._debounce_s = debounce
+        self._poll_interval = poll_interval_s
         self._observer_factory = observer_factory
+        self._polling_observer_factory = polling_observer_factory
 
         self._condition = threading.Condition()
         self._pending: dict[tuple[str, ...], _Pending] = {}
@@ -107,6 +136,7 @@ class Watcher:
 
         self._worker: threading.Thread | None = None
         self._observer: Any | None = None
+        self._polling_observer: Any | None = None
         self._handler: _EventDispatch | None = None
 
         self._error_lock = threading.Lock()
@@ -137,18 +167,32 @@ class Watcher:
         worker.start()
 
         observer: Any | None = None
+        polling_observer: Any | None = None
+        started_observers: list[Any] = []
         try:
-            observer = self._build_observer()
             handler = _EventDispatch(self)
-            self._schedule_watches(observer, handler)
-            observer.start()
+            if self._native_roots:
+                observer = self._build_observer()
+                self._schedule_watches(observer, handler, self._native_roots)
+            if self._polled_roots:
+                polling_observer = self._build_polling_observer()
+                self._schedule_watches(polling_observer, handler, self._polled_roots)
+            for candidate in (observer, polling_observer):
+                if candidate is not None:
+                    candidate.start()
+                    started_observers.append(candidate)
         except Exception as exc:
-            self._abort_start(worker, observer)
+            self._abort_start(
+                worker,
+                [obs for obs in (observer, polling_observer) if obs is not None],
+                started_observers,
+            )
             if isinstance(exc, WatcherError):
                 raise
             raise WatcherError(f"cannot start file watcher: {exc}") from exc
 
         self._observer = observer
+        self._polling_observer = polling_observer
         self._handler = handler
 
     def resume(self) -> None:
@@ -165,17 +209,12 @@ class Watcher:
             self._condition.notify_all()
 
         observer = self._observer
+        polling_observer = self._polling_observer
         self._observer = None
+        self._polling_observer = None
         self._handler = None
-        if observer is not None:
-            try:
-                observer.stop()
-            except Exception as exc:  # noqa: BLE001 - third-party observer
-                self._record_error("cannot stop filesystem observer", exc)
-            try:
-                observer.join(timeout=timeout)
-            except Exception as exc:  # noqa: BLE001 - third-party observer
-                self._record_error("cannot join filesystem observer", exc)
+        self._stop_observer(observer, timeout=timeout)
+        self._stop_observer(polling_observer, timeout=timeout)
 
         worker = self._worker
         self._worker = None
@@ -192,6 +231,11 @@ class Watcher:
 
         with self._condition:
             self._started = False
+
+    @property
+    def polled_roots(self) -> tuple[Path, ...]:
+        """Resolved watch roots scheduled on the polling observer."""
+        return self._polled_roots
 
     @property
     def errors(self) -> list[tuple[str, str]]:
@@ -211,10 +255,25 @@ class Watcher:
             ) from exc
         return Observer()
 
-    def _schedule_watches(self, observer: Any, handler: _EventDispatch) -> None:
+    def _build_polling_observer(self) -> Any:
+        if self._polling_observer_factory is not None:
+            return self._polling_observer_factory(self._poll_interval)
+        try:
+            from watchdog.observers.polling import PollingObserver
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise WatcherError(
+                "watchdog is required for `seekr daemon`; install the watchdog package"
+            ) from exc
+        return PollingObserver(timeout=self._poll_interval)
+
+    def _schedule_watches(
+        self,
+        observer: Any,
+        handler: _EventDispatch,
+        roots: Sequence[Path],
+    ) -> None:
         watches: dict[str, bool] = {}
-        for root in self._roots:
-            resolved = self._resolve(root)
+        for resolved in roots:
             try:
                 root_stat = resolved.stat()
             except OSError as exc:
@@ -237,21 +296,51 @@ class Watcher:
         for watch_path, recursive in sorted(watches.items()):
             observer.schedule(handler, watch_path, recursive=recursive)
 
-    def _abort_start(self, worker: threading.Thread, observer: Any | None) -> None:
+    def _stop_observer(
+        self,
+        observer: Any | None,
+        *,
+        timeout: float,
+        join: bool = True,
+        context: str = "cannot stop filesystem observer",
+    ) -> None:
+        if observer is None:
+            return
+        try:
+            observer.stop()
+        except Exception as exc:  # noqa: BLE001 - third-party observer
+            self._record_error(context, exc)
+        if not join:
+            return
+        try:
+            observer.join(timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - third-party observer
+            self._record_error("cannot join filesystem observer", exc)
+
+    def _abort_start(
+        self,
+        worker: threading.Thread,
+        observers: Sequence[Any],
+        started_observers: Sequence[Any],
+    ) -> None:
         with self._condition:
             self._stopping = True
             self._pending.clear()
             self._condition.notify_all()
-        if observer is not None:
-            try:
-                observer.stop()
-            except Exception as exc:  # noqa: BLE001 - best-effort startup cleanup
-                self._record_error("cannot stop filesystem observer during startup", exc)
+        started_ids = {id(obs) for obs in started_observers}
+        for observer in observers:
+            self._stop_observer(
+                observer,
+                timeout=5.0,
+                join=id(observer) in started_ids,
+                context="cannot stop filesystem observer during startup",
+            )
         worker.join(timeout=5.0)
         with self._condition:
             self._started = False
         self._handler = None
         self._observer = None
+        self._polling_observer = None
 
     # -- event intake ------------------------------------------------------
 

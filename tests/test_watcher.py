@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from seekr.config import Config
 from seekr.embed import FakeEmbedder
 from seekr.indexer import Indexer
+from seekr.platform_info import Mount
 from seekr.search import Searcher
 from seekr.store import DocRow, StoredChunk
 from seekr.watcher import Watcher, WatcherError
@@ -599,6 +600,193 @@ class _RealWatchdogIntegrationTests(unittest.TestCase):
             _wait_for(lambda: self.store.list_paths() == [str(dst.resolve())])
         )
         self.assertEqual(self.embedder.document_calls, calls_after_index)
+
+    def test_polling_observer_detects_create_and_delete(self) -> None:
+        mounts = [Mount(source="C:\\", mount_point=str(self.root), fstype="9p")]
+        self.watcher = Watcher(
+            self.indexer,
+            [self.root],
+            debounce_s=0.1,
+            poll_interval=0.2,
+            mounts=mounts,
+        )
+        self.assertEqual(self.watcher.polled_roots, (self.root.resolve(),))
+        self.watcher.start()
+        time.sleep(0.25)
+
+        path = self.root / "polled.md"
+        path.write_text("polled content", encoding="utf-8")
+        self.assertTrue(
+            _wait_for(
+                lambda: self.store.get_document(str(path.resolve())) is not None
+            )
+        )
+
+        path.unlink()
+        self.assertTrue(
+            _wait_for(lambda: self.store.get_document(str(path.resolve())) is None)
+        )
+
+
+class _PollingObserverTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.fast_root = self.tmp / "fast"
+        self.fast_root.mkdir()
+        self.slow_root = self.tmp / "slow"
+        self.slow_root.mkdir()
+        self.indexer = _RecordingIndexer()
+
+    def test_slow_roots_use_polling_observer(self) -> None:
+        native_obs = _FakeObserver()
+        poll_obs = _FakeObserver()
+        poll_intervals: list[float] = []
+        mounts = [
+            Mount(source="/dev/sdc", mount_point="/", fstype="ext4"),
+            Mount(source="C:\\", mount_point=str(self.slow_root), fstype="9p"),
+        ]
+
+        def poll_factory(interval: float) -> _FakeObserver:
+            poll_intervals.append(interval)
+            return poll_obs
+
+        watcher = Watcher(
+            self.indexer,
+            [self.fast_root, self.slow_root],
+            debounce_s=0.05,
+            observer_factory=lambda: native_obs,
+            poll_interval=20,
+            mounts=mounts,
+            polling_observer_factory=poll_factory,
+        )
+        self.addCleanup(watcher.stop)
+
+        self.assertEqual(watcher.polled_roots, (self.slow_root.resolve(),))
+        watcher.start()
+
+        self.assertEqual(poll_intervals, [20.0])
+        self.assertTrue(native_obs.started)
+        self.assertTrue(poll_obs.started)
+        self.assertEqual(
+            [item[1] for item in native_obs.schedules],
+            [str(self.fast_root.resolve())],
+        )
+        self.assertEqual(
+            [item[1] for item in poll_obs.schedules],
+            [str(self.slow_root.resolve())],
+        )
+
+        slow_file = self.slow_root / "note.md"
+        slow_file.write_text("polled note", encoding="utf-8")
+        assert watcher._handler is not None
+        watcher._handler.dispatch(_FakeEvent("created", str(slow_file)))
+        self.assertTrue(_wait_for(lambda: bool(self.indexer.calls)))
+        self.assertEqual(self.indexer.calls, [("index", slow_file.resolve())])
+
+        watcher.stop()
+        self.assertTrue(native_obs.stopped)
+        self.assertTrue(poll_obs.stopped)
+
+    def test_no_slow_roots_creates_no_polling_observer(self) -> None:
+        native_obs = _FakeObserver()
+        polling_calls: list[float] = []
+        mounts = [Mount(source="/dev/sdc", mount_point="/", fstype="ext4")]
+
+        def poll_factory(interval: float) -> _FakeObserver:
+            polling_calls.append(interval)
+            return _FakeObserver()
+
+        watcher = Watcher(
+            self.indexer,
+            [self.fast_root],
+            observer_factory=lambda: native_obs,
+            mounts=mounts,
+            polling_observer_factory=poll_factory,
+        )
+        self.addCleanup(watcher.stop)
+
+        self.assertEqual(watcher.polled_roots, ())
+        watcher.start()
+        self.assertEqual(polling_calls, [])
+        self.assertIsNone(watcher._polling_observer)
+        self.assertTrue(native_obs.started)
+        watcher.stop()
+        self.assertTrue(native_obs.stopped)
+
+    def test_only_slow_roots_skips_native_observer(self) -> None:
+        native_calls = 0
+        poll_obs = _FakeObserver()
+        mounts = [
+            Mount(source="/dev/sdc", mount_point="/", fstype="ext4"),
+            Mount(source="C:\\", mount_point=str(self.slow_root), fstype="drvfs"),
+        ]
+
+        def native_factory() -> _FakeObserver:
+            nonlocal native_calls
+            native_calls += 1
+            return _FakeObserver()
+
+        watcher = Watcher(
+            self.indexer,
+            [self.slow_root],
+            observer_factory=native_factory,
+            mounts=mounts,
+            polling_observer_factory=lambda _interval: poll_obs,
+        )
+        self.addCleanup(watcher.stop)
+
+        self.assertEqual(watcher.polled_roots, (self.slow_root.resolve(),))
+        watcher.start()
+        self.assertEqual(native_calls, 0)
+        self.assertIsNone(watcher._observer)
+        self.assertTrue(poll_obs.started)
+        self.assertEqual(
+            [item[1] for item in poll_obs.schedules],
+            [str(self.slow_root.resolve())],
+        )
+        watcher.stop()
+        watcher.stop()
+        self.assertTrue(poll_obs.stopped)
+
+    def test_invalid_poll_interval_raises(self) -> None:
+        for bad in (0, -1, float("nan"), float("inf"), "15", True):
+            with self.subTest(poll_interval=bad), self.assertRaises(WatcherError):
+                Watcher(
+                    self.indexer,
+                    [self.fast_root],
+                    poll_interval=bad,  # type: ignore[arg-type]
+                    mounts=[],
+                )
+
+    def test_polling_observer_start_failure_stops_native_observer(self) -> None:
+        native_obs = _FakeObserver()
+        poll_obs = _FakeObserver()
+
+        def fail_start() -> None:
+            raise RuntimeError("poll boom")
+
+        poll_obs.start = fail_start  # type: ignore[method-assign]
+        mounts = [
+            Mount(source="/dev/sdc", mount_point="/", fstype="ext4"),
+            Mount(source="C:\\", mount_point=str(self.slow_root), fstype="cifs"),
+        ]
+
+        watcher = Watcher(
+            self.indexer,
+            [self.fast_root, self.slow_root],
+            observer_factory=lambda: native_obs,
+            mounts=mounts,
+            polling_observer_factory=lambda _interval: poll_obs,
+        )
+
+        with self.assertRaises(WatcherError):
+            watcher.start()
+
+        self.assertTrue(native_obs.stopped)
+        self.assertIsNone(watcher._observer)
+        self.assertIsNone(watcher._polling_observer)
 
 
 @unittest.skipUnless(

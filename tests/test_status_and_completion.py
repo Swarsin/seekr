@@ -15,6 +15,7 @@ from seekr.cli import app
 from seekr.config import Config
 from seekr.embed import FakeEmbedder
 from seekr.indexer import Indexer
+from seekr.platform_info import Mount
 from seekr.store import SCHEMA_VERSION, Store
 
 _HAS_TYPER = importlib.util.find_spec("typer") is not None
@@ -268,3 +269,143 @@ class PolishedStatusTests(unittest.TestCase):
                 {"module": None, "week": None, "files": 1},
             ],
         )
+
+    def test_status_prints_polled_roots_when_daemon_running(self) -> None:
+        from typer.testing import CliRunner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fast_root = base / "repo"
+            fast_root.mkdir()
+            (fast_root / "notes.md").write_text("# Doc\n\nhello", encoding="utf-8")
+            slow_root = Path("/mnt/c/Users/alice/notes")
+            db_path = base / "index.db"
+            cfg_default = Config(
+                roots=(fast_root, slow_root),
+                db_path=db_path,
+                embed_model="fake",
+            )
+            store = Store(db_path, "fake", 8)
+            try:
+                Indexer(store, FakeEmbedder(dim=8), cfg_default).sync([fast_root])
+            finally:
+                store.close()
+
+            mounts = [
+                Mount(source="/dev/sdc", mount_point="/", fstype="ext4"),
+                Mount(source="C:\\", mount_point="/mnt/c", fstype="9p"),
+            ]
+            sock = base / "seekr.sock"
+            with (
+                mock.patch("seekr.cli_index._load_config", return_value=cfg_default),
+                mock.patch("seekr.cli_index._daemon_status", return_value=(True, sock)),
+                mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
+            ):
+                res_running = CliRunner().invoke(app, ["status"])
+
+            self.assertEqual(res_running.exit_code, 0, res_running.output)
+            self.assertIn(
+                f"watch: {slow_root} (polling every 15s)",
+                res_running.output,
+            )
+            self.assertNotIn(f"watch: {fast_root}", res_running.output)
+
+            cfg_custom = Config(
+                roots=(fast_root, slow_root),
+                db_path=db_path,
+                embed_model="fake",
+                poll_interval_seconds=25,
+            )
+            with (
+                mock.patch("seekr.cli_index._load_config", return_value=cfg_custom),
+                mock.patch("seekr.cli_index._daemon_status", return_value=(True, sock)),
+                mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
+            ):
+                res_custom = CliRunner().invoke(app, ["status"])
+
+            self.assertEqual(res_custom.exit_code, 0, res_custom.output)
+            self.assertIn(
+                f"watch: {slow_root} (polling every 25s)",
+                res_custom.output,
+            )
+
+            with (
+                mock.patch("seekr.cli_index._load_config", return_value=cfg_default),
+                mock.patch("seekr.cli_index._daemon_status", return_value=(False, sock)),
+                mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
+            ):
+                res_stopped = CliRunner().invoke(app, ["status"])
+
+            self.assertEqual(res_stopped.exit_code, 0, res_stopped.output)
+            self.assertNotIn("polling every", res_stopped.output)
+
+    def test_status_uses_live_daemon_polling_metadata(self) -> None:
+        import threading
+        import time
+
+        from typer.testing import CliRunner
+
+        from seekr import daemon
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            db_path = base / "index.db"
+            cfg = Config(roots=(), db_path=db_path, embed_model="fake")
+            store = Store(db_path, "fake", 8)
+            self.addCleanup(store.close)
+            searcher = mock.Mock()
+            searcher.store = store
+            searcher.daemon_metadata = {
+                "polled_roots": ["/mnt/c/live"],
+                "poll_interval_seconds": 30,
+            }
+            sock = base / "seekr.sock"
+            stop_event = threading.Event()
+            thread = threading.Thread(
+                target=daemon.serve,
+                args=(searcher, sock, stop_event),
+                daemon=True,
+            )
+            thread.start()
+            try:
+                for _ in range(100):
+                    if sock.exists():
+                        break
+                    time.sleep(0.02)
+                with (
+                    mock.patch("seekr.cli_index._load_config", return_value=cfg),
+                    mock.patch("seekr.cli_index._daemon_status", return_value=(True, sock)),
+                ):
+                    result = CliRunner().invoke(app, ["status"])
+            finally:
+                stop_event.set()
+                thread.join(timeout=5.0)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("watch: /mnt/c/live (polling every 30s)", result.output)
+
+
+@unittest.skipUnless(_HAS_TYPER, "typer is not installed")
+class MissingDbWatchStatusTests(unittest.TestCase):
+    def test_status_without_db_prints_polled_roots_when_daemon_running(self) -> None:
+        from typer.testing import CliRunner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            slow_root = Path("/mnt/c/notes")
+            cfg = Config(
+                roots=(slow_root,),
+                db_path=base / "missing.db",
+                embed_model="fake",
+            )
+            mounts = [Mount(source="C:\\", mount_point="/mnt/c", fstype="9p")]
+            sock = base / "seekr.sock"
+            with (
+                mock.patch("seekr.cli_index._load_config", return_value=cfg),
+                mock.patch("seekr.cli_index._daemon_status", return_value=(True, sock)),
+                mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
+            ):
+                result = CliRunner().invoke(app, ["status"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("watch: /mnt/c/notes (polling every 15s)", result.output)
