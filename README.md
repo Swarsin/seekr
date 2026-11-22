@@ -5,9 +5,9 @@ Private, offline hybrid keyword and semantic search for your notes, PDFs, code, 
 [![CI](https://github.com/Swarsin/seekr/actions/workflows/ci.yml/badge.svg)](https://github.com/Swarsin/seekr/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/seekr-search)](https://pypi.org/project/seekr-search/)
 [![Python](https://img.shields.io/pypi/pyversions/seekr-search)](https://pypi.org/project/seekr-search/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/Swarsin/seekr/blob/main/LICENSE)
 
-![seekr CLI demo](docs/img/demo.gif)
+![seekr CLI demo](https://raw.githubusercontent.com/Swarsin/seekr/main/docs/img/demo.gif)
 
 ## Quickstart
 
@@ -29,11 +29,11 @@ Run `seekr doctor` to verify SQLite FTS5/`sqlite-vec` support, add persistent fo
 ## What it does
 
 - **CLI (`seekr`)** — index directories incrementally (`seekr index`, `seekr reindex`, `seekr status`), run hybrid/keyword/vector queries with `--kind`, `--since`, `--path`, `--rerank`, `--json`, and `--explain`, find related files (`seekr similar`), open hits interactively (`seekr pick`, `seekr open`), and generate shell completions (`seekr completion bash|zsh|fish`).
-- **Web UI (`seekr web`)** — local-only browser workspace (`http://127.0.0.1:8000`) for adding folders, checking local model readiness, triggering incremental index scans, and searching with filters and one-click location copying. See [`docs/web.md`](docs/web.md) and [`docs/web-api.md`](docs/web-api.md).
-- **Daemon (`seekr daemon`)** — keeps the embedding model warm in memory, answers CLI/web queries over `$XDG_RUNTIME_DIR/seekr.sock` (falling back automatically to local search when stopped), and watches configured roots for file changes; includes [`contrib/seekr.service`](contrib/seekr.service) (systemd user unit) and [`contrib/seekr-popup.sh`](contrib/seekr-popup.sh) (Hyprland/rofi launcher).
+- **Web UI (`seekr web`)** — local-only browser workspace (`http://127.0.0.1:8000`) for adding folders, checking local model readiness, triggering incremental index scans, and searching with filters and one-click location copying. See [`docs/web.md`](https://github.com/Swarsin/seekr/blob/main/docs/web.md) and [`docs/web-api.md`](https://github.com/Swarsin/seekr/blob/main/docs/web-api.md).
+- **Daemon (`seekr daemon`)** — keeps the embedding model warm in memory, answers CLI/web queries over `$XDG_RUNTIME_DIR/seekr.sock` (falling back automatically to local search when stopped), and watches configured roots for file changes; includes [`contrib/seekr.service`](https://github.com/Swarsin/seekr/blob/main/contrib/seekr.service) (systemd user unit) and [`contrib/seekr-popup.sh`](https://github.com/Swarsin/seekr/blob/main/contrib/seekr-popup.sh) (Hyprland/rofi launcher).
 - **MCP (`seekr mcp`)** — newline-delimited JSON-RPC 2.0 stdio server exposing `search` and `similar` tools for coding agents with zero implicit network calls and stderr-only diagnostics.
 
-![seekr web UI](docs/img/web.png)
+![seekr web UI](https://raw.githubusercontent.com/Swarsin/seekr/main/docs/img/web.png)
 
 ## Use with Claude Code / Cursor
 
@@ -101,7 +101,7 @@ Indexing runs in batches (up to 64 files / 128 chunks per transaction) and keys 
 - Default `int8` quantization halves index DB size (`22.35 MiB` vs `44.88 MiB` at 20k chunks) with negligible quality change (`-0.06` pts macro-avg on SciFact+NFCorpus).
 - Warm hybrid search runs at ~`11 ms` p95 (`11.39 ms` at 20k chunks, excluding query embedding).
 
-See [`docs/benchmarks.md`](docs/benchmarks.md) for full BEIR tables, single-variable ablations, latency/throughput numbers, 100k-chunk scale results, and design notes, and [`docs/eval.md`](docs/eval.md) to evaluate your own corpus.
+See [`docs/benchmarks.md`](https://github.com/Swarsin/seekr/blob/main/docs/benchmarks.md) for full BEIR tables, single-variable ablations, latency/throughput numbers, 100k-chunk scale results, and design notes, and [`docs/eval.md`](https://github.com/Swarsin/seekr/blob/main/docs/eval.md) to evaluate your own corpus.
 
 ## Limitations
 
@@ -121,8 +121,8 @@ pytest -m "not slow"
 pytest -m slow          # real cached models, sqlite-vec int8, and 100k scale test
 ```
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `ruff check .`, `pytest -m "not slow"`, and wheel installation checks on Python 3.11–3.13 on Ubuntu.
+CI ([`.github/workflows/ci.yml`](https://github.com/Swarsin/seekr/blob/main/.github/workflows/ci.yml)) runs `ruff check .`, `pytest -m "not slow"`, and wheel installation checks on Python 3.11–3.13 on Ubuntu.
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](https://github.com/Swarsin/seekr/blob/main/LICENSE).

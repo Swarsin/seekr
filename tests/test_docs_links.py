@@ -13,6 +13,10 @@ ANCHOR_LINK = re.compile(r"\]\((?!https?://|mailto:)([^)\s#]*)#([^)\s]+)\)")
 FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 ATX_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$")
 INLINE_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+REPO_FILE_URL = re.compile(
+    r"https://(?:raw\.githubusercontent\.com/Swarsin/seekr/main|github\.com/Swarsin/seekr/(?:blob|tree)/main)/"
+    r"([^)\s#\"']+)"
+)
 
 
 def _iter_non_fenced_lines(text: str) -> Iterator[str]:
@@ -88,6 +92,21 @@ class DocsLinkTests(unittest.TestCase):
                     broken.append(f"{md.relative_to(ROOT)}: {raw_target}#{fragment}")
         self.assertEqual(broken, [])
 
+    def test_readme_has_only_absolute_links_for_pypi(self) -> None:
+        # PyPI renders the README without the repository, so relative links and
+        # images break there; the README must point at GitHub instead.
+        body = "\n".join(_iter_non_fenced_lines((ROOT / "README.md").read_text(encoding="utf-8")))
+        self.assertEqual(LINK.findall(body), [])
+
+    def test_repository_urls_point_to_existing_files(self) -> None:
+        broken: list[str] = []
+        for md in _doc_markdown_files():
+            body = "\n".join(_iter_non_fenced_lines(md.read_text(encoding="utf-8")))
+            for target in REPO_FILE_URL.findall(body):
+                if not (ROOT / target).exists():
+                    broken.append(f"{md.relative_to(ROOT)}: {target}")
+        self.assertEqual(broken, [])
+
     def test_readme_mentions_install_name(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("pipx install seekr-search", readme)
@@ -97,8 +116,8 @@ class DocsLinkTests(unittest.TestCase):
         self.assertTrue((ROOT / "docs" / "benchmarks.md").is_file())
         for needle in (
             "docs/benchmarks.md",
-            "docs/img/demo.gif",
-            "docs/img/web.png",
+            "https://raw.githubusercontent.com/Swarsin/seekr/main/docs/img/demo.gif",
+            "https://raw.githubusercontent.com/Swarsin/seekr/main/docs/img/web.png",
             "claude mcp add seekr -- seekr mcp",
         ):
             self.assertIn(needle, readme)
