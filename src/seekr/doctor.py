@@ -1,10 +1,18 @@
-"""Environment diagnostics used by the ``seekr doctor`` command."""
+"""Environment and readiness diagnostics used by the ``seekr doctor`` command."""
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+from . import platform_info
+from .config import Config, ConfigError, default_config_path, load_config
+from .platform_info import Mount, is_slow_path
+from .provision import ModelAsset, assets_for, is_cached, missing_grammars
 
 VectorLoader = Callable[[sqlite3.Connection], None]
 
@@ -22,12 +30,13 @@ _HINT_NO_SQLITE_VEC = (
 
 @dataclass(frozen=True)
 class DoctorCheck:
-    """The result of one environment check."""
+    """The result of one environment or readiness check."""
 
     name: str
     ok: bool
     detail: str
     hint: str = ""
+    severity: Literal["error", "info"] = "error"
 
 
 @dataclass(frozen=True)
@@ -38,12 +47,17 @@ class DoctorReport:
 
     @property
     def ok(self) -> bool:
-        return all(check.ok for check in self.checks)
+        return all(check.ok for check in self.checks if check.severity == "error")
 
     def render(self) -> str:
         lines: list[str] = []
         for check in self.checks:
-            status = "ok" if check.ok else "FAIL"
+            if check.ok:
+                status = "ok"
+            elif check.severity == "info":
+                status = "info"
+            else:
+                status = "FAIL"
             lines.append(f"[{status}] {check.name}: {check.detail}")
             if not check.ok and check.hint:
                 lines.append(f"       hint: {check.hint}")
@@ -52,6 +66,31 @@ class DoctorReport:
         else:
             lines.append("doctor: one or more checks failed")
         return "\n".join(lines)
+
+
+def _default_daemon_state() -> str:
+    from .daemon import _socket_is_active, socket_path, socket_path_problem
+
+    sock = socket_path()
+    problem = socket_path_problem(sock)
+    if problem is not None:
+        return f"unavailable ({problem})"
+    try:
+        active = _socket_is_active(sock)
+    except OSError:
+        return f"stopped ({sock})"
+    return f"running ({sock})" if active else f"stopped ({sock})"
+
+
+@dataclass
+class DoctorProbes:
+    """Offline probes injected into :func:`run_doctor`."""
+
+    model_cached: Callable[[ModelAsset], bool] = is_cached
+    grammars_missing: Callable[[], list[str]] = missing_grammars
+    mounts: Callable[[], list[Mount]] = platform_info.read_mounts
+    is_wsl: Callable[[], bool] = platform_info.is_wsl
+    daemon_state: Callable[[], str] = _default_daemon_state
 
 
 def _memory_connection() -> sqlite3.Connection:
@@ -116,22 +155,21 @@ def _check_sqlite_vec(conn: sqlite3.Connection, loader: VectorLoader) -> DoctorC
     return DoctorCheck("sqlite-vec", True, f"loaded and probed (vec_version {version})")
 
 
-def run_doctor(
-    *,
-    connect: Callable[[], sqlite3.Connection] = _memory_connection,
-    vector_loader: VectorLoader | None = None,
-) -> DoctorReport:
-    """Run every environment check and return a report instead of raising."""
+def _sqlite_checks(
+    connect: Callable[[], sqlite3.Connection],
+    vector_loader: VectorLoader | None,
+) -> list[DoctorCheck]:
     try:
         conn = connect()
     except sqlite3.Error as exc:
-        check = DoctorCheck(
-            "SQLite",
-            False,
-            f"could not open an in-memory database: {exc}",
-            "check this Python's sqlite3 module and SQLite build",
-        )
-        return DoctorReport((check,))
+        return [
+            DoctorCheck(
+                "SQLite",
+                False,
+                f"could not open an in-memory database: {exc}",
+                "check this Python's sqlite3 module and SQLite build",
+            )
+        ]
 
     checks: list[DoctorCheck] = []
     try:
@@ -177,7 +215,220 @@ def run_doctor(
                 )
     finally:
         conn.close()
+    return checks
 
+
+def _check_config(cfg: Config | None) -> tuple[DoctorCheck, Config | None]:
+    if cfg is not None:
+        return (
+            DoctorCheck(
+                "config",
+                True,
+                f"loaded ({len(cfg.roots)} root(s))",
+                severity="error",
+            ),
+            cfg,
+        )
+
+    config_path = default_config_path()
+    try:
+        loaded = load_config()
+    except ConfigError as exc:
+        return (
+            DoctorCheck(
+                "config",
+                False,
+                str(exc),
+                f"fix or remove {config_path}",
+                severity="error",
+            ),
+            None,
+        )
+    detail = (
+        f"loaded {config_path}"
+        if config_path.is_file()
+        else f"using defaults ({config_path} not present)"
+    )
+    return DoctorCheck("config", True, detail, severity="error"), loaded
+
+
+def _check_roots(cfg: Config | None) -> DoctorCheck:
+    if cfg is None:
+        return DoctorCheck(
+            "roots",
+            False,
+            "not checked because config could not be loaded",
+            "fix configuration errors and re-run `seekr doctor`",
+            severity="error",
+        )
+    if not cfg.roots:
+        return DoctorCheck(
+            "roots",
+            True,
+            "none configured (add `roots = [...]` to config.toml or pass paths to `seekr index`)",
+            severity="error",
+        )
+    problems: list[str] = []
+    for raw_root in cfg.roots:
+        root = Path(raw_root).expanduser()
+        if not root.exists():
+            problems.append(f"{root} (missing)")
+            continue
+        if not root.is_dir():
+            problems.append(f"{root} (not a directory)")
+            continue
+        try:
+            with os.scandir(root):
+                pass
+        except OSError as exc:
+            problems.append(f"{root} (not readable: {exc})")
+    if problems:
+        return DoctorCheck(
+            "roots",
+            False,
+            "; ".join(problems),
+            "update `roots` in config.toml or check directory permissions",
+            severity="error",
+        )
+    unit = "directory" if len(cfg.roots) == 1 else "directories"
+    return DoctorCheck("roots", True, f"{len(cfg.roots)} readable {unit}", severity="error")
+
+
+def _check_models(cfg: Config | None, probes: DoctorProbes) -> list[DoctorCheck]:
+    if cfg is None:
+        return [
+            DoctorCheck(
+                "embedding model",
+                False,
+                "not checked because config could not be loaded",
+                "seekr models pull",
+                severity="error",
+            ),
+            DoctorCheck(
+                "reranker model",
+                False,
+                "not checked because config could not be loaded",
+                "seekr models pull --rerank",
+                severity="info",
+            ),
+        ]
+
+    checks: list[DoctorCheck] = []
+    for asset in assets_for(cfg, rerank=True):
+        cached = probes.model_cached(asset)
+        if asset.purpose == "embedding":
+            checks.append(
+                DoctorCheck(
+                    "embedding model",
+                    cached,
+                    f"{asset.repo_id} ({'cached' if cached else 'not cached'})",
+                    "" if cached else "seekr models pull",
+                    severity="error",
+                )
+            )
+        else:
+            checks.append(
+                DoctorCheck(
+                    "reranker model",
+                    cached,
+                    f"{asset.repo_id} ({'cached' if cached else 'not cached; optional'})",
+                    "" if cached else "seekr models pull --rerank",
+                    severity="info",
+                )
+            )
+    return checks
+
+
+def _check_grammars(probes: DoctorProbes) -> DoctorCheck:
+    missing = probes.grammars_missing()
+    if not missing:
+        return DoctorCheck(
+            "code grammars",
+            True,
+            "all supported AST grammars installed",
+            severity="info",
+        )
+    return DoctorCheck(
+        "code grammars",
+        False,
+        f"missing: {', '.join(missing)}",
+        "seekr models pull --grammars",
+        severity="info",
+    )
+
+
+def _check_wsl_roots(cfg: Config | None, probes: DoctorProbes) -> DoctorCheck | None:
+    if not probes.is_wsl():
+        return None
+    if cfg is None or not cfg.roots:
+        return DoctorCheck(
+            "windows drive roots",
+            True,
+            "none configured",
+            severity="info",
+        )
+
+    mounts = probes.mounts()
+    polled: list[str] = []
+    for raw_root in cfg.roots:
+        expanded = Path(raw_root).expanduser()
+        try:
+            resolved = expanded.resolve(strict=False)
+        except (OSError, RuntimeError):
+            resolved = expanded
+        if is_slow_path(resolved, mounts) or is_slow_path(expanded, mounts):
+            polled.append(str(expanded))
+
+    if not polled:
+        return DoctorCheck(
+            "windows drive roots",
+            True,
+            "none (all configured roots use native Linux filesystems)",
+            severity="info",
+        )
+    return DoctorCheck(
+        "windows drive roots",
+        False,
+        f"polled every {cfg.poll_interval_seconds}s: {', '.join(polled)}",
+        severity="info",
+    )
+
+
+def _check_daemon(probes: DoctorProbes) -> DoctorCheck:
+    state = probes.daemon_state()
+    running = state.strip().lower().startswith("running")
+    return DoctorCheck(
+        "daemon",
+        running,
+        state,
+        "" if running else "run `seekr daemon` for warm search and live indexing",
+        severity="info",
+    )
+
+
+def run_doctor(
+    *,
+    connect: Callable[[], sqlite3.Connection] = _memory_connection,
+    vector_loader: VectorLoader | None = None,
+    cfg: Config | None = None,
+    probes: DoctorProbes | None = None,
+    env_only: bool = False,
+) -> DoctorReport:
+    """Run environment and readiness checks and return a report instead of raising."""
+    checks: list[DoctorCheck] = _sqlite_checks(connect, vector_loader)
+    if env_only:
+        return DoctorReport(tuple(checks))
+
+    active_probes = probes if probes is not None else DoctorProbes()
+    config_check, loaded_cfg = _check_config(cfg)
+    checks.append(config_check)
+    checks.append(_check_roots(loaded_cfg))
+    checks.extend(_check_models(loaded_cfg, active_probes))
+    checks.append(_check_grammars(active_probes))
+    wsl_check = _check_wsl_roots(loaded_cfg, active_probes)
+    if wsl_check is not None:
+        checks.append(wsl_check)
+    checks.append(_check_daemon(active_probes))
     return DoctorReport(tuple(checks))
 
 

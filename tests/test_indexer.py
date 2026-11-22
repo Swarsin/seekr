@@ -995,8 +995,7 @@ class GrammarSummaryTests(_IndexerTestCase):
         expected_message = (
             "6 code file(s) used 60-line windows because tree-sitter grammars "
             "are not installed (javascript: 1, python: 5); install them with: "
-            "python -c \"from tree_sitter_language_pack import download; "
-            "download(['javascript', 'python'])\""
+            "seekr models pull --grammars"
         )
         self.assertEqual(
             report.warnings,
@@ -1082,8 +1081,7 @@ class GrammarSummaryTests(_IndexerTestCase):
             message,
             "16 code file(s) used 60-line windows because tree-sitter grammars are not "
             "installed (go: 4, python: 10, rust: 2); install them with: "
-            "python -c \"from tree_sitter_language_pack import download; "
-            "download(['go', 'python', 'rust'])\"",
+            "seekr models pull --grammars",
         )
 
     def test_single_file_root_records_one_grammar_summary(self) -> None:

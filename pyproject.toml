@@ -40,6 +40,7 @@ dependencies = [
     # assumed to accept local_files_only/trust_remote_code (src/seekr/offline.py)
     # from sentence-transformers 3.0 onward; this is an assumption, not a pin.
     "sentence-transformers>=3.0",
+    "huggingface_hub>=0.23",
     "sqlite-vec>=0.1",
     "pymupdf>=1.23",
     "watchdog>=3.0",

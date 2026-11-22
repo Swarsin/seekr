@@ -84,11 +84,10 @@ def grammar_summary_message(counts: dict[str, int]) -> str:
     langs = sorted(lang for lang, count in counts.items() if count > 0)
     total = sum(counts[lang] for lang in langs)
     breakdown = ", ".join(f"{lang}: {counts[lang]}" for lang in langs)
-    quoted = ", ".join(f"'{lang}'" for lang in langs)
     return (
         f"{total} code file(s) used 60-line windows because tree-sitter grammars are "
         f"not installed ({breakdown}); install them with: "
-        f'python -c "from tree_sitter_language_pack import download; download([{quoted}])"'
+        "seekr models pull --grammars"
     )
 
 

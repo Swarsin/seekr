@@ -108,7 +108,7 @@ class DoctorReportTests(unittest.TestCase):
         def stub_loader(conn: sqlite3.Connection) -> None:
             conn.create_function("vec_version", 0, lambda: "test-vec")
 
-        report = run_doctor(vector_loader=stub_loader)
+        report = run_doctor(vector_loader=stub_loader, env_only=True)
         output = report.render()
 
         self.assertTrue(report.ok, output)
@@ -150,7 +150,7 @@ class DoctorReportTests(unittest.TestCase):
         def stub_loader(target: Any) -> None:
             target.events.append("load")
 
-        report = run_doctor(connect=lambda: conn, vector_loader=stub_loader)
+        report = run_doctor(connect=lambda: conn, vector_loader=stub_loader, env_only=True)
 
         self.assertTrue(report.ok, report.render())
         self.assertEqual(
@@ -190,7 +190,7 @@ class CliTests(unittest.TestCase):
     def test_doctor_passes_here(self) -> None:
         from seekr.cli import app
 
-        result = self._runner().invoke(app, ["doctor"])
+        result = self._runner().invoke(app, ["doctor", "--env-only"])
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("FTS5", result.output)

@@ -21,6 +21,7 @@ COMMAND_MODULES = (
     "cli_daemon",
     "cli_eval",
     "cli_index",
+    "cli_models",
     "cli_open",
     "cli_search",
     "cli_web",
@@ -72,7 +73,7 @@ class CliRegistrationSourceTests(unittest.TestCase):
         source = CLI_PATH.read_text(encoding="utf-8")
 
         self.assertIn("--version", source)
-        self.assertIn("def doctor()", source)
+        self.assertIn("def doctor(", source)
 
 
 @unittest.skipUnless(_HAS_TYPER, "typer is not installed")
@@ -93,18 +94,36 @@ class CliRegistrationTests(unittest.TestCase):
         output = strip_ansi(result.output)
 
         self.assertEqual(result.exit_code, 0, result.output)
-        for command in ("doctor", *MODULE_COMMANDS):
+        for command in ("doctor", "models", *MODULE_COMMANDS):
             self.assertIn(command, output)
 
     def test_all_module_command_names_are_on_the_app(self) -> None:
         from seekr.cli import app
 
         names = {info.name for info in app.registered_commands if info.name}
+        groups = {info.name for info in app.registered_groups if info.name}
 
         self.assertTrue(
             set(MODULE_COMMANDS) <= names,
             f"missing commands: {sorted(set(MODULE_COMMANDS) - names)}",
         )
+        self.assertIn("models", groups)
+
+    def test_models_subcommands_have_help(self) -> None:
+        models_help = self._invoke(["models", "--help"])
+        self.assertEqual(models_help.exit_code, 0, models_help.output)
+        models_output = strip_ansi(models_help.output)
+        self.assertIn("pull", models_output)
+        self.assertIn("status", models_output)
+
+        pull_help = self._invoke(["models", "pull", "--help"])
+        self.assertEqual(pull_help.exit_code, 0, pull_help.output)
+        pull_output = strip_ansi(pull_help.output)
+        for option in ("--rerank", "--grammars", "--all", "--yes"):
+            self.assertIn(option, pull_output)
+
+        status_help = self._invoke(["models", "status", "--help"])
+        self.assertEqual(status_help.exit_code, 0, status_help.output)
 
     def test_version_still_works(self) -> None:
         from seekr import __version__

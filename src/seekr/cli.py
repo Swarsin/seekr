@@ -9,6 +9,7 @@ from . import (
     cli_daemon,
     cli_eval,
     cli_index,
+    cli_models,
     cli_open,
     cli_search,
     cli_web,
@@ -51,11 +52,17 @@ _SUPPORTED_SHELLS = frozenset({"bash", "zsh", "fish"})
 
 
 @app.command()
-def doctor() -> None:
-    """Check that SQLite, FTS5 and sqlite-vec are available."""
+def doctor(
+    env_only: bool = typer.Option(
+        False,
+        "--env-only",
+        help="Only check SQLite, FTS5 and sqlite-vec without checking config, roots or models.",
+    ),
+) -> None:
+    """Check that SQLite, FTS5, sqlite-vec, config, roots and models are ready."""
     from .doctor import run_doctor
 
-    report = run_doctor()
+    report = run_doctor(env_only=env_only)
     typer.echo(report.render())
     if not report.ok:
         raise typer.Exit(code=1)
@@ -95,6 +102,7 @@ def completion(
 cli_daemon.register(app)
 cli_eval.register(app)
 cli_index.register(app)
+cli_models.register(app)
 cli_open.register(app)
 cli_search.register(app)
 cli_web.register(app)
