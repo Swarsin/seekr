@@ -24,8 +24,9 @@ dist/
 *.db-wal
 *.db-shm
 
-# Downloaded evaluation data
+# Downloaded and personal evaluation data
 eval/data/
+eval/personal/
 
 # Environment and editor noise
 .env

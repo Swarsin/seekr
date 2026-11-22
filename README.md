@@ -1,6 +1,6 @@
 # seekr
 
-Private, offline hybrid keyword and semantic search for your notes, PDFs, code, and lecture transcripts — stored in a single SQLite file on your machine.
+Private, offline hybrid keyword and semantic search for your notes, PDFs, Word documents, slides, Jupyter notebooks, code, and lecture transcripts — stored in a single SQLite file on your machine.
 
 [![CI](https://github.com/Swarsin/seekr/actions/workflows/ci.yml/badge.svg)](https://github.com/Swarsin/seekr/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/seekr-search?logo=pypi&logoColor=white)](https://pypi.org/project/seekr-search/)
@@ -11,27 +11,22 @@ Private, offline hybrid keyword and semantic search for your notes, PDFs, code, 
 
 ## Quickstart
 
-Requires Python 3.11+ on Linux with SQLite loadable extension support. Note that the PyPI distribution name is `seekr-search`, while the command, Python import name, and config/data directories stay `seekr`.
+Requires Python 3.11+ on Linux or WSL2 with SQLite loadable extension support. Note that the PyPI distribution name is `seekr-search`, while the command, Python import name, and config/data directories stay `seekr`.
 
 ```bash
-# 1. Install the CLI and runtime dependencies
 pipx install seekr-search
-
-# 2. One-time model cache (seekr itself never downloads models implicitly)
-~/.local/pipx/venvs/seekr-search/bin/python -c 'from sentence_transformers import SentenceTransformer; SentenceTransformer("BAAI/bge-small-en-v1.5")'
-
-# 3. Index a folder and search immediately
-seekr index ~/notes && seekr search "how do I checkpoint a WAL database?"
+seekr init ~/Documents/ai-course
+seekr search "bias variance tradeoff" --module machine-learning
 ```
 
-Run `seekr doctor` to verify SQLite FTS5/`sqlite-vec` support, add persistent folders in `~/.config/seekr/config.toml` (`roots = ["~/notes"]`), or cache `cross-encoder/ms-marco-MiniLM-L-6-v2` if you want optional `--rerank` scoring.
+`seekr init` writes `~/.config/seekr/config.toml`, explicitly prompts to download `BAAI/bge-small-en-v1.5` and tree-sitter code grammars (via `seekr models pull`), and builds your initial index. Want to try it before pointing at your own folders? Run `seekr init --demo` to copy and index the packaged sample course, or use `seekr models pull --rerank` / `--all`, `seekr models status`, and `seekr doctor` to inspect local readiness.
 
 ## What it does
 
-- **CLI (`seekr`)** — index directories incrementally (`seekr index`, `seekr reindex`, `seekr status`), run hybrid/keyword/vector queries with `--kind`, `--since`, `--path`, `--rerank`, `--json`, and `--explain`, find related files (`seekr similar`), open hits interactively (`seekr pick`, `seekr open`), and generate shell completions (`seekr completion bash|zsh|fish`).
-- **Web UI (`seekr web`)** — local-only browser workspace (`http://127.0.0.1:8000`) for adding folders, checking local model readiness, triggering incremental index scans, and searching with filters and one-click location copying. See [`docs/web.md`](https://github.com/Swarsin/seekr/blob/main/docs/web.md) and [`docs/web-api.md`](https://github.com/Swarsin/seekr/blob/main/docs/web-api.md).
-- **Daemon (`seekr daemon`)** — keeps the embedding model warm in memory, answers CLI/web queries over `$XDG_RUNTIME_DIR/seekr.sock` (falling back automatically to local search when stopped), and watches configured roots for file changes; includes [`contrib/seekr.service`](https://github.com/Swarsin/seekr/blob/main/contrib/seekr.service) (systemd user unit) and [`contrib/seekr-popup.sh`](https://github.com/Swarsin/seekr/blob/main/contrib/seekr-popup.sh) (Hyprland/rofi launcher).
-- **MCP (`seekr mcp`)** — newline-delimited JSON-RPC 2.0 stdio server exposing `search` and `similar` tools for coding agents with zero implicit network calls and stderr-only diagnostics.
+- **CLI (`seekr`)** — one-command setup (`seekr init`, `seekr init --demo`), explicit offline asset provisioning (`seekr models pull`, `seekr models status`), incremental indexing (`seekr index`, `seekr reindex`, `seekr status`), hybrid/keyword/vector queries with `--module`, `--week`, `--kind`, `--since`, `--path`, `--rerank`, `--spread` (cross-module/week appearance summary), `--json`, `--explain`, and stemmed term highlights, related-file lookup (`seekr similar`), interactive opening (`seekr pick`, `seekr open` with Windows app launch via `wslview` / `explorer.exe` under WSL), and shell completions (`seekr completion bash|zsh|fish`).
+- **Web UI (`seekr web`)** — local-only browser workspace (`http://127.0.0.1:8000`) with first-run setup and one-click model download, folder add/remove management, **Module** / **Week** / file-type / date filters, **Appears in** cross-course spread chips, highlighted snippets, inline passage and PDF page preview, and one-click file opening or location copying (with WSL Windows/POSIX path toggle). See [`docs/web.md`](https://github.com/Swarsin/seekr/blob/main/docs/web.md) and [`docs/web-api.md`](https://github.com/Swarsin/seekr/blob/main/docs/web-api.md).
+- **Daemon (`seekr daemon`)** — keeps the embedding model warm in memory, answers CLI/web queries over `$XDG_RUNTIME_DIR/seekr.sock` (falling back automatically to local search when stopped), and watches configured roots for file changes—automatically switching to polling (`poll_interval_seconds`, default `15`s) on Windows drives (`9p`/`drvfs`) and network mounts (`cifs`, `smb3`, `nfs`, `fuse.sshfs`); includes [`contrib/seekr.service`](https://github.com/Swarsin/seekr/blob/main/contrib/seekr.service) (systemd user unit) and [`contrib/seekr-popup.sh`](https://github.com/Swarsin/seekr/blob/main/contrib/seekr-popup.sh) (Hyprland/rofi launcher).
+- **MCP (`seekr mcp`)** — newline-delimited JSON-RPC 2.0 stdio server exposing `search` and `similar` tools (including `module`, `week`, and `spread` support) for coding agents with zero implicit network calls and stderr-only diagnostics.
 
 ![seekr web UI](https://raw.githubusercontent.com/Swarsin/seekr/main/docs/img/web.png)
 
@@ -56,44 +51,47 @@ Or add the stdio MCP server block to Claude Desktop, Cursor, or any MCP host con
 }
 ```
 
-If `seekr` is installed inside a dedicated virtualenv (such as `pipx`), set `"command"` to `~/.local/bin/seekr` or that environment's `seekr` binary. The server exposes `search` (`query`, `k`, `mode`, `per_file`, `rerank`, `path`, `kind`, `since`, `explain`) and `similar` (`path`, `k`, `per_file`, `path_prefix`, `kind`, `since`).
+If `seekr` is installed inside a dedicated virtualenv (such as `pipx`), set `"command"` to `~/.local/bin/seekr` or that environment's `seekr` binary. The server exposes `search` (`query`, `k`, `mode`, `per_file`, `rerank`, `path`, `kind`, `since`, `module`, `week`, `explain`, `spread`) and `similar` (`path`, `k`, `per_file`, `path_prefix`, `kind`, `since`, `module`, `week`).
 
 ## How it works
 
 ```text
-PDF / Markdown / text / code / transcripts (UTF-8, UTF-8/UTF-16 BOM, latin-1 fallback)
+PDF / Markdown / Word (.docx) / PowerPoint (.pptx) / Jupyter (.ipynb) /
+code / transcripts / text (UTF-8, UTF-8/UTF-16 BOM, latin-1 fallback)
                   │
                   ▼
-        extract text units + locators
+        extract text units + locators + module/week labels
                   │
                   ▼
   chunk: word windows (300/450/50), heading sections,
-  tree-sitter AST chunks, transcript cues
+  tree-sitter AST chunks, transcript cues, slide/cell blocks
                   │
                   ▼
   batched embed locally (BAAI/bge-small-en-v1.5, 384-d L2-normalised,
   int8 quantized by default in sqlite-vec)
                   │
                   ▼
-        one SQLite WAL index (schema v2)
-        ├── documents (indexed on kind, mtime_ns) + chunks + meta
+        one SQLite WAL index (schema v3)
+        ├── documents (indexed on kind/mtime_ns and module/week) + chunks + meta
         ├── chunks_fts (external-content FTS5, porter unicode61)
         └── chunks_vec (sqlite-vec vec0 KNN + scalar filters)
                   ▲
                   │
 query ──► BGE query prefix + embed locally
-          ├──► FTS5 BM25 (path/kind/since SQL filters) ──┐
-          └──► vec0 KNN or filtered scalar L2 search ────┴──► RRF (k=60)
-                                                                 │
-                                                                 ▼
-                                                      optional cross-encoder rerank
-                                                                 │
-                                                                 ▼
-                                         CLI (text / --json / --explain),
-                                         warm Unix daemon, or `seekr mcp`
+          ├──► FTS5 BM25 (path/kind/since/module/week SQL filters) ──┐
+          └──► vec0 KNN or filtered scalar L2 search ────────────────┴──► RRF (k=60)
+                                                                               │
+                                                                               ▼
+                                                                    optional cross-encoder rerank
+                                                                               │
+                                                                               ▼
+                                                        stemmed highlights + optional --spread
+                                                                               │
+                                                                               ▼
+                                                     CLI, web preview, warm Unix daemon, or `seekr mcp`
 ```
 
-Indexing runs in batches (up to 64 files / 128 chunks per transaction) and keys each chunk by the SHA-256 of its normalised text, so unchanged passages reuse stored vectors across edits and renames. Configuration lives at `$XDG_CONFIG_HOME/seekr/config.toml` (`roots`, `db_path`, `ignore_globs`, `embed_model`, `rerank_model`, `vector_quant`), and `schema_version = 2` migrates legacy `float32` databases inside an atomic transaction. Once models are cached locally, `seekr.offline` sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, passes `local_files_only=True`, disables telemetry, and rejects `trust_remote_code`; network access is strictly limited to explicit BEIR dataset converters in `eval/beir_*.py` unless invoked with `--no-download`.
+Indexing runs in batches (up to 64 files / 128 chunks per transaction) and keys each chunk by the SHA-256 of its normalised text, so unchanged passages reuse stored vectors across edits and renames. Configuration lives at `$XDG_CONFIG_HOME/seekr/config.toml` (`roots`, `db_path`, `ignore_globs`, `embed_model`, `rerank_model`, `vector_quant`, `course_structure`, `week_pattern`, `poll_interval_seconds`), and `schema_version = 3` migrates older v1/v2 and `float32` databases inside an atomic transaction. Once models are cached locally, `seekr.offline` sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, passes `local_files_only=True`, disables telemetry, and rejects `trust_remote_code`; network access happens only during explicit `seekr models pull` (or the setup download button) and BEIR dataset converters in `eval/beir_*.py` unless `--no-download` is passed.
 
 ## Benchmarks
 
@@ -101,15 +99,16 @@ Indexing runs in batches (up to 64 files / 128 chunks per transaction) and keys 
 - Default `int8` quantization halves index DB size (`22.35 MiB` vs `44.88 MiB` at 20k chunks) with negligible quality change (`-0.06` pts macro-avg on SciFact+NFCorpus).
 - Warm hybrid search runs at ~`11 ms` p95 (`11.39 ms` at 20k chunks, excluding query embedding).
 
-See [`docs/benchmarks.md`](https://github.com/Swarsin/seekr/blob/main/docs/benchmarks.md) for full BEIR tables, single-variable ablations, latency/throughput numbers, 100k-chunk scale results, and design notes, and [`docs/eval.md`](https://github.com/Swarsin/seekr/blob/main/docs/eval.md) to evaluate your own corpus.
+See [`docs/benchmarks.md`](https://github.com/Swarsin/seekr/blob/main/docs/benchmarks.md) for full BEIR tables, single-variable ablations, latency/throughput numbers, 100k-chunk scale results, Windows-drive (`9p`/DrvFS) sync timings, and design notes, and [`docs/eval.md`](https://github.com/Swarsin/seekr/blob/main/docs/eval.md) to evaluate your own corpus.
 
 ## Limitations
 
 - No OCR for scanned image PDFs (extracts embedded text only).
-- Linux only (`AF_UNIX`, `SO_PEERCRED`, and `fcntl.flock` lifecycle locks); Windows and macOS are not supported.
+- Linux and WSL2 only (`AF_UNIX`, `SO_PEERCRED`, and `fcntl.flock` lifecycle locks); native Windows and macOS are not supported.
+- Legacy binary Office files (`.doc`, `.ppt`) are skipped with a warning; convert them to `.docx` or `.pptx` to index them.
 - No LLM answer generation — seekr retrieves and locates source passages rather than synthesizing prose answers.
 - `OR`-joined multi-term FTS5 queries scan long posting lists on large conversational corpora (e.g., FiQA `keyword p50 = 72.13 ms`).
-- Filtered vector queries (`--path`, `--kind`, `--since`, `seekr similar`) use sqlite-vec's exact `vec_distance_L2` scalar scan so filters apply before top-k selection, scaling linearly with matching chunk count.
+- Filtered vector queries (`--path`, `--kind`, `--since`, `--module`, `--week`, `seekr similar`) use sqlite-vec's exact `vec_distance_L2` scalar scan so filters apply before top-k selection, scaling linearly with matching chunk count.
 - Transcript locators format timestamps in `open` links as labels without seeking external media players.
 
 ## Development

@@ -77,6 +77,22 @@ Query embedding latency (`BAAI/bge-small-en-v1.5`, CUDA, 50 warm queries) measur
 
 **100,000-chunk scale test (`tests/test_scale_100k.py`, `@pytest.mark.slow`, `int8`):** `2,500` documents × `40` chunks (`100,000` chunks) populated in `9.11 s` (`10,977 chunks/sec`), producing a `110.45 MiB` database with warm query latencies `keyword 4.35 / 5.00 ms`, `vector 41.39 / 42.55 ms`, and `hybrid 44.37 / 46.38 ms` (p50 / p95 over 30 queries).
 
+## Windows-drive sync overhead under WSL2 (`bench/drvfs_sync.py`)
+
+Measured with `bench/drvfs_sync.py` across `20` copies of the packaged demo course (`500` indexed files, `1,500` chunks, `20` skipped `queries.jsonl` files) using `FakeEmbedder(dim=64)` and an isolated SQLite database under Linux `/tmp` (matching real WSL setups where `index.db` stays in `~/.local/share/seekr` even when course folders live on `/mnt/c`):
+
+```bash
+python bench/drvfs_sync.py --target /mnt/c/Users/<you>/seekr-bench --copies 20
+python bench/drvfs_sync.py --target /tmp/seekr-bench --copies 20
+```
+
+| Target | Filesystem (`mount_for`) | Copies | Indexed files | Chunks | Initial sync | No-op re-sync |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `/mnt/c/Users/<you>/seekr-bench` | `9p` (Windows drive / DrvFS) | 20 | 500 | 1,500 | 22.1450 s | 4.2414 s |
+| `/tmp/seekr-bench` | `tmpfs` (Linux `/tmp`) | 20 | 500 | 1,500 | 1.0075 s | 0.0174 s |
+
+Using `FakeEmbedder(dim=64)` isolates filesystem walk/stat/extract overhead from neural model inference. Cross-OS `9p`/DrvFS metadata and read calls make initial extraction ~`22x` slower and no-op `stat` re-syncs ~`244x` slower than Linux `/tmp`, while keeping `index.db` on the Linux filesystem keeps no-op re-syncs for `500` files under `5 s`. Because `inotify` events do not propagate reliably across `/mnt/c`, `seekr daemon` automatically selects polling (`PollingObserver`, default `poll_interval_seconds = 15`) for paths on `9p`, `drvfs`, and network mounts.
+
 ## Design Decisions & What Did Not Work
 
 ### What works well

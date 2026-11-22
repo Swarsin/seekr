@@ -88,6 +88,47 @@ The example contains no precomputed results. Only commit measured results
 produced by a real run on a stated corpus, and keep the command and model
 names with them.
 
+## Your own course
+
+To evaluate retrieval across your own course folders, organise notes, slides,
+notebooks, and code under a `<module>/weekN/` hierarchy, for example:
+
+```text
+~/Documents/ai-course/
+├── machine-learning/
+│   ├── week1/
+│   └── week2/
+├── data-structures/
+│   ├── week1/
+│   └── week2/
+└── 4CCS1LGC-logic/
+    └── week1/
+```
+
+Write your private query set in `eval/personal/queries.jsonl` (git-ignored so
+personal course paths and queries never leave your machine), covering queries
+across multiple modules and file formats (`.md`, `.pdf`, `.docx`, `.pptx`,
+`.ipynb`, and code):
+
+```json
+{"id": "ml-01", "query": "bias variance tradeoff", "relevant": ["machine-learning/week2/bias-variance-tradeoff.md"]}
+{"id": "ds-01", "query": "Dijkstra shortest paths", "relevant": ["data-structures/week3/shortest-paths.pptx"]}
+```
+
+Then run `seekr eval` against your course root and save the private report under
+`eval/personal/results.md`:
+
+```bash
+seekr eval \
+  --root <course> \
+  --queries eval/personal/queries.jsonl \
+  --out eval/personal/results.md
+```
+
+For example, pass `~/Documents/ai-course` as `<course>` when your files live
+there. For a ready-made reference set, inspect the packaged demo course's query
+file (`src/seekr/demo_course/queries.jsonl`).
+
 ## BEIR SciFact
 
 `eval/beir_scifact.py` converts the public BEIR SciFact dataset into the same

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- One-command setup via `seekr init` (with `--demo`, `--yes`, `--no-download`, and `--force`) that scans folders, writes `config.toml`, downloads models and code grammars explicitly, and builds the initial index.
+- Explicit offline provisioning CLI (`seekr models pull` with `--rerank`, `--grammars`, `--all`, `--yes`; `seekr models status`) and expanded `seekr doctor` checks for cached models, code grammars, WSL status, slow mounts, and daemon readiness.
+- Extraction and chunking support for Word documents (`.docx`), PowerPoint slides (`.pptx`), and Jupyter notebooks (`.ipynb`), with warnings for legacy `.doc`/`.ppt` binary files.
+- Automatic module and week labeling derived from course folder hierarchies (`course_structure` and `week_pattern` in `config.toml`), with `--module` and `--week` filtering across the CLI, daemon, MCP tools, and web interface.
+- Cross-course topic spread summaries (`--spread` on `seekr search`, `spread` on MCP `search`, and **Appears in** chips in the web UI) plus word-aligned snippets with stemmed query highlights.
+- Web UI course endpoints (`/api/course`), inline passage and PDF page preview (`/api/preview`, `/api/preview/page`), native/WSL file opening (`/api/open`), folder removal (`/api/roots/remove`), and one-click setup model download (`/api/models/pull`, `/api/models/pull/status`).
+- WSL2 support: automatic polling (`PollingObserver`, configurable via `poll_interval_seconds`) on `9p`, `drvfs`, and network mounts, Windows path/location formatting, and launching results in Windows apps via `wslview` or `explorer.exe`.
+- Personal course evaluation guidance in `docs/eval.md` (with `eval/personal/` git-ignored), real-model demo course evaluation test (`tests/test_demo_eval_slow.py`), and Windows-drive sync benchmark (`bench/drvfs_sync.py`) recorded in `docs/benchmarks.md`.
+
+### Changed
+- Upgraded SQLite index schema to `schema_version = 3` (with automatic transactional migration from v1/v2) to store and index `module` and `week` document metadata.
+- Updated `README.md` quickstart to use `seekr init`, refreshed feature/architecture docs, and re-recorded `docs/img/demo.gif`.
+
+### Fixed
+- Handled `python-docx` XML schema validation errors cleanly as `ExtractionError` instead of crashing indexing.
+- Checked `tree-sitter-language-pack` `downloaded_languages` when `LanguageRegistry` lacks a preloaded parser so downloaded grammars are recognized offline.
+- Validated `remove_root` paths strictly and propagated `SEEKR_CONFIG` to background web model-download subprocesses.
+
 ## [0.1.1] - 2026-11-22
 
 ### Added
