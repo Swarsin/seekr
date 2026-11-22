@@ -13,6 +13,7 @@ import dataclasses
 import json
 import logging
 import sqlite3
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
@@ -632,6 +633,7 @@ def _hit_to_json_dict(hit: Hit) -> dict[str, Any]:
     data = dataclasses.asdict(hit)
     if data.get("explain") is None:
         data.pop("explain", None)
+    data["highlights"] = [[int(a), int(b)] for a, b in hit.highlights]
     return data
 
 
@@ -662,6 +664,25 @@ def _hit_label_prefix(hit: Hit) -> str:
     return f"{' · '.join(parts)} · " if parts else ""
 
 
+def _format_snippet(typer_module: Any, hit: Hit) -> str:
+    snippet = hit.snippet
+    if not hit.highlights or not getattr(sys.stdout, "isatty", lambda: False)():
+        return snippet
+    parts: list[str] = []
+    cursor = 0
+    length = len(snippet)
+    for start, end in sorted(hit.highlights):
+        if start < cursor or start >= end or end > length:
+            continue
+        if start > cursor:
+            parts.append(snippet[cursor:start])
+        parts.append(typer_module.style(snippet[start:end], bold=True))
+        cursor = end
+    if cursor < length:
+        parts.append(snippet[cursor:])
+    return "".join(parts)
+
+
 def _echo_hits(
     typer_module: Any,
     hits: list[Hit],
@@ -683,7 +704,7 @@ def _echo_hits(
         typer_module.echo(f"{label}{hit.path}  ({hit.locator})  {hit.score:.4f}")
         if explain and hit.explain is not None:
             typer_module.echo(_format_explain_line(hit.explain))
-        typer_module.echo(hit.snippet)
+        typer_module.echo(_format_snippet(typer_module, hit))
         typer_module.echo()
 
 

@@ -535,6 +535,7 @@ def test_novice_flow_over_http_with_real_service(tmp_path: Path) -> None:
                     "kind",
                     "module",
                     "week",
+                    "highlights",
                 }
                 assert Path(hit["path"]).resolve() in (
                     docs / "notes.md",
@@ -568,6 +569,7 @@ def test_novice_flow_over_http_with_real_service(tmp_path: Path) -> None:
                 kind=hit.kind,
                 module=hit.module,
                 week=hit.week,
+                highlights=hit.highlights,
             ).to_dict()
             for hit in expected
         ]
@@ -1295,6 +1297,9 @@ def test_keyword_and_lane_conflicts_during_real_paused_index_over_http(
                 snippet=hit.snippet,
                 score=hit.score,
                 kind=hit.kind,
+                module=hit.module,
+                week=hit.week,
+                highlights=hit.highlights,
             ).to_dict()
             for hit in expected
         ]

@@ -51,6 +51,7 @@ class Hit:
     explain: HitExplain | None = None
     module: str | None = None
     week: int | None = None
+    highlights: tuple[tuple[int, int], ...] = ()
 
 
 def text_sha(text: str) -> str:

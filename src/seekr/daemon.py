@@ -272,15 +272,15 @@ def _ensure_reranker(
 def _hit_to_dict(hit: object) -> dict[str, Any]:
     if isinstance(hit, Hit) or dataclasses.is_dataclass(hit):
         data = dataclasses.asdict(hit)  # type: ignore[arg-type]
-        if data.get("explain") is None:
-            data.pop("explain", None)
-        return data
-    if isinstance(hit, Mapping):
+    elif isinstance(hit, Mapping):
         data = dict(hit)
-        if data.get("explain") is None:
-            data.pop("explain", None)
-        return data
-    raise TypeError(f"search returned an unsupported hit type {type(hit).__name__}")
+    else:
+        raise TypeError(f"search returned an unsupported hit type {type(hit).__name__}")
+    if data.get("explain") is None:
+        data.pop("explain", None)
+    raw_highlights = data.get("highlights") or ()
+    data["highlights"] = [[int(a), int(b)] for a, b in raw_highlights]
+    return data
 
 
 def _handle_request(

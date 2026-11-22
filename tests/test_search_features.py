@@ -838,3 +838,55 @@ class CliModuleWeekTests(unittest.TestCase):
         bad_pick = CliRunner().invoke(app, ["pick", "x", "--week", "0"])
         self.assertEqual(bad_pick.exit_code, 1)
         self.assertIn("invalid --week value", bad_pick.output)
+
+
+@unittest.skipUnless(_HAS_TYPER, "typer is not installed")
+class SnippetCliTests(unittest.TestCase):
+    def test_json_output_includes_highlights(self) -> None:
+        from typer.testing import CliRunner
+
+        hit = Hit(
+            chunk_id=1,
+            path="/notes/ml.md",
+            locator="§Intro",
+            loc_start=1.0,
+            snippet="The model learned slowly.",
+            score=0.9,
+            kind="markdown",
+            highlights=((10, 17),),
+        )
+        with mock.patch("seekr.cli_search.get_hits", return_value=[hit]):
+            result = CliRunner().invoke(app, ["search", "learning", "--json"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        parsed = json.loads(result.stdout)
+        self.assertEqual(parsed[0]["highlights"], [[10, 17]])
+
+    def test_tty_output_bolds_highlights_and_non_tty_is_plain(self) -> None:
+        import io
+        import sys
+
+        import typer
+
+        hit = Hit(
+            chunk_id=1,
+            path="/notes/ml.md",
+            locator="§Intro",
+            loc_start=1.0,
+            snippet="The model learned slowly.",
+            score=0.9,
+            kind="markdown",
+            highlights=((10, 17),),
+        )
+        tty_buf = io.StringIO()
+        tty_buf.isatty = lambda: True  # type: ignore[method-assign]
+        with mock.patch.object(sys, "stdout", tty_buf):
+            cli_search._echo_hits(typer, [hit])
+        self.assertIn(typer.style("learned", bold=True), tty_buf.getvalue())
+
+        plain_buf = io.StringIO()
+        plain_buf.isatty = lambda: False  # type: ignore[method-assign]
+        with mock.patch.object(sys, "stdout", plain_buf):
+            cli_search._echo_hits(typer, [hit])
+        self.assertIn("The model learned slowly.", plain_buf.getvalue())
+        self.assertNotIn("\x1b[", plain_buf.getvalue())

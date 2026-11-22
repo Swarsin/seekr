@@ -162,6 +162,8 @@ def _hit_to_dict(hit: Any) -> dict[str, Any]:
         raise TypeError(f"unsupported hit type {type(hit).__name__}")
     if data.get("explain") is None:
         data.pop("explain", None)
+    raw_highlights = data.get("highlights") or ()
+    data["highlights"] = [[int(a), int(b)] for a, b in raw_highlights]
     return data
 
 

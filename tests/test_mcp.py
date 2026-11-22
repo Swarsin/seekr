@@ -369,6 +369,35 @@ class McpModuleWeekTests(unittest.TestCase):
         self.assertEqual(similar_calls[0][1]["module"], "ml")
         self.assertEqual(similar_calls[0][1]["week"], "4")
 
+    def test_mcp_result_includes_highlights(self) -> None:
+        def fake_search(*args: Any, **kwargs: Any) -> list[Hit]:
+            return [
+                Hit(
+                    chunk_id=1,
+                    path="/course/ml/week4/trees.md",
+                    locator="§Intro",
+                    loc_start=1.0,
+                    snippet="decision trees",
+                    score=0.9,
+                    kind="markdown",
+                    highlights=((9, 14),),
+                )
+            ]
+
+        server = McpServer(search_fn=fake_search, similar_fn=lambda *a, **kw: [])
+        resp = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "search", "arguments": {"query": "trees"}},
+            }
+        )
+        assert resp is not None
+        self.assertFalse(resp["result"]["isError"])
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        self.assertEqual(payload[0]["highlights"], [[9, 14]])
+
     def test_tools_list_kind_enums_include_office_and_notebooks(self) -> None:
         server = McpServer()
         response = server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})

@@ -138,6 +138,7 @@ class HitDTO:
     kind: str
     module: str | None = None
     week: int | None = None
+    highlights: tuple[tuple[int, int], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -150,6 +151,7 @@ class HitDTO:
             "kind": self.kind,
             "module": self.module,
             "week": self.week,
+            "highlights": [[int(a), int(b)] for a, b in self.highlights],
         }
 
 

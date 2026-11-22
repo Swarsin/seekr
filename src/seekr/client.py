@@ -160,6 +160,27 @@ def _explain_from_dict(payload: object) -> HitExplain | None:
     )
 
 
+def _highlights_from_wire(raw: object, snippet_len: int) -> tuple[tuple[int, int], ...]:
+    if not isinstance(raw, (list, tuple)):
+        raise DaemonError("daemon hit field 'highlights' must be a list of [start, end] pairs")
+    spans: list[tuple[int, int]] = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise DaemonError("daemon hit highlight must be a [start, end] pair")
+        start, end = item
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, int)
+            or not isinstance(end, int)
+        ):
+            raise DaemonError("daemon hit highlight bounds must be integers")
+        if start < 0 or end <= start or end > snippet_len:
+            raise DaemonError("daemon hit highlight bounds are out of range")
+        spans.append((start, end))
+    return tuple(spans)
+
+
 def _hit_from_dict(payload: object) -> Hit:
     if not isinstance(payload, Mapping):
         raise DaemonError("daemon returned a hit that is not a JSON object")
@@ -197,6 +218,7 @@ def _hit_from_dict(payload: object) -> Hit:
     week = payload.get("week")
     if week is not None and (isinstance(week, bool) or not isinstance(week, int)):
         raise DaemonError("daemon hit field 'week' must be an integer or null")
+    highlights = _highlights_from_wire(payload.get("highlights", ()), len(snippet))
     return Hit(
         chunk_id=chunk_id,
         path=path,
@@ -208,6 +230,7 @@ def _hit_from_dict(payload: object) -> Hit:
         explain=explain,
         module=module,
         week=week,
+        highlights=highlights,
     )
 
 

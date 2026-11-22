@@ -539,8 +539,11 @@ class SearcherBehaviourTests(unittest.TestCase):
         hits = Searcher(store, _ExplodingEmbedder()).search("E1234", mode="keyword")
 
         self.assertEqual(len(hits), 1)
-        self.assertLessEqual(len(hits[0].snippet), 240)
+        self.assertLessEqual(len(hits[0].snippet), 242)
         self.assertIn("E1234", hits[0].snippet)
+        self.assertEqual(
+            [hits[0].snippet[a:b] for a, b in hits[0].highlights], ["E1234"]
+        )
 
     def test_snippet_prefers_window_with_most_query_terms(self) -> None:
         text = "alpha " + "filler " * 20 + "beta " + "tail " * 200
@@ -552,9 +555,12 @@ class SearcherBehaviourTests(unittest.TestCase):
             "alpha beta", mode="keyword"
         )
 
-        self.assertLessEqual(len(hits[0].snippet), 240)
+        self.assertLessEqual(len(hits[0].snippet), 242)
         self.assertIn("alpha", hits[0].snippet)
         self.assertIn("beta", hits[0].snippet)
+        self.assertEqual(
+            [hits[0].snippet[a:b] for a, b in hits[0].highlights], ["alpha", "beta"]
+        )
 
     def test_snippet_falls_back_to_first_window(self) -> None:
         text = "z" * 300
@@ -566,7 +572,8 @@ class SearcherBehaviourTests(unittest.TestCase):
             "absent", mode="keyword"
         )
 
-        self.assertEqual(hits[0].snippet, text[:240])
+        self.assertEqual(hits[0].snippet, text[:240] + "…")
+        self.assertEqual(hits[0].highlights, ())
 
     def test_invalid_mode_raises_value_error(self) -> None:
         store = _RecordingStore([_chunk(1, "/notes/a.md", "alpha")])

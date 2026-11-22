@@ -1294,6 +1294,50 @@ class ModuleWeekDaemonTests(unittest.TestCase):
         unlabelled = _hit()
         self.assertEqual(client._hit_from_dict(daemon._hit_to_dict(unlabelled)), unlabelled)
 
+    def test_daemon_hit_roundtrip_keeps_highlights(self) -> None:
+        hit = Hit(
+            chunk_id=42,
+            path="/course/machine-learning/week4/trees.md",
+            locator="§Trees",
+            loc_start=12.0,
+            snippet="decision trees",
+            score=0.8125,
+            kind="markdown",
+            module="machine-learning",
+            week=4,
+            highlights=((9, 14),),
+        )
+        wire = daemon._hit_to_dict(hit)
+        self.assertEqual(wire["highlights"], [[9, 14]])
+        self.assertEqual(client._hit_from_dict(wire), hit)
+
+        for bad_highlights in (
+            "bad",
+            [1],
+            [[0]],
+            [[True, 2]],
+            [[-1, 2]],
+            [[2, 2]],
+            [[4, 2]],
+            [[0, 99]],
+        ):
+            bad_wire = dict(wire, highlights=bad_highlights)
+            with (
+                self.subTest(highlights=bad_highlights),
+                self.assertRaises(client.DaemonError),
+            ):
+                client._hit_from_dict(bad_wire)
+
+        class _HighlightSearcher(_FakeSearcher):
+            def search(self, *args: Any, **kwargs: Any) -> list[Hit]:
+                return [hit]
+
+        with _running_server(_HighlightSearcher(), self.tmp) as (sock_path, *_):
+            received = client.try_daemon_search(
+                {"query": "trees"}, sock_path=sock_path
+            )
+        self.assertEqual(received, [hit])
+
 
 if __name__ == "__main__":
     unittest.main()

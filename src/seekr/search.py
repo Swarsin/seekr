@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from .filters import normalise_kind, resolve_module
 from .logging_config import log_event
 from .models import Hit, HitExplain
+from .snippets import make_snippet
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,8 +33,6 @@ SearchMode = Literal["keyword", "vector", "hybrid"]
 SEARCH_MODES = frozenset({"keyword", "vector", "hybrid"})
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
-_SNIPPET_CHARS = 240
-_SNIPPET_CONTEXT_CHARS = 40
 _MIN_CANDIDATES = 50
 _CANDIDATES_PER_K = 5
 # One candidate request per retriever.  Path scoping happens inside the
@@ -83,39 +82,6 @@ def rrf(rank_lists: list[list[int]], k: int = 60) -> list[tuple[int, float]]:
         scores.items(),
         key=lambda item: (-item[1], best_ranks[item[0]], item[0]),
     )
-
-
-def _best_snippet(text: str, raw_query: str) -> str:
-    """Return the 240-character window with the most distinct query terms."""
-    if len(text) <= _SNIPPET_CHARS:
-        return text
-
-    wanted = {match.group(0).lower() for match in _TOKEN_RE.finditer(raw_query)}
-    if not wanted:
-        return text[:_SNIPPET_CHARS]
-
-    starts = {0}
-    for match in _TOKEN_RE.finditer(text):
-        if match.group(0).lower() not in wanted:
-            continue
-        position = match.start()
-        # Anchor a full-size window on the term, and a near-window for context.
-        starts.add(max(0, min(position, len(text) - _SNIPPET_CHARS)))
-        starts.add(max(0, position - _SNIPPET_CONTEXT_CHARS))
-
-    best_start = 0
-    best_coverage = -1
-    for start in sorted(starts):
-        window = text[start : start + _SNIPPET_CHARS]
-        window_terms = {match.group(0).lower() for match in _TOKEN_RE.finditer(window)}
-        coverage = len(wanted & window_terms)
-        if coverage > best_coverage:
-            best_coverage = coverage
-            best_start = start
-
-    if best_coverage <= 0:
-        return text[:_SNIPPET_CHARS]
-    return text[best_start : best_start + _SNIPPET_CHARS]
 
 
 def _normalise_path_prefix(prefix: str | None) -> str | None:
@@ -412,18 +378,20 @@ def _build_hits(
                 rerank_rank=rr[0] if rr is not None else None,
                 rerank_score=rr[1] if rr is not None else None,
             )
+        snip = make_snippet(chunk.text, query)
         hits.append(
             Hit(
                 chunk_id=chunk.id,
                 path=chunk.path,
                 locator=chunk.locator,
                 loc_start=chunk.loc_start,
-                snippet=_best_snippet(chunk.text, query),
+                snippet=snip.text,
                 score=float(score),
                 kind=chunk.kind,
                 explain=hit_explain,
                 module=chunk.module,
                 week=chunk.week,
+                highlights=snip.highlights,
             )
         )
     return hits
@@ -688,17 +656,19 @@ class Searcher:
         hits: list[Hit] = []
         for chunk_id, sim_score in _cap_per_file(scored, chunks, per_file, k):
             chunk = chunks[chunk_id]
+            snip = make_snippet(chunk.text, "")
             hits.append(
                 Hit(
                     chunk_id=chunk.id,
                     path=chunk.path,
                     locator=chunk.locator,
                     loc_start=chunk.loc_start,
-                    snippet=chunk.text[:_SNIPPET_CHARS],
+                    snippet=snip.text,
                     score=float(sim_score),
                     kind=chunk.kind,
                     module=chunk.module,
                     week=chunk.week,
+                    highlights=snip.highlights,
                 )
             )
         log_event(

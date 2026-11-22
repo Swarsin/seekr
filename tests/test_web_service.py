@@ -473,6 +473,9 @@ def test_keyword_path_is_read_only_and_matches_local_get_hits(tmp_path: Path) ->
             snippet=hit.snippet,
             score=hit.score,
             kind=hit.kind,
+            module=hit.module,
+            week=hit.week,
+            highlights=hit.highlights,
         ).to_dict()
         for hit in expected_hits
     ]
@@ -1474,3 +1477,23 @@ def test_module_and_week_filters_and_labels_in_web_service(tmp_path: Path) -> No
     assert daemon_err.value.status == 400
     assert daemon_err.value.code == "invalid_request"
     assert "module" in (daemon_err.value.fields or {})
+
+
+def test_hit_dto_highlights(tmp_path: Path) -> None:
+    docs = _root(tmp_path)
+    _write_docs(
+        docs,
+        {"notes.md": "The model learned slowly. Learning rates matter.\n"},
+    )
+    config_path = _write_config(tmp_path, roots=[docs])
+    embedder = FakeEmbedder(dim=64)
+
+    with _service(config_path, tmp_path, embedder_factory=lambda _cfg: embedder) as service:
+        job = _wait_job(service, service.start_index())
+        assert job.state == "succeeded"
+
+        res = service.search(SearchRequest("learning", mode="keyword"))
+        assert len(res.hits) == 1
+        hit = res.hits[0]
+        assert hit.highlights == ((10, 17), (26, 34))
+        assert hit.to_dict()["highlights"] == [[10, 17], [26, 34]]

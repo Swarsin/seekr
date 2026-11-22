@@ -945,6 +945,7 @@ class WebService:
     def _hit_dto(hit: object) -> HitDTO:
         raw_module = getattr(hit, "module", None)
         raw_week = getattr(hit, "week", None)
+        raw_highlights = getattr(hit, "highlights", ()) or ()
         return HitDTO(
             chunk_id=int(hit.chunk_id),  # type: ignore[attr-defined]
             path=str(hit.path),  # type: ignore[attr-defined]
@@ -955,6 +956,7 @@ class WebService:
             kind=str(hit.kind),  # type: ignore[attr-defined]
             module=str(raw_module) if raw_module is not None else None,
             week=int(raw_week) if raw_week is not None else None,
+            highlights=tuple((int(a), int(b)) for a, b in raw_highlights),
         )
 
     def _search_result(self, hits: list[object], started: float) -> SearchResult:

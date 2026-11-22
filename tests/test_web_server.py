@@ -2235,6 +2235,7 @@ def test_hit_dto_has_labels() -> None:
         "kind": "markdown",
         "module": "machine-learning",
         "week": 4,
+        "highlights": [],
     }
 
     backend = FakeWebBackend(search_result=SearchResult(hits=(hit,), took_ms=1.0))
