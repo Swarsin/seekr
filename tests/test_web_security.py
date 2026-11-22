@@ -329,6 +329,24 @@ class ExplodingBackend(FakeWebBackend):
     def search(self, request: Any) -> Any:
         raise OSError(f"{self.SECRET} {request.query}")
 
+    def remove_root(self, path: str, revision: str) -> Any:
+        raise ValueError(f"{self.SECRET} {path} {revision}")
+
+    def course(self) -> Any:
+        raise RuntimeError(f"{self.SECRET} course")
+
+    def preview(self, chunk_id: int) -> Any:
+        raise RuntimeError(f"{self.SECRET} {chunk_id}")
+
+    def preview_page_png(self, chunk_id: int) -> bytes:
+        raise RuntimeError(f"{self.SECRET} {chunk_id}")
+
+    def open_chunk(self, chunk_id: int) -> None:
+        raise RuntimeError(f"{self.SECRET} {chunk_id}")
+
+    def start_download(self, rerank: bool = False) -> str:
+        raise RuntimeError(f"{self.SECRET} {rerank}")
+
 
 class SurrogateBackend(FakeWebBackend):
     """Returns a hit with a lone surrogate to prove safe JSON serialization."""
@@ -606,11 +624,19 @@ def test_token_stays_out_of_urls_and_html() -> None:
     with _running(FakeWebBackend()) as server:
         token = _bootstrap(server)
 
-        # a token as a query string must not open a shortcut around the header
+        # a token as a query string must not open a shortcut around the header,
+        # and non-preview routes reject query strings even with a valid header
+        no_header = _request(
+            server, "GET", f"/api/status?X-Seekr-Token={token}"
+        )
+        assert no_header.status == 403
+        assert no_header.error_code() == "forbidden"
+
         response = _request(
             server, "GET", f"/api/status?X-Seekr-Token={token}", headers=_token(token)
         )
-        assert response.status == 200
+        assert response.status == 400
+        assert response.error_code() == "invalid_request"
 
         for path in ("/", "/index.html", "/styles.css", "/app.js"):
             asset = _request(server, "GET", path, headers={"Origin": server.url})
@@ -1199,3 +1225,135 @@ class LeakyBackend(FakeWebBackend):
 
     def status(self) -> Any:
         raise RuntimeError(f"{self.SECRET_TEXT} boom")
+
+
+def test_query_string_allowlist_only_on_preview_routes() -> None:
+    with _running(FakeWebBackend()) as server:
+        token = _bootstrap(server)
+
+        for preview_route in ("/api/preview", "/api/preview/page"):
+            for bad_target in (
+                preview_route,
+                f"{preview_route}?",
+                f"{preview_route}?chunk=",
+                f"{preview_route}?chunk=0",
+                f"{preview_route}?chunk=01",
+                f"{preview_route}?chunk=-1",
+                f"{preview_route}?chunk=+1",
+                f"{preview_route}?chunk=abc",
+                f"{preview_route}?chunk=%31",
+                f"{preview_route}?chunk=1&x=2",
+                f"{preview_route}?chunk=1&chunk=2",
+                f"{preview_route}?&chunk=1",
+                f"{preview_route}?chunk=1&",
+                f"{preview_route}?x=1",
+                f"{preview_route}?chunk={'1' * 20}",
+            ):
+                resp = _request(server, "GET", bad_target, headers=_token(token))
+                assert resp.status == 400, bad_target
+                assert resp.error_code() == "invalid_request"
+
+            # Missing token on invalid preview query still enforces 403 first.
+            unauth = _request(server, "GET", f"{preview_route}?chunk=abc")
+            assert unauth.status == 403
+            assert unauth.error_code() == "forbidden"
+
+        # Query strings must be rejected with 400 invalid_request on all other known routes.
+        for path, method, body in (
+            ("/api/status?x=1", "GET", None),
+            ("/api/status?", "GET", None),
+            ("/api/roots?x=1", "GET", None),
+            ("/api/course?x=1", "GET", None),
+            ("/api/jobs/fixture?x=1", "GET", None),
+            ("/api/open?chunk=1", "POST", b'{"chunk": 1}'),
+            ("/api/roots/remove?x=1", "POST", b'{"path": "/a", "revision": "r"}'),
+            ("/api/setup/download?rerank=true", "POST", b"{}"),
+            ("/api/search?x=1", "POST", b'{"query": "x"}'),
+            ("/api/model/check?x=1", "POST", b"{}"),
+            ("/api/index?x=1", "POST", b"{}"),
+        ):
+            headers = (
+                {**_token(token), "Content-Type": "application/json"}
+                if body is not None
+                else _token(token)
+            )
+            resp = _request(server, method, path, headers=headers, body=body)
+            assert resp.status == 400, (method, path)
+            assert resp.error_code() == "invalid_request"
+
+        session_q = _request(
+            server, "GET", "/api/session?x=1", headers=_session_headers(server)
+        )
+        assert session_q.status == 400
+        assert session_q.error_code() == "invalid_request"
+
+        for asset_q in ("/?x=1", "/index.html?x=1", "/styles.css?x=1", "/app.js?v=1"):
+            resp = _request(server, "GET", asset_q, headers={"Origin": server.url})
+            assert resp.status == 400, asset_q
+            assert resp.error_code() == "invalid_request"
+
+
+def test_new_routes_auth_origin_options_media_and_size_rules() -> None:
+    with _running(FakeWebBackend()) as server:
+        token = _bootstrap(server)
+
+        for method, path, body in (
+            ("GET", "/api/course", None),
+            ("GET", "/api/preview?chunk=1", None),
+            ("GET", "/api/preview/page?chunk=1", None),
+            ("POST", "/api/open", b'{"chunk": 1}'),
+            ("POST", "/api/roots/remove", b'{"path": "/a", "revision": "r"}'),
+            ("POST", "/api/setup/download", b"{}"),
+        ):
+            # Missing token -> 403
+            resp = _request(
+                server,
+                method,
+                path,
+                headers={"Content-Type": "application/json"} if body else {},
+                body=body,
+            )
+            assert resp.status == 403, (method, path)
+            assert resp.error_code() == "forbidden"
+
+            # Cross-site Sec-Fetch-Site -> 403
+            resp_cross = _request(
+                server,
+                method,
+                path,
+                headers={
+                    **_token(token),
+                    "Sec-Fetch-Site": "cross-site",
+                    **({"Content-Type": "application/json"} if body else {}),
+                },
+                body=body,
+            )
+            assert resp_cross.status == 403, (method, path)
+            assert resp_cross.error_code() == "forbidden"
+
+            # OPTIONS -> 405 without CORS headers
+            opt = _request(server, "OPTIONS", path)
+            assert opt.status == 405, path
+            assert opt.error_code() == "method_not_allowed"
+            assert not any(h.startswith("access-control-") for h in opt.headers)
+
+        # Wrong Content-Type and oversized body on new POST routes
+        for path in ("/api/open", "/api/roots/remove", "/api/setup/download"):
+            bad_ct = _request(
+                server,
+                "POST",
+                path,
+                headers={**_token(token), "Content-Type": "text/plain"},
+                body=b"{}",
+            )
+            assert bad_ct.status == 415, path
+
+            too_big = _request(
+                server,
+                "POST",
+                path,
+                headers={**_token(token), "Content-Type": "application/json"},
+                body=b'{"x":"' + b"a" * LIMITS["request_body_bytes"] + b'"}',
+            )
+            assert too_big.status == 413, path
+            assert too_big.error_code() == "payload_too_large"

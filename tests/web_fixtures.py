@@ -9,8 +9,11 @@ from __future__ import annotations
 
 from seekr.web_contract import (
     ApiError,
+    CourseModuleDTO,
+    CourseView,
     HitDTO,
     JobView,
+    PreviewView,
     RootsView,
     SearchRequest,
     SearchResult,
@@ -18,6 +21,7 @@ from seekr.web_contract import (
 )
 
 __all__ = [
+    "COURSE_VIEW",
     "ERROR_BUSY",
     "ERROR_DAEMON_ACTIVE",
     "ERROR_FORBIDDEN",
@@ -30,11 +34,14 @@ __all__ = [
     "FIXTURE_REVISION",
     "FIXTURE_ROOT",
     "FIXTURE_SOCKET_PATH",
+    "JOB_DOWNLOAD_SUCCEEDED",
     "JOB_FAILED",
     "JOB_MODEL_SUCCEEDED",
     "JOB_PARTIAL",
     "JOB_RUNNING",
     "JOB_SUCCEEDED",
+    "PREVIEW_PNG_BYTES",
+    "PREVIEW_VIEW",
     "ROOTS_VIEW",
     "SEARCH_HITS",
     "SEARCH_RESULT",
@@ -131,6 +138,33 @@ ROOTS_VIEW = RootsView(
     ),
     config_path=FIXTURE_CONFIG_PATH,
     revision=FIXTURE_REVISION,
+)
+
+COURSE_VIEW = CourseView(
+    modules=(
+        CourseModuleDTO(
+            name="machine-learning",
+            display="machine learning",
+            weeks=(1, 2),
+            files=3,
+        ),
+    )
+)
+
+PREVIEW_VIEW = PreviewView(
+    chunk=101,
+    kind="markdown",
+    path=f"{FIXTURE_ROOT}/notes.md",
+    locator="line 12",
+    location=f"{FIXTURE_ROOT}/notes.md (line 12)",
+    text="Fixture xylophone notes from the synthetic test corpus.",
+    page_image=False,
+)
+
+PREVIEW_PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc```\x00\x00"
+    b"\x00\x04\x00\x01\xf6\x178U\x00\x00\x00\x00IEND\xaeB`\x82"
 )
 
 SEARCH_HITS = (
@@ -256,6 +290,17 @@ JOB_MODEL_SUCCEEDED = JobView(
     error=None,
 )
 
+JOB_DOWNLOAD_SUCCEEDED = JobView(
+    job_id="job-download-succeeded",
+    operation="download",
+    state="succeeded",
+    started_at="2026-11-20T12:00:00Z",
+    finished_at="2026-11-20T12:00:05Z",
+    elapsed_ms=5000,
+    report={"rerank": False, "returncode": 0, "lines": ["Done."]},
+    error=None,
+)
+
 ERROR_INVALID_REQUEST = ApiError(400, "invalid_request", "invalid request")
 ERROR_FORBIDDEN = ApiError(
     403,
@@ -290,13 +335,15 @@ class FakeWebBackend:
     """A deterministic in-memory implementation of :class:`WebBackend`.
 
     ``errors`` maps a backend method name (``"status"``, ``"roots"``,
-    ``"add_root"``, ``"search"``, ``"start_model_check"``, ``"start_index"``,
+    ``"add_root"``, ``"remove_root"``, ``"course"``, ``"preview"``,
+    ``"preview_page_png"``, ``"open_chunk"``, ``"search"``,
+    ``"start_model_check"``, ``"start_index"``, ``"start_download"``,
     or ``"job"``) to an :class:`ApiError` that method raises instead of
     returning.  Every call is appended to ``calls`` as
     ``(method_name, keyword_arguments)``.
 
-    Starting a check or index job automatically records a running ``JobView``
-    when the configured job ID is not already present in ``jobs``.
+    Starting a check, index, or download job automatically records a running
+    ``JobView`` when the configured job ID is not already present in ``jobs``.
     """
 
     def __init__(
@@ -306,9 +353,14 @@ class FakeWebBackend:
         roots: RootsView | None = None,
         search_result: SearchResult | None = None,
         add_root_result: RootsView | None = None,
+        remove_root_result: RootsView | None = None,
+        course_view: CourseView | None = None,
+        preview_view: PreviewView | None = None,
+        preview_png: bytes = PREVIEW_PNG_BYTES,
         jobs: dict[str, JobView] | None = None,
         start_model_check_job_id: str = "job-model-check-fixture",
         start_index_job_id: str = "job-index-fixture",
+        start_download_job_id: str = "job-download-fixture",
         errors: dict[str, ApiError] | None = None,
     ) -> None:
         self.status_value = STATUS_READY if status is None else status
@@ -317,9 +369,16 @@ class FakeWebBackend:
         self.add_root_result_value = (
             ROOTS_VIEW if add_root_result is None else add_root_result
         )
+        self.remove_root_result_value = (
+            ROOTS_VIEW if remove_root_result is None else remove_root_result
+        )
+        self.course_view_value = COURSE_VIEW if course_view is None else course_view
+        self.preview_view_value = PREVIEW_VIEW if preview_view is None else preview_view
+        self.preview_png_value = preview_png
         self.jobs: dict[str, JobView] = dict(jobs or {})
         self.start_model_check_job_id = start_model_check_job_id
         self.start_index_job_id = start_index_job_id
+        self.start_download_job_id = start_download_job_id
         self.errors = dict(errors or {})
         self.calls: list[tuple[str, dict[str, object]]] = []
 
@@ -360,6 +419,30 @@ class FakeWebBackend:
         self._raise_configured("add_root")
         return self.add_root_result_value
 
+    def remove_root(self, path: str, revision: str) -> RootsView:
+        self._record("remove_root", path=path, revision=revision)
+        self._raise_configured("remove_root")
+        return self.remove_root_result_value
+
+    def course(self) -> CourseView:
+        self._record("course")
+        self._raise_configured("course")
+        return self.course_view_value
+
+    def preview(self, chunk_id: int) -> PreviewView:
+        self._record("preview", chunk_id=chunk_id)
+        self._raise_configured("preview")
+        return self.preview_view_value
+
+    def preview_page_png(self, chunk_id: int) -> bytes:
+        self._record("preview_page_png", chunk_id=chunk_id)
+        self._raise_configured("preview_page_png")
+        return self.preview_png_value
+
+    def open_chunk(self, chunk_id: int) -> None:
+        self._record("open_chunk", chunk_id=chunk_id)
+        self._raise_configured("open_chunk")
+
     def search(self, request: SearchRequest) -> SearchResult:
         self._record("search", request=request)
         self._raise_configured("search")
@@ -376,6 +459,12 @@ class FakeWebBackend:
         self._raise_configured("start_index")
         self._ensure_running_job(self.start_index_job_id, "index")
         return self.start_index_job_id
+
+    def start_download(self, rerank: bool = False) -> str:
+        self._record("start_download", rerank=rerank)
+        self._raise_configured("start_download")
+        self._ensure_running_job(self.start_download_job_id, "download")
+        return self.start_download_job_id
 
     def job(self, job_id: str) -> JobView:
         self._record("job", job_id=job_id)

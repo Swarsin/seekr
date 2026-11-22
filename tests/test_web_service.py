@@ -26,7 +26,14 @@ from seekr.locations import format_location
 from seekr.models import ChunkSpec, Hit, text_sha
 from seekr.platform_info import Mount
 from seekr.store import SCHEMA_VERSION, Store, StoredChunk
-from seekr.web_contract import ApiError, HitDTO, SearchRequest
+from seekr.web_contract import (
+    ApiError,
+    CourseModuleDTO,
+    CourseView,
+    HitDTO,
+    PreviewView,
+    SearchRequest,
+)
 from seekr.web_service import WebService, _socket_is_live
 
 
@@ -1705,3 +1712,494 @@ def test_hit_dto_location_windows_on_wsl(tmp_path: Path) -> None:
                 "/mnt/c/course/plain.txt",
             ),
         ]
+
+
+def _make_pdf(path: Path, pages: list[tuple[float, float, str]]) -> Path:
+    import pymupdf
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = pymupdf.open()
+    try:
+        for width, height, text in pages:
+            page = doc.new_page(width=width, height=height)
+            page.insert_textbox(
+                pymupdf.Rect(36, 36, max(72.0, width - 36), max(72.0, height - 36)),
+                text,
+            )
+        doc.save(path)
+    finally:
+        doc.close()
+    return path
+
+
+def _chunk_id_for_path(db_path: Path, target_path: str, locator: str | None = None) -> int:
+    connection = sqlite3.connect(db_path)
+    try:
+        if locator is None:
+            row = connection.execute(
+                "SELECT c.id FROM chunks AS c "
+                "JOIN documents AS d ON d.id = c.doc_id "
+                "WHERE d.path = ? ORDER BY c.id LIMIT 1",
+                (target_path,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT c.id FROM chunks AS c "
+                "JOIN documents AS d ON d.id = c.doc_id "
+                "WHERE d.path = ? AND c.locator = ? ORDER BY c.id LIMIT 1",
+                (target_path, locator),
+            ).fetchone()
+        assert row is not None, (target_path, locator)
+        return int(row[0])
+    finally:
+        connection.close()
+
+
+def test_course_returns_sorted_modules_without_model_and_handles_missing_empty(
+    tmp_path: Path,
+) -> None:
+    def explode(cfg: Config):
+        raise AssertionError("course() must never load a model")
+
+    missing_cfg = _write_config(tmp_path, db_path=tmp_path / "missing.db")
+    with _service(missing_cfg, tmp_path, embedder_factory=explode) as service:
+        view = service.course()
+        assert view == CourseView(modules=())
+        assert view.to_dict() == {"modules": []}
+        assert not (tmp_path / "missing.db").exists()
+
+    empty_db = tmp_path / "empty.db"
+    Store(empty_db, "fake", 64, vector_quant="int8").close()
+    empty_cfg = _write_config(tmp_path, db_path=empty_db)
+    with _service(empty_cfg, tmp_path, embedder_factory=explode) as service:
+        assert service.course() == CourseView(modules=())
+
+    docs = _root(tmp_path, "course-docs")
+    _write_docs(
+        docs,
+        {
+            "BetaMod/week3/b.md": "beta week 3 b\n",
+            "BetaMod/week1/a.md": "beta week 1 a\n",
+            "BetaMod/week3/c.md": "beta week 3 c\n",
+            "BetaMod/overview.md": "beta overview without week\n",
+            "alpha_mod/week2/d.md": "alpha week 2 d\n",
+            "unassigned.md": "root level document without module\n",
+        },
+    )
+    ready_db = tmp_path / "ready.db"
+    ready_cfg = _write_config(tmp_path, roots=[docs], db_path=ready_db)
+    with _service(ready_cfg, tmp_path) as service:
+        assert _wait_job(service, service.start_index()).state == "succeeded"
+
+    with _service(ready_cfg, tmp_path, embedder_factory=explode) as service:
+        view = service.course()
+        assert view == CourseView(
+            modules=(
+                CourseModuleDTO(
+                    name="alpha_mod",
+                    display="alpha mod",
+                    weeks=(2,),
+                    files=1,
+                ),
+                CourseModuleDTO(
+                    name="BetaMod",
+                    display="BetaMod",
+                    weeks=(1, 3),
+                    files=4,
+                ),
+            )
+        )
+        assert view.to_dict() == {
+            "modules": [
+                {"name": "alpha_mod", "display": "alpha mod", "weeks": [2], "files": 1},
+                {"name": "BetaMod", "display": "BetaMod", "weeks": [1, 3], "files": 4},
+            ]
+        }
+
+    mismatch_db = tmp_path / "mismatch.db"
+    _add_indexed_document(mismatch_db, model="different/model")
+    with (
+        _service(_write_config(tmp_path, db_path=mismatch_db), tmp_path, embedder_factory=explode) as service,
+        pytest.raises(ApiError) as raised,
+    ):
+        service.course()
+    assert _error_code(raised.value) == "incompatible_index"
+
+    corrupt_db = tmp_path / "corrupt.db"
+    corrupt_db.write_bytes(b"not sqlite")
+    with (
+        _service(_write_config(tmp_path, db_path=corrupt_db), tmp_path, embedder_factory=explode) as service,
+        pytest.raises(ApiError) as raised,
+    ):
+        service.course()
+    assert _error_code(raised.value) == "index_unavailable"
+
+
+def test_preview_and_preview_page_png_with_width_cap_and_close(
+    tmp_path: Path,
+) -> None:
+    import pymupdf
+
+    docs = _root(tmp_path, "preview-docs")
+    page1_words = " ".join(f"alpha{i}" for i in range(30))
+    page2_words = " ".join(f"beta{i}" for i in range(30))
+    pdf_path = _make_pdf(
+        docs / "slides.pdf",
+        [
+            (400, 300, page1_words),
+            (2000, 600, page2_words),
+        ],
+    )
+    _write_docs(docs, {"notes.md": "# Heading\n\nFull markdown chunk text.\n"})
+    db_path = tmp_path / "preview.db"
+    config_path = _write_config(tmp_path, roots=[docs], db_path=db_path)
+
+    with _service(config_path, tmp_path) as service:
+        assert _wait_job(service, service.start_index()).state == "succeeded"
+
+        pdf_p1_id = _chunk_id_for_path(db_path, str(pdf_path), "p.1")
+        pdf_p2_id = _chunk_id_for_path(db_path, str(pdf_path), "p.2")
+        md_id = _chunk_id_for_path(db_path, str(docs / "notes.md"))
+
+        pdf_preview = service.preview(pdf_p2_id)
+        assert isinstance(pdf_preview, PreviewView)
+        assert pdf_preview.chunk == pdf_p2_id
+        assert pdf_preview.kind == "pdf"
+        assert pdf_preview.path == str(pdf_path)
+        assert pdf_preview.locator == "p.2"
+        assert pdf_preview.location == f"{pdf_path} (page 2)"
+        assert "beta0" in pdf_preview.text
+        assert pdf_preview.page_image is True
+        assert set(pdf_preview.to_dict()) == {
+            "chunk",
+            "kind",
+            "path",
+            "locator",
+            "location",
+            "text",
+            "page_image",
+        }
+
+        md_preview = service.preview(md_id)
+        assert md_preview.kind == "markdown"
+        assert md_preview.page_image is False
+        assert "Full markdown chunk text." in md_preview.text
+
+        # Normal page width (400pt) zooms by 1.5 -> 600px wide.
+        png1 = service.preview_page_png(pdf_p1_id)
+        assert png1.startswith(b"\x89PNG\r\n\x1a\n")
+        pix1 = pymupdf.Pixmap(png1)
+        assert pix1.width == 600
+
+        # Wide page (2000pt) scales down so rendered PNG width is <= 2000px.
+        png2 = service.preview_page_png(pdf_p2_id)
+        assert png2.startswith(b"\x89PNG\r\n\x1a\n")
+        pix2 = pymupdf.Pixmap(png2)
+        assert pix2.width <= 2000
+
+        # Verify PDF document is closed cleanly.
+        real_open = pymupdf.open
+        closed_flags: list[bool] = []
+
+        def tracked_open(*args, **kwargs):
+            doc = real_open(*args, **kwargs)
+            orig_close = doc.close
+
+            def wrapped_close():
+                closed_flags.append(True)
+                return orig_close()
+
+            doc.close = wrapped_close  # type: ignore[method-assign]
+            return doc
+
+        with mock.patch("pymupdf.open", side_effect=tracked_open):
+            service.preview_page_png(pdf_p1_id)
+        assert closed_flags == [True]
+
+        # Non-PDF chunk and unknown chunk -> 404 not_found.
+        for bad_id in (md_id, 999999, 2**63):
+            with pytest.raises(ApiError) as raised:
+                service.preview_page_png(bad_id)
+            assert _error_code(raised.value) == "not_found"
+
+        for unknown_id in (999999, 2**63):
+            with pytest.raises(ApiError) as raised:
+                service.preview(unknown_id)
+            assert _error_code(raised.value) == "not_found"
+
+        # Deleted PDF file -> preview_page_png returns 404 not_found.
+        pdf_path.unlink()
+        with pytest.raises(ApiError) as raised:
+            service.preview_page_png(pdf_p1_id)
+        assert _error_code(raised.value) == "not_found"
+
+
+def test_preview_page_png_out_of_range_page_is_404(tmp_path: Path) -> None:
+    docs = _root(tmp_path, "oob-docs")
+    pdf_path = _make_pdf(docs / "onepage.pdf", [(300, 400, "only one page")])
+    db_path = tmp_path / "oob.db"
+    embedder = FakeEmbedder(dim=64)
+    store = Store(db_path, "fake", 64, vector_quant="int8")
+    try:
+        doc_id = store.upsert_document(str(pdf_path), 1, 10, "a" * 64, "pdf")
+        store.replace_chunks(
+            doc_id,
+            [
+                StoredChunk(
+                    spec=ChunkSpec(text="bad page", locator="p.5", loc_start=5.0),
+                    text_sha=text_sha("bad page"),
+                    vector=embedder.embed_documents(["bad page"])[0],
+                )
+            ],
+        )
+    finally:
+        store.close()
+    chunk_id = _chunk_id_for_path(db_path, str(pdf_path), "p.5")
+    config_path = _write_config(tmp_path, roots=[docs], db_path=db_path)
+
+    with (
+        _service(config_path, tmp_path) as service,
+        pytest.raises(ApiError) as raised,
+    ):
+        service.preview_page_png(chunk_id)
+    assert _error_code(raised.value) == "not_found"
+
+
+def test_open_chunk_runs_opener_without_shell_and_maps_errors(tmp_path: Path) -> None:
+    import types
+
+    docs = _root(tmp_path, "open-docs")
+    pdf_path = _make_pdf(
+        docs / "handout.pdf",
+        [(300, 400, " ".join(f"word{i}" for i in range(30)))],
+    )
+    _write_docs(docs, {"notes.md": "# Title\n\nsome body text\n"})
+    db_path = tmp_path / "open.db"
+    config_path = _write_config(tmp_path, roots=[docs], db_path=db_path)
+
+    with _service(config_path, tmp_path) as service:
+        assert _wait_job(service, service.start_index()).state == "succeeded"
+        pdf_chunk = _chunk_id_for_path(db_path, str(pdf_path), "p.1")
+
+        with (
+            mock.patch("seekr.platform_info.is_wsl", return_value=False),
+            mock.patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}" if name == "zathura" else None),
+            mock.patch(
+                "subprocess.run",
+                return_value=types.SimpleNamespace(returncode=0),
+            ) as run_mock,
+        ):
+            service.open_chunk(pdf_chunk)
+        run_mock.assert_called_once_with(
+            ["zathura", "-P", "1", str(pdf_path)], check=False
+        )
+
+        mounts = [Mount(source="C:\\", mount_point="/mnt/c", fstype="9p")]
+        store = Store(db_path, "fake", 64, vector_quant="int8")
+        try:
+            doc_id = store.upsert_document("/mnt/c/course/wsl.pdf", 1, 10, "b" * 64, "pdf")
+            store.replace_chunks(
+                doc_id,
+                [
+                    StoredChunk(
+                        spec=ChunkSpec(text="wsl pdf", locator="p.3", loc_start=3.0),
+                        text_sha=text_sha("wsl pdf"),
+                        vector=FakeEmbedder(dim=64).embed_documents(["wsl pdf"])[0],
+                    )
+                ],
+            )
+        finally:
+            store.close()
+        wsl_chunk = _chunk_id_for_path(db_path, "/mnt/c/course/wsl.pdf", "p.3")
+
+        with (
+            mock.patch("seekr.platform_info.is_wsl", return_value=True),
+            mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
+            mock.patch("shutil.which", return_value=None),
+            mock.patch(
+                "subprocess.run",
+                return_value=types.SimpleNamespace(returncode=1),
+            ) as run_mock,
+        ):
+            service.open_chunk(wsl_chunk)
+        run_mock.assert_called_once_with(
+            ["explorer.exe", r"C:\course\wsl.pdf"], check=False
+        )
+
+        # Non-success exit code -> 500 internal_error
+        with (
+            mock.patch("seekr.platform_info.is_wsl", return_value=True),
+            mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
+            mock.patch("shutil.which", return_value=None),
+            mock.patch(
+                "subprocess.run",
+                return_value=types.SimpleNamespace(returncode=2),
+            ),
+            pytest.raises(ApiError) as raised,
+        ):
+            service.open_chunk(wsl_chunk)
+        assert _error_code(raised.value) == "internal_error"
+
+        # Missing executable -> 500 internal_error
+        with (
+            mock.patch("seekr.platform_info.is_wsl", return_value=False),
+            mock.patch("shutil.which", return_value=None),
+            mock.patch("subprocess.run", side_effect=FileNotFoundError("xdg-open")),
+            pytest.raises(ApiError) as raised,
+        ):
+            service.open_chunk(pdf_chunk)
+        assert _error_code(raised.value) == "internal_error"
+
+        # Unconvertible WSL path -> 500 internal_error
+        with (
+            mock.patch("seekr.platform_info.is_wsl", return_value=True),
+            mock.patch("seekr.platform_info.read_mounts", return_value=[]),
+            mock.patch("seekr.platform_info.wslpath_windows", return_value=None),
+            mock.patch("shutil.which", return_value=None),
+            pytest.raises(ApiError) as raised,
+        ):
+            service.open_chunk(pdf_chunk)
+        assert _error_code(raised.value) == "internal_error"
+
+        # Unknown chunk -> 404 not_found
+        with pytest.raises(ApiError) as raised:
+            service.open_chunk(999999)
+        assert _error_code(raised.value) == "not_found"
+
+
+def test_remove_root_purges_config_and_db_respects_prefix_lane_and_daemon(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path, "course")
+    root2 = _root(tmp_path, "course2")
+    _write_docs(root, {"a.txt": "alpha uniquewordrootone\n"})
+    _write_docs(root2, {"b.txt": "beta uniquewordroottwo\n"})
+    db_path = tmp_path / "remove.db"
+    config_path = _write_config(tmp_path, roots=[root, root2], db_path=db_path)
+
+    with _service(config_path, tmp_path, daemon_probe=lambda _p: True) as daemon_service:
+        rev = daemon_service.roots().revision
+        with pytest.raises(ApiError) as raised:
+            daemon_service.remove_root(str(root), rev)
+        assert _error_code(raised.value) == "daemon_active"
+
+    paused = _PausingIndexer()
+    with _service(
+        config_path, tmp_path, indexer_factory=lambda s, e, c: paused
+    ) as busy_service:
+        job_id = busy_service.start_index()
+        assert paused.started.wait(5.0)
+        rev = busy_service.roots().revision
+        with pytest.raises(ApiError) as raised:
+            busy_service.remove_root(str(root), rev)
+        assert _error_code(raised.value) == "busy"
+        paused.release.set()
+        _wait_job(busy_service, job_id)
+
+    with _service(config_path, tmp_path) as service:
+        assert _wait_job(service, service.start_index()).state == "succeeded"
+        rev = service.roots().revision
+
+        with pytest.raises(ApiError) as raised:
+            service.remove_root(str(root), "0" * 64)
+        assert _error_code(raised.value) == "stale_config"
+
+        with pytest.raises(ApiError) as raised:
+            service.remove_root(str(tmp_path / "not-configured"), rev)
+        assert _error_code(raised.value) == "invalid_root"
+
+        updated = service.remove_root(str(root), rev)
+        assert updated.roots == (str(root2),)
+        assert updated.revision != rev
+        assert load_config(config_path).roots == (root2,)
+
+        # root's docs are purged, root2's docs remain searchable.
+        assert service.search(SearchRequest("uniquewordrootone", mode="keyword")).hits == ()
+        remaining = service.search(SearchRequest("uniquewordroottwo", mode="keyword"))
+        assert [hit.path for hit in remaining.hits] == [str(root2 / "b.txt")]
+
+
+def test_start_download_job_scrubs_offline_env_keeps_last_50_lines_and_handles_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+    import types
+
+    config_path = _write_config(tmp_path)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    monkeypatch.setenv("HF_DATASETS_OFFLINE", "1")
+
+    captured_calls: list[dict[str, object]] = []
+    many_lines = "\n".join(f"line-{i}" for i in range(65)) + "\n"
+
+    def fake_run(cmd, **kwargs):
+        captured_calls.append({"cmd": list(cmd), "env": dict(kwargs.get("env") or {})})
+        return types.SimpleNamespace(returncode=0, stdout=many_lines, stderr="")
+
+    with (
+        mock.patch("subprocess.run", side_effect=fake_run),
+        _service(config_path, tmp_path) as service,
+    ):
+        job_id = service.start_download(rerank=False)
+        view = _wait_job(service, job_id)
+        assert view.operation == "download"
+        assert view.state == "succeeded"
+        assert view.error is None
+        assert view.report is not None
+        assert len(view.report["lines"]) == 50  # type: ignore[arg-type]
+        assert view.report["lines"][0] == "line-15"  # type: ignore[index]
+        assert view.report["lines"][-1] == "line-64"  # type: ignore[index]
+        assert captured_calls[0]["cmd"] == [
+            sys.executable,
+            "-m",
+            "seekr",
+            "models",
+            "pull",
+            "--yes",
+            "--grammars",
+        ]
+        child_env = captured_calls[0]["env"]
+        assert isinstance(child_env, dict)
+        for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
+            assert key not in child_env
+
+        # With rerank=True
+        rerank_job_id = service.start_download(rerank=True)
+        rerank_view = _wait_job(service, rerank_job_id)
+        assert rerank_view.state == "succeeded"
+        assert captured_calls[1]["cmd"] == [
+            sys.executable,
+            "-m",
+            "seekr",
+            "models",
+            "pull",
+            "--yes",
+            "--grammars",
+            "--rerank",
+        ]
+
+    # Non-zero exit code -> failed job, and busy lane during download
+    entered = threading.Event()
+    release = threading.Event()
+
+    def failing_run(cmd, **kwargs):
+        entered.set()
+        assert release.wait(5.0)
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="network unreachable\n")
+
+    with (
+        mock.patch("subprocess.run", side_effect=failing_run),
+        _service(config_path, tmp_path) as service,
+    ):
+        job_id = service.start_download()
+        assert entered.wait(5.0)
+        assert service.status().activity == {"lane": "download", "job_id": job_id}
+        with pytest.raises(ApiError) as raised:
+            service.start_download()
+        assert _error_code(raised.value) == "busy"
+        release.set()
+        failed = _wait_job(service, job_id)
+        assert failed.state == "failed"
+        assert "network unreachable" in (failed.error or "")
+        assert service.status().activity == {"lane": "idle", "job_id": None}

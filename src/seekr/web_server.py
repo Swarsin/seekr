@@ -65,12 +65,15 @@ SECURITY_HEADERS: tuple[tuple[str, str], ...] = (
 )
 
 _JSON_CONTENT_TYPE = "application/json; charset=utf-8"
+_PNG_CONTENT_TYPE = "image/png"
 _GET_METHOD = "GET"
 _POST_METHOD = "POST"
 _ORIGIN_FETCH_SITE_VALUES = frozenset({"same-origin", "none"})
 _SEARCH_MODES = frozenset({"keyword", "vector", "hybrid"})
 _CONTENT_LENGTH_RE = re.compile(r"[0-9]+")
 _JOB_ID_RE = re.compile(r"[A-Za-z0-9_.~-]{1,200}")
+_PREVIEW_QUERY_RE = re.compile(r"chunk=([1-9][0-9]{0,18})")
+_PREVIEW_ROUTES = frozenset({"preview", "preview_page"})
 
 #: Bounded post-response drain so an early error does not reset the client
 #: before it can read the JSON envelope.  The one-second grace is shorter than
@@ -99,9 +102,15 @@ _API_ROUTES: dict[str, tuple[str, frozenset[str]]] = {
     "/api/session": ("session", frozenset({_GET_METHOD})),
     "/api/status": ("status", frozenset({_GET_METHOD})),
     "/api/roots": ("roots", frozenset({_GET_METHOD, _POST_METHOD})),
+    "/api/roots/remove": ("roots_remove", frozenset({_POST_METHOD})),
+    "/api/course": ("course", frozenset({_GET_METHOD})),
+    "/api/preview": ("preview", frozenset({_GET_METHOD})),
+    "/api/preview/page": ("preview_page", frozenset({_GET_METHOD})),
+    "/api/open": ("open", frozenset({_POST_METHOD})),
     "/api/search": ("search", frozenset({_POST_METHOD})),
     "/api/model/check": ("model_check", frozenset({_POST_METHOD})),
     "/api/index": ("index", frozenset({_POST_METHOD})),
+    "/api/setup/download": ("setup_download", frozenset({_POST_METHOD})),
 }
 
 
@@ -314,6 +323,19 @@ def _validate_search(body: dict[str, Any]) -> SearchRequest:
 def _validate_roots(body: dict[str, Any]) -> tuple[str, str]:
     _reject_unknown_fields(body, {"path", "revision"})
     return _require_string(body, "path"), _require_string(body, "revision")
+
+
+def _validate_open(body: dict[str, Any]) -> int:
+    _reject_unknown_fields(body, {"chunk"})
+    value = body.get("chunk")
+    if type(value) is not int or value <= 0:
+        raise _invalid("chunk must be a positive integer", field="chunk")
+    return value
+
+
+def _validate_download(body: dict[str, Any]) -> bool:
+    _reject_unknown_fields(body, {"rerank"})
+    return _optional_bool(body, "rerank", default=False)
 
 
 def _validate_empty_body(body: dict[str, Any]) -> None:
@@ -681,17 +703,19 @@ class WebRequestHandler(BaseHTTPRequestHandler):
 
     # -- request policy ---------------------------------------------------
 
-    def _request_path(self) -> str | None:
+    def _request_target(self) -> tuple[str, bool, str] | None:
         # Use the raw request target so stdlib ``//`` normalization cannot turn
         # a non-canonical target into an exact allowlisted route.
         parts = self.requestline.split()
         target = parts[1] if len(parts) >= 2 else self.path
-        if not target.startswith("/") or target.startswith("//"):
+        if not target.startswith("/") or target.startswith("//") or "#" in target:
             return None
         try:
-            return urlsplit(target).path
+            urlsplit(target)
         except ValueError:
             return None
+        raw_path, separator, raw_query = target.partition("?")
+        return raw_path, bool(separator), raw_query
 
     def _single_header(self, name: str) -> str | None:
         values = self.headers.get_all(name) if self.headers is not None else None
@@ -891,21 +915,24 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                     duration_ms,
                 )
 
-    def _resolve_route(self) -> tuple[str, frozenset[str], str | None] | None:
-        path = self._request_path()
-        if path is None:
+    def _resolve_route(
+        self,
+    ) -> tuple[str, frozenset[str], str | None, bool, str] | None:
+        parsed = self._request_target()
+        if parsed is None:
             return None
+        path, has_query, raw_query = parsed
         if path in _ASSET_ROUTES:
             filename, mime = _ASSET_ROUTES[path]
-            return ("asset", frozenset({_GET_METHOD}), f"{filename}\x00{mime}")
+            return ("asset", frozenset({_GET_METHOD}), f"{filename}\x00{mime}", has_query, raw_query)
         if path in _API_ROUTES:
             name, methods = _API_ROUTES[path]
-            return (name, methods, None)
+            return (name, methods, None, has_query, raw_query)
         if path == "/api/jobs/" or path.startswith("/api/jobs/"):
             job_id = path[len("/api/jobs/") :]
             if "/" in job_id:
                 return None
-            return ("job", frozenset({_GET_METHOD}), job_id)
+            return ("job", frozenset({_GET_METHOD}), job_id, has_query, raw_query)
         return None
 
     def _dispatch(self) -> tuple[str, int]:
@@ -921,7 +948,7 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         if route is None:
             raise _not_found()
 
-        name, allowed_methods, parameter = route
+        name, allowed_methods, parameter, has_query, raw_query = route
         route_label = _route_label(name)
         if self.command not in allowed_methods:
             raise _method_not_allowed()
@@ -934,6 +961,20 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         else:
             self._check_fetch_metadata(require_proof=False)
             self._check_token()
+
+        preview_chunk_id: int | None = None
+        if name in _PREVIEW_ROUTES:
+            if not has_query:
+                raise _invalid("chunk query parameter is required", field="chunk")
+            match = _PREVIEW_QUERY_RE.fullmatch(raw_query)
+            if match is None:
+                raise _invalid(
+                    "chunk query parameter must be a positive integer",
+                    field="chunk",
+                )
+            preview_chunk_id = int(match.group(1), 10)
+        elif has_query:
+            raise _invalid("query strings are not supported for this route")
 
         if self.command == _GET_METHOD:
             self._check_get_body()
@@ -964,6 +1005,29 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             path, revision = _validate_roots(body)
             self._send_json(200, backend.add_root(path, revision).to_dict())
             return route_label, 200
+        if name == "roots_remove":
+            assert body is not None
+            path, revision = _validate_roots(body)
+            self._send_json(200, backend.remove_root(path, revision).to_dict())
+            return route_label, 200
+        if name == "course":
+            self._send_json(200, backend.course().to_dict())
+            return route_label, 200
+        if name == "preview":
+            assert preview_chunk_id is not None
+            self._send_json(200, backend.preview(preview_chunk_id).to_dict())
+            return route_label, 200
+        if name == "preview_page":
+            assert preview_chunk_id is not None
+            png_bytes = backend.preview_page_png(preview_chunk_id)
+            self._send_bytes(200, _PNG_CONTENT_TYPE, png_bytes)
+            return route_label, 200
+        if name == "open":
+            assert body is not None
+            chunk_id = _validate_open(body)
+            backend.open_chunk(chunk_id)
+            self._send_json(200, {"opened": True})
+            return route_label, 200
         if name == "search":
             assert body is not None
             request = _validate_search(body)
@@ -981,6 +1045,12 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             job_id = backend.start_index()
             self._send_json(202, {"job_id": job_id})
             return route_label, 202
+        if name == "setup_download":
+            assert body is not None
+            rerank = _validate_download(body)
+            job_id = backend.start_download(rerank=rerank)
+            self._send_json(202, {"job_id": job_id})
+            return route_label, 202
         if name == "job":
             assert parameter is not None
             if not _JOB_ID_RE.fullmatch(parameter):
@@ -996,9 +1066,15 @@ def _route_label(name: str) -> str:
         "session": "/api/session",
         "status": "/api/status",
         "roots": "/api/roots",
+        "roots_remove": "/api/roots/remove",
+        "course": "/api/course",
+        "preview": "/api/preview",
+        "preview_page": "/api/preview/page",
+        "open": "/api/open",
         "search": "/api/search",
         "model_check": "/api/model/check",
         "index": "/api/index",
+        "setup_download": "/api/setup/download",
         "job": "/api/jobs/{job_id}",
     }.get(name, "unknown")
 

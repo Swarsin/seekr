@@ -61,6 +61,13 @@ diagnosable security rule, not a missing-token accident.
 - Host/origin/token checks run before reading a request body. For non-`OPTIONS`
   requests, method is checked after the route is resolved; `OPTIONS` is
   rejected before routing. API/session responses are `Cache-Control: no-store`.
+- Query strings are accepted **only** on `GET /api/preview` and
+  `GET /api/preview/page`, and **only** as an exact single parameter
+  `chunk=<id>` matching `^[1-9]\d{0,18}$` (no empty keys, duplicate keys, or
+  extra parameters). Missing or malformed preview query strings return
+  `400 invalid_request` (after Host/Origin/Fetch-Metadata/token checks). All
+  other known routes require exact request targets and reject any query string
+  with `400 invalid_request`.
 - Request bodies and document text are never logged. Error messages must be
   safe for display and must not include document text.
 
@@ -68,15 +75,21 @@ diagnosable security rule, not a missing-token accident.
 
 | Method and route | Request | Successful response | Error codes |
 | --- | --- | --- | --- |
-| `GET /api/session` | No body; `X-Seekr-Client: 1`; exact Host; valid Origin/Sec-Fetch as above | `200 {token: string, limits: object}`; no config contents | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `500 internal_error` |
-| `GET /api/status` | Token; no body | `200` status object; never loads a model or takes the lifecycle lock | `403 forbidden`, `405 method_not_allowed`, `500 internal_error` |
-| `GET /api/roots` | Token; no body | `200 {roots: string[], config_path: string, revision: string}`; roots in stored order and form | `403 forbidden`, `405 method_not_allowed`, `409 config_invalid`, `500 internal_error` |
-| `POST /api/roots` | Token; JSON `{path: string, revision: string}` | `200 {roots, config_path, revision, daemon_restart_required: boolean, warning: string or null}` | `400 invalid_request`, `400 invalid_root`, `400 roots_limit`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 stale_config`, `409 duplicate_root`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `500 config_write_failed` |
-| `POST /api/search` | Token; JSON `{query, mode?, k?, per_file?, path?, kind?, since?, module?, week?, spread?}` | `200 {hits: Hit[], took_ms: number, spread?: SpreadGroup[]}` | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable`, `503 model_unavailable`, `503 daemon_failure` |
-| `POST /api/model/check` | Token; JSON exactly `{}` | `202 {job_id: string}`; job result arrives through the job endpoint | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error` |
-| `POST /api/index` | Token; JSON exactly `{}`; targets come only from validated config | `202 {job_id: string}` | `400 invalid_request`, `400 no_roots`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 daemon_active`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable`, `503 model_unavailable` |
-| `GET /api/jobs/{job_id}` | Token; no body; job ID is a server-issued opaque string | `200` job object with state, operation, timestamps, report/error, and truncation flags | `403 forbidden`, `404 job_not_found`, `405 method_not_allowed`, `500 internal_error` |
-| `GET /`, `/index.html`, `/styles.css`, `/app.js` | No token; exact Host; matching Origin or allowed `Sec-Fetch-Site` required | `200` packaged asset with the correct MIME type | `404 not_found` for a missing allowlisted asset or unknown path; `405 method_not_allowed` for non-GET; `403 forbidden` for Host/Origin/Sec-Fetch |
+| `GET /api/session` | No body; no query; `X-Seekr-Client: 1`; exact Host; valid Origin/Sec-Fetch as above | `200 {token: string, limits: object}`; no config contents | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `500 internal_error` |
+| `GET /api/status` | Token; no body; no query | `200` status object; never loads a model or takes the lifecycle lock | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `500 internal_error` |
+| `GET /api/roots` | Token; no body; no query | `200 {roots: string[], config_path: string, revision: string}`; roots in stored order and form | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 config_invalid`, `500 internal_error` |
+| `POST /api/roots` | Token; no query; JSON `{path: string, revision: string}` | `200 {roots, config_path, revision, daemon_restart_required: boolean, warning: string or null}` | `400 invalid_request`, `400 invalid_root`, `400 roots_limit`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 stale_config`, `409 duplicate_root`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `500 config_write_failed` |
+| `POST /api/roots/remove` | Token; no query; JSON `{path: string, revision: string}` | `200 {roots, config_path, revision, daemon_restart_required: boolean, warning: string or null}` | `400 invalid_request`, `400 invalid_root`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 stale_config`, `409 daemon_active`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `500 config_write_failed` |
+| `GET /api/course` | Token; no body; no query | `200 {modules: [{name, display, weeks, files}]}` | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `409 incompatible_index`, `500 internal_error`, `503 index_unavailable` |
+| `GET /api/preview?chunk=<id>` | Token; no body; exact query `chunk=<^[1-9]\d{0,18}$>` | `200 {chunk, kind, path, locator, location, text, page_image}` | `400 invalid_request`, `403 forbidden`, `404 not_found`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `409 incompatible_index`, `500 internal_error`, `503 index_unavailable` |
+| `GET /api/preview/page?chunk=<id>` | Token; no body; exact query `chunk=<^[1-9]\d{0,18}$>` | `200` raw `image/png` bytes (`Content-Type: image/png`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, no CORS) | `400 invalid_request`, `403 forbidden`, `404 not_found`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `409 incompatible_index`, `500 internal_error`, `503 index_unavailable` |
+| `POST /api/open` | Token; no query; JSON `{chunk: int}` (`> 0`, strict integer, no unknown keys) | `200 {opened: true}` | `400 invalid_request`, `403 forbidden`, `404 not_found`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `409 incompatible_index`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable` |
+| `POST /api/search` | Token; no query; JSON `{query, mode?, k?, per_file?, path?, kind?, since?, module?, week?, spread?}` | `200 {hits: Hit[], took_ms: number, spread?: SpreadGroup[]}` | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable`, `503 model_unavailable`, `503 daemon_failure` |
+| `POST /api/model/check` | Token; no query; JSON exactly `{}` | `202 {job_id: string}`; job result arrives through the job endpoint | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error` |
+| `POST /api/index` | Token; no query; JSON exactly `{}`; targets come only from validated config | `202 {job_id: string}` | `400 invalid_request`, `400 no_roots`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 daemon_active`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable`, `503 model_unavailable` |
+| `POST /api/setup/download` | Token; no query; JSON `{}` or `{rerank?: boolean}` | `202 {job_id: string}`; runs model/grammar download job | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error` |
+| `GET /api/jobs/{job_id}` | Token; no body; no query; job ID is a server-issued opaque string | `200` job object with state, operation, timestamps, report/error, and truncation flags | `400 invalid_request`, `403 forbidden`, `404 job_not_found`, `405 method_not_allowed`, `500 internal_error` |
+| `GET /`, `/index.html`, `/styles.css`, `/app.js` | No token; no query; exact Host; matching Origin or allowed `Sec-Fetch-Site` required | `200` packaged asset with the correct MIME type | `400 invalid_request` for query string; `404 not_found` for a missing allowlisted asset or unknown path; `405 method_not_allowed` for non-GET; `403 forbidden` for Host/Origin/Sec-Fetch |
 
 Unknown routes return `404 not_found`. There is no directory listing and no
 document-serving route. A missing allowlisted asset is `404 not_found`, not a
@@ -108,7 +121,8 @@ client must tolerate the two default-valued write-metadata fields.
   the UI corresponds to `loading`.
 - Job states: `running`, `succeeded`, `partial`, `failed`. `queued` does not
   exist.
-- Activity lane values: `idle`, `search`, `model_check`, `index`.
+- Job operations: `model_check`, `index`, `download`.
+- Activity lane values: `idle`, `search`, `model_check`, `index`, `download`.
 
 `ready` must reflect a successful local check/load, not merely a directory that
 happens to exist. `partial` is used if and only if a completed index report has
@@ -184,7 +198,7 @@ Do not add undocumented keys to `limits`; the frontend may rely on these names.
     "roots": 0,
     "message": null
   },
-  "activity": {"lane": "idle | search | model_check | index", "job_id": null}
+  "activity": {"lane": "idle | search | model_check | index | download", "job_id": null}
 }
 ```
 
@@ -527,12 +541,71 @@ model.
 - Shutdown waits for an active `Indexer.sync`; there is no cancellation hook
   and a browser disconnect is not cancellation.
 
+## Remove folder semantics
+
+- `POST /api/roots/remove` accepts `{path, revision}` and runs inside the
+  engine lane (`409 busy` when another engine operation is running).
+- If a seekr daemon socket is live, refuse with `409 daemon_active` before
+  editing config or touching the index database.
+- Matches the submitted `path` canonically against stored config roots (allowing
+  a previously deleted directory on disk to be removed cleanly); if no
+  configured root matches, raises `400 invalid_root`.
+- Enforces the same TOML-preserving editor and `409 stale_config` revision
+  checks as `POST /api/roots`.
+- When the index database exists and is ready, purges indexed documents under
+  the removed root via `Store.delete_documents_under` (component-aware prefix,
+  so removing `/tmp/root` never deletes `/tmp/root2`), along with their chunks,
+  FTS rows, and vectors.
+
+## Course overview, preview, and open semantics
+
+- `GET /api/course` reads `Store.course_summary()` using a read-only Store
+  without loading any embedding model. Missing or empty databases return
+  `{"modules": []}`. Unassigned documents (`module is None`) are omitted;
+  named modules are sorted case-insensitively by `name`, with `display`
+  formatted by `course.display_module(name)`, unique sorted non-null integer
+  `weeks`, and total `files` across all indexed files in that module.
+- `GET /api/preview?chunk=<id>` looks up an indexed chunk in a read-only Store
+  and returns `{chunk, kind, path, locator, location, text, page_image}`. Unknown
+  chunk IDs return `404 not_found`. `location` uses WSL-aware Windows path
+  formatting when running on WSL; `page_image` is `true` when `kind == "pdf"`
+  and the PDF file exists on disk.
+- `GET /api/preview/page?chunk=<id>` renders the 1-based page from `locator`
+  (`p.<N>`, defaulting to page 1 when `locator` is empty) using PyMuPDF at zoom
+  `1.5`, scaling down (`min(1.5, 2000.0 / page.rect.width)`) so the rendered PNG
+  width is at most `2000` pixels. Unknown chunks, non-PDF chunks, missing or
+  unreadable PDFs, and out-of-range page numbers return `404 not_found`. The
+  response emits raw `image/png` bytes with `Content-Type: image/png`,
+  `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, the baseline
+  security headers, and no CORS headers.
+- `POST /api/open` accepts `{chunk: int}` (strict integer `> 0`), resolves the
+  indexed chunk, builds the argv via `seekr.opener.open_command` (WSL-aware),
+  and executes it directly without a shell (`subprocess.run(argv, check=False)`),
+  honoring `opener.OPEN_SUCCESS_CODES`. Unknown chunks return `404 not_found`;
+  opener launch failures return `500 internal_error`.
+
+## Model download setup semantics
+
+- `POST /api/setup/download` accepts `{}` or `{"rerank": <bool>}` (strict
+  boolean defaulting to `false`; unknown keys or non-booleans return
+  `400 invalid_request`).
+- Runs as a background job with operation `"download"` in the engine lane
+  (`409 busy` if occupied).
+- Spawns `[sys.executable, "-m", "seekr", "models", "pull", "--yes", "--grammars"]`
+  (plus `"--rerank"` when `rerank` is `true`) in a subprocess with
+  `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`, and `HF_DATASETS_OFFLINE` scrubbed
+  from the child environment so downloads succeed even when the web server
+  configured an offline parent process.
+- Captures stdout and stderr, retains the last `50` output lines in
+  `report.lines`, and transitions the job to `"succeeded"` on exit `0` or
+  `"failed"` with a safe error summary on non-zero exit.
+
 ## Job response and report
 
 ```json
 {
   "job_id": "server-issued-opaque-string",
-  "operation": "index | model_check",
+  "operation": "index | model_check | download",
   "state": "running | succeeded | partial | failed",
   "started_at": "2026-11-20T12:34:56Z",
   "finished_at": null,
@@ -568,7 +641,9 @@ Only the first 100 errors and first 100 warnings are serialized; totals and
 truncation flags always describe the full report. `partial` is used iff
 `error_total > 0`. Warnings alone do not make a job partial. A failed job may
 have `report: null` and an `error` string. For a successful `model_check`,
-`report` is `{"model": "…", "dim": 384}`. `Indexer.sync` remains the owner of
+`report` is `{"model": "…", "dim": 384}`. For a `download` job, `report` is
+`{"rerank": false, "returncode": 0, "lines": ["..."]}` containing at most the
+last 50 captured output lines. `Indexer.sync` remains the owner of
 the persisted last-error count.
 
 Retain at most 20 jobs in memory, dropping the oldest finished job first.
@@ -586,25 +661,25 @@ request bodies, document text, tracebacks, or the token.
 
 | HTTP | Code | Meaning and applicable endpoints |
 | --- | --- | --- |
-| 400 | `invalid_request` | Malformed JSON, unknown fields/types, duplicate sensitive headers, missing content length, invalid query/mode/k/per_file/kind/since/module/week/spread (including unknown or ambiguous module), bootstrap-header failure. All body-taking routes and session. |
-| 400 | `invalid_root` | Submitted root is missing, not a readable directory, contains NUL, is not valid UTF-8, or exceeds 4,096 bytes. `POST /api/roots`. |
+| 400 | `invalid_request` | Malformed JSON, unknown fields/types, duplicate sensitive headers, missing content length, invalid or disallowed query strings, invalid search filters/mode/k/per_file/spread, invalid chunk/rerank fields, bootstrap-header failure. All routes. |
+| 400 | `invalid_root` | Submitted root is missing, not a readable directory, contains NUL, is not valid UTF-8, exceeds 4,096 bytes, or is not configured on remove. `POST /api/roots`, `POST /api/roots/remove`. |
 | 400 | `roots_limit` | The 50-root limit would be exceeded. `POST /api/roots`. |
 | 400 | `no_roots` | Index requested with no configured roots. `POST /api/index`. |
 | 403 | `forbidden` | Bad Host, bad Origin, cross-site/same-site fetch metadata, missing/wrong token. All token-protected routes and static assets for Host/fetch violations. |
-| 404 | `not_found` | Unknown route, unknown path, or missing allowlisted asset. Static and unknown routes. |
+| 404 | `not_found` | Unknown route, unknown path, missing allowlisted asset, or unknown/missing chunk or PDF preview page. Static, unknown, preview, and open routes. |
 | 404 | `job_not_found` | Unknown, expired, or malformed job ID. `GET /api/jobs/{job_id}`. |
 | 405 | `method_not_allowed` | Wrong method, including `OPTIONS`; no CORS/preflight response. Every route. |
-| 409 | `busy` | A second engine operation is active, a root write conflicts with the engine lane, or a keyword read cannot obtain its snapshot within the bounded wait. `POST /api/search`, `POST /api/roots`, `POST /api/model/check`, `POST /api/index`. |
-| 409 | `stale_config` | Revision mismatch or an external edit was detected before replace. `POST /api/roots`. |
-| 409 | `daemon_active` | A seekr daemon socket is live and a web index was requested. `POST /api/index`. |
-| 409 | `incompatible_index` | Stored model/schema/quantization metadata is incompatible with the config. Local search and `POST /api/index` preflight. |
+| 409 | `busy` | A second engine operation is active, a root write conflicts with the engine lane, or a read/purge cannot obtain its snapshot within the bounded wait. `POST /api/search`, `POST /api/roots`, `POST /api/roots/remove`, `POST /api/model/check`, `POST /api/index`, `POST /api/setup/download`, `GET /api/course`, `GET /api/preview`, `GET /api/preview/page`, `POST /api/open`. |
+| 409 | `stale_config` | Revision mismatch or an external edit was detected before replace. `POST /api/roots`, `POST /api/roots/remove`. |
+| 409 | `daemon_active` | A seekr daemon socket is live and a web index or folder removal was requested. `POST /api/index`, `POST /api/roots/remove`. |
+| 409 | `incompatible_index` | Stored model/schema/quantization metadata is incompatible with the config. Local search, `POST /api/index`, `GET /api/course`, `GET /api/preview`, `GET /api/preview/page`, `POST /api/open`. |
 | 409 | `duplicate_root` | The canonical path already exists in roots. `POST /api/roots`. |
-| 409 | `config_invalid` | Config is malformed, unsupported, ambiguous, or unsafe to edit. `GET /api/roots`, `POST /api/roots`, `POST /api/search`, `POST /api/model/check`, `POST /api/index`. Status reports invalid config in its `200` body instead. |
+| 409 | `config_invalid` | Config is malformed, unsupported, ambiguous, or unsafe to edit. `GET /api/roots`, `POST /api/roots`, `POST /api/roots/remove`, `GET /api/course`, `GET /api/preview`, `GET /api/preview/page`, `POST /api/open`, `POST /api/search`, `POST /api/model/check`, `POST /api/index`, `POST /api/setup/download`. Status reports invalid config in its `200` body instead. |
 | 413 | `payload_too_large` | Body exceeds 64 KiB. Body-taking routes. |
 | 415 | `unsupported_media_type` | Wrong Content-Type, unsupported charset, or chunked transfer encoding. Body-taking routes. |
-| 500 | `internal_error` | Unexpected server failure with no safe-specific code. Every route. |
-| 500 | `config_write_failed` | Validated config could not be written/replaced. `POST /api/roots`. |
-| 503 | `index_unavailable` | Index inspection reports `error` (corrupt/unreadable database). Status still returns `200` with `index.state = "error"`. `POST /api/search`, `POST /api/index` preflight. |
+| 500 | `internal_error` | Unexpected server failure or opener launch failure with no safe-specific code. Every route. |
+| 500 | `config_write_failed` | Validated config could not be written/replaced. `POST /api/roots`, `POST /api/roots/remove`. |
+| 503 | `index_unavailable` | Index inspection reports `error` (corrupt/unreadable database). Status still returns `200` with `index.state = "error"`. `POST /api/search`, `POST /api/index`, `GET /api/course`, `GET /api/preview`, `GET /api/preview/page`, `POST /api/open`. |
 | 503 | `model_unavailable` | Hybrid/vector search or index requested while the model is known unavailable. `POST /api/search`, `POST /api/index`. |
 | 503 | `daemon_failure` | A reachable daemon failed a search/protocol interaction; do not hide it with a cold local retry. `POST /api/search`. |
 
@@ -655,10 +730,14 @@ Referrer-Policy: no-referrer
   style attributes, no `eval`, no `document.write`, and no `innerHTML`. Render
   paths, locators, errors, and snippets as text nodes. Query-term highlighting
   may create text nodes and safe `<mark>` elements only.
-- No external asset fetch, remote font/image/script URL, telemetry, document
-  serving route, arbitrary filesystem read, shell endpoint, executable launch,
-  directory traversal, or directory listing. The asset allowlist is exact:
-  `/`, `/index.html`, `/styles.css`, `/app.js`; missing assets are `404`.
+- No external asset fetch, remote font/image/script URL, telemetry, arbitrary
+  document-serving route, arbitrary filesystem read, shell endpoint, arbitrary
+  executable launch, directory traversal, or directory listing. Preview and open
+  routes accept only server-indexed positive integer chunk IDs (`/api/preview`,
+  `/api/preview/page`, `/api/open`), and `/api/open` executes only the
+  allowlisted argv produced by `seekr.opener.open_command` without a shell. The
+  asset allowlist is exact: `/`, `/index.html`, `/styles.css`, `/app.js`; missing
+  assets are `404`.
 
 ## Backend protocol and DTOs
 
@@ -672,9 +751,15 @@ class WebBackend(Protocol):
     def status(self) -> StatusView: ...
     def roots(self) -> RootsView: ...
     def add_root(self, path: str, revision: str) -> RootsView: ...
+    def remove_root(self, path: str, revision: str) -> RootsView: ...
+    def course(self) -> CourseView: ...
+    def preview(self, chunk_id: int) -> PreviewView: ...
+    def preview_page_png(self, chunk_id: int) -> bytes: ...
+    def open_chunk(self, chunk_id: int) -> None: ...
     def search(self, request: SearchRequest) -> SearchResult: ...
     def start_model_check(self) -> str: ...
     def start_index(self) -> str: ...
+    def start_download(self, rerank: bool = False) -> str: ...
     def job(self, job_id: str) -> JobView: ...
 ```
 
@@ -691,6 +776,11 @@ DTOs are frozen dataclasses with `to_dict()` methods:
   (Windows drive path when on WSL and mounted from a drive letter, otherwise
   POSIX path) and `posix_location` always uses the POSIX path; no `explain`
   field, and `to_dict()` must not emit `explain`.
+- `CourseModuleDTO(name, display, weeks=(), files=0)` and
+  `CourseView(modules=())` serialize to
+  `{"modules": [{"name": str, "display": str, "weeks": int[], "files": int}]}`.
+- `PreviewView(chunk, kind, path, locator, location, text, page_image=False)`
+  serializes to `{"chunk", "kind", "path", "locator", "location", "text", "page_image"}`.
 - `SearchRequest(query, mode="hybrid", k=10, per_file=2, path=None, kind=None,
   since=None, module=None, week=None, spread=False)`. `to_query_kwargs()` maps
   wire field `path` to `get_hits(path_prefix=...)` and returns exactly `query`,
@@ -703,18 +793,18 @@ DTOs are frozen dataclasses with `to_dict()` methods:
   daemon_restart_required=False, warning=None)` serializes all five fields;
   GET uses the defaults noted above.
 - `JobView(job_id, operation, state, started_at, finished_at, elapsed_ms,
-  report, error)` validates that `state` is one of `running`, `succeeded`,
-  `partial`, or `failed`. `report` is `null` while running or for a failed job
-  without a report.
+  report, error)` validates that `operation` is in `JOB_OPERATIONS` and `state`
+  is one of `running`, `succeeded`, `partial`, or `failed`. `report` is `null`
+  while running or for a failed job without a report.
 - `StatusView(index, model, daemon, config, activity)` serializes the five
   documented status objects.
 
 `ApiError(status, code, message, fields=None)` validates that `code` exists in
 `ERROR_STATUS` and that `status` matches its frozen value. Its `to_envelope()`
 returns exactly `{"error": {"code", "message"}}`, adding `"fields"` only when
-there are safe field strings. `LIMITS`, `ERROR_STATUS`, the state tuples
-(`INDEX_STATES`, `MODEL_STATES`, `JOB_STATES`, `LANES`), `ASSET_ALLOWLIST`, and
-`ASSET_MIME_TYPES` in `src/seekr/web_contract.py` are the executable copies of
-the frozen lists in this document. The contract module imports only the
-standard library; it must not import `http.server`, numpy, torch,
-sentence-transformers, sqlite-vec, or any backend module.
+there are safe field strings. `LIMITS`, `ERROR_STATUS`, the state/operation tuples
+(`INDEX_STATES`, `MODEL_STATES`, `JOB_OPERATIONS`, `JOB_STATES`, `LANES`),
+`ASSET_ALLOWLIST`, and `ASSET_MIME_TYPES` in `src/seekr/web_contract.py` are the
+executable copies of the frozen lists in this document. The contract module
+imports only the standard library; it must not import `http.server`, numpy,
+torch, sentence-transformers, sqlite-vec, or any backend module.

@@ -18,6 +18,7 @@ from seekr.web_config import (
     config_revision,
     inspect_config,
     read_roots,
+    remove_root,
     set_roots,
     toml_string,
 )
@@ -483,3 +484,128 @@ def test_set_roots_appends_when_absent_and_checks_revision(tmp_path: Path) -> No
     cleared = set_roots(config, [])
     assert cleared.roots == ()
     assert load_config(config).roots == ()
+
+
+def test_remove_root_preserves_comments_other_keys_crlf_and_trailing_comment(
+    tmp_path: Path,
+) -> None:
+    first = _root(tmp_path, "first")
+    second = _root(tmp_path, "second")
+    config = _write(
+        tmp_path / "config.toml",
+        (
+            "# leading comment\r\n"
+            'embed_model = "fake"\r\n'
+            f"roots  =  [ {_toml_path(first)}, {_toml_path(second)} ]  # keep me\r\n"
+            "# trailing comment\r\n"
+        ),
+    )
+
+    snapshot = remove_root(config, str(first), config_revision(config))
+
+    expected = (
+        "# leading comment\r\n"
+        'embed_model = "fake"\r\n'
+        f"roots  =  [{_toml_path(second)}]  # keep me\r\n"
+        "# trailing comment\r\n"
+    ).encode()
+    assert config.read_bytes() == expected
+    assert snapshot.roots == (str(second),)
+    assert snapshot.revision == hashlib.sha256(expected).hexdigest()
+    assert load_config(config).roots == (second,)
+
+
+def test_remove_root_matches_canonically_and_allows_missing_dir_on_disk(
+    tmp_path: Path,
+) -> None:
+    first = _root(tmp_path, "first")
+    second = _root(tmp_path, "second")
+    alias = tmp_path / "second-link"
+    alias.symlink_to(second)
+    config = _config_with_roots(tmp_path, [first, second])
+
+    # Remove a folder that was already deleted from disk, passing a trailing slash.
+    first.rmdir()
+    after_first = remove_root(config, f"{first}/", config_revision(config))
+    assert after_first.roots == (str(second),)
+
+    # Remove via a symlink alias to the remaining root, leaving roots = [].
+    after_second = remove_root(config, str(alias), after_first.revision)
+    assert after_second.roots == ()
+    assert load_config(config).roots == ()
+
+
+def test_remove_root_unknown_or_invalid_raises_invalid_root_without_touching_file(
+    tmp_path: Path,
+) -> None:
+    first = _root(tmp_path, "first")
+    other = _root(tmp_path, "other")
+    config = _config_with_roots(tmp_path, [first])
+    before = config.read_bytes()
+    revision = config_revision(config)
+
+    for bad_path in (str(other), "", "   ", "bad\x00path", "\ud800", "a" * 4097):
+        with pytest.raises(ApiError) as raised:
+            remove_root(config, bad_path, revision)
+        assert _code(raised.value) == "invalid_root"
+        assert raised.value.status == 400
+        assert "path" in (raised.value.fields or {})
+
+    assert config.read_bytes() == before
+
+    missing_config = tmp_path / "missing" / "config.toml"
+    with pytest.raises(ApiError) as raised:
+        remove_root(missing_config, str(other), config_revision(missing_config))
+    assert _code(raised.value) == "invalid_root"
+    assert not missing_config.exists()
+
+
+def test_remove_root_stale_revision_and_external_edit_raise_stale_config(
+    tmp_path: Path,
+) -> None:
+    first = _root(tmp_path, "first")
+    config = _config_with_roots(tmp_path, [first])
+    before = config.read_bytes()
+
+    with pytest.raises(ApiError) as raised:
+        remove_root(config, str(first), "0" * 64)
+    assert _code(raised.value) == "stale_config"
+    assert config.read_bytes() == before
+
+    real_load = load_config
+
+    def edit_after_validation(path: Path):
+        loaded = real_load(path)
+        if path.name.endswith(".tmp"):
+            config.write_bytes(before + b"# external edit\n")
+        return loaded
+
+    with (
+        mock.patch("seekr.web_config.load_config", side_effect=edit_after_validation),
+        pytest.raises(ApiError) as raised,
+    ):
+        remove_root(config, str(first), config_revision(config))
+
+    assert _code(raised.value) == "stale_config"
+    assert config.read_bytes() == before + b"# external edit\n"
+
+
+def test_remove_root_refuses_symlink_and_unsupported_toml_shapes(tmp_path: Path) -> None:
+    first = _root(tmp_path, "first")
+    target = _write(tmp_path / "real.toml", f"roots = [{_toml_path(first)}]\n")
+    link = tmp_path / "config.toml"
+    link.symlink_to(target)
+    before = target.read_bytes()
+
+    with pytest.raises(ApiError) as raised:
+        remove_root(link, str(first), config_revision(link))
+    assert _code(raised.value) == "config_invalid"
+    assert target.read_bytes() == before
+
+    multiline = _write(
+        tmp_path / "multiline.toml",
+        f'embed_model = "fake"\nroots = [\n  {_toml_path(first)},\n]\n',
+    )
+    with pytest.raises(ApiError) as raised:
+        remove_root(multiline, str(first), config_revision(multiline))
+    assert _code(raised.value) == "config_invalid"

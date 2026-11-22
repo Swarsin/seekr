@@ -11,8 +11,12 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import re
+import shutil
 import socket
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -31,14 +35,19 @@ from .config import (
     default_config_path,
     load_config,
 )
+from .course import display_module
 from .locations import format_location
 from .web_config import add_root as config_add_root
 from .web_config import inspect_config, read_roots
+from .web_config import remove_root as config_remove_root
 from .web_contract import (
     LIMITS,
     ApiError,
+    CourseModuleDTO,
+    CourseView,
     HitDTO,
     JobView,
+    PreviewView,
     RootsView,
     SearchRequest,
     SearchResult,
@@ -57,6 +66,15 @@ _STATUS_BUSY_TIMEOUT_SECONDS = 5.0
 _DIAGNOSTIC_LIMIT = LIMITS["errors_retained"]
 _JOBS_RETAINED = LIMITS["jobs_retained"]
 _DAEMON_PROBE_TIMEOUT = 0.2
+_DOWNLOAD_OUTPUT_LINES = 50
+_DEFAULT_PREVIEW_ZOOM = 1.5
+_MAX_PREVIEW_PNG_WIDTH = 2000.0
+_PDF_PAGE_LOCATOR_RE = re.compile(r"p\.(\d+)(?:-\d+)?\Z")
+_OFFLINE_ENV_KEYS = (
+    "HF_HUB_OFFLINE",
+    "TRANSFORMERS_OFFLINE",
+    "HF_DATASETS_OFFLINE",
+)
 _DAEMON_WARNING = (
     "a seekr daemon is running; restart it before relying on the new folder "
     "in daemon-backed searches"
@@ -941,6 +959,396 @@ class WebService:
             warning=_DAEMON_WARNING if present else None,
         )
 
+    def remove_root(self, path: str, revision: str) -> RootsView:
+        self._reject_if_shutting_down()
+        self._begin_lane("index")
+        try:
+            if self.daemon_present():
+                raise ApiError(
+                    409,
+                    "daemon_active",
+                    "a seekr daemon is running and maintains the index; stop the running "
+                    "`seekr daemon` process before removing a folder",
+                )
+            cfg = self._load_config()
+            db_path = Path(cfg.db_path).expanduser()
+            index_snapshot: _IndexSnapshot | None = None
+            if db_path.exists():
+                try:
+                    index_snapshot = self._inspect_index(cfg, self._read_busy_timeout)
+                except _SqliteBusyError as exc:
+                    raise ApiError(
+                        409, "busy", f"index is busy: {_safe_message(exc)}"
+                    ) from exc
+
+            prefixes = self._removed_root_prefixes(path, cfg.roots)
+            lock: Any = None
+            if index_snapshot is not None and index_snapshot.state == "ready":
+                lock = self._acquire_lifecycle_lock(
+                    cfg.db_path, "index is in use; could not remove folder"
+                )
+            try:
+                try:
+                    with self._config_write_lock:
+                        snapshot = config_remove_root(self._config_path, path, revision)
+                except ApiError:
+                    raise
+                except Exception as exc:
+                    raise ApiError(
+                        500, "internal_error", f"cannot remove the root: {_safe_message(exc)}"
+                    ) from exc
+
+                if (
+                    index_snapshot is not None
+                    and index_snapshot.state == "ready"
+                    and index_snapshot.dim is not None
+                    and prefixes
+                ):
+                    try:
+                        self._with_opened_store(
+                            cfg,
+                            index_snapshot,
+                            read_only=False,
+                            fn=lambda store: [
+                                store.delete_documents_under(prefix)
+                                for prefix in prefixes
+                            ],
+                        )
+                    except Exception as exc:
+                        raise self._map_index_read_error(exc) from exc
+            finally:
+                if lock is not None:
+                    with suppress(Exception):
+                        lock.release()
+        finally:
+            self._end_lane()
+
+        return RootsView(
+            roots=snapshot.roots,
+            config_path=str(snapshot.path),
+            revision=snapshot.revision,
+        )
+
+    @staticmethod
+    def _removed_root_prefixes(path: str, configured_roots: Sequence[Path]) -> list[str]:
+        prefixes: list[str] = []
+        try:
+            canonical = str(Path(path).expanduser().resolve(strict=False))
+        except (OSError, RuntimeError):
+            canonical = ""
+        try:
+            expanded = str(Path(path).expanduser())
+        except (OSError, RuntimeError):
+            expanded = ""
+        for candidate in (canonical, expanded):
+            if candidate and candidate != "/" and candidate not in prefixes:
+                prefixes.append(candidate)
+        if canonical:
+            for existing in configured_roots:
+                try:
+                    existing_resolved = str(existing.expanduser().resolve(strict=False))
+                except (OSError, RuntimeError):
+                    continue
+                if existing_resolved == canonical:
+                    exp = str(existing.expanduser())
+                    if exp and exp != "/" and exp not in prefixes:
+                        prefixes.append(exp)
+        return prefixes
+
+    # -- course, preview, open ---------------------------------------------
+
+    def _acquire_lifecycle_lock(self, db_path: Path, message_prefix: str) -> Any:
+        from .lifecycle import LifecycleLock, LifecycleLockError
+
+        deadline = time.monotonic() + self._lock_wait_seconds
+        while True:
+            candidate = LifecycleLock(db_path, shared=True, blocking=False)
+            try:
+                candidate.acquire()
+            except LifecycleLockError as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ApiError(
+                        409,
+                        "busy",
+                        f"{message_prefix}: {_safe_message(exc)}",
+                    ) from exc
+                time.sleep(min(0.05, remaining))
+            else:
+                return candidate
+
+    def _with_opened_store(
+        self,
+        cfg: Config,
+        snapshot: _IndexSnapshot,
+        *,
+        read_only: bool,
+        fn: Callable[[Any], Any],
+    ) -> Any:
+        if snapshot.dim is None or snapshot.vector_quant is None:
+            raise ApiError(503, "index_unavailable", "index metadata could not be read")
+        from .store import Store
+
+        store_factory = self._store_factory or Store
+        kwargs: dict[str, Any] = {"vector_quant": snapshot.vector_quant}
+        if read_only:
+            kwargs["read_only"] = True
+        store: object | None = None
+        try:
+            try:
+                store = store_factory(
+                    snapshot.db_path,
+                    cfg.embed_model,
+                    snapshot.dim,
+                    **kwargs,
+                )
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+                if _is_busy_error(exc):
+                    raise ApiError(409, "busy", f"index is busy: {_safe_message(exc)}") from exc
+                raise
+            return fn(store)
+        finally:
+            if store is not None:
+                with suppress(Exception):
+                    store.close()  # type: ignore[attr-defined]
+
+    def _with_read_only_store(
+        self,
+        cfg: Config,
+        snapshot: _IndexSnapshot,
+        fn: Callable[[Any], Any],
+    ) -> Any:
+        lock = self._acquire_lifecycle_lock(
+            cfg.db_path,
+            "index is busy; could not take a lifecycle lock",
+        )
+        try:
+            return self._with_opened_store(cfg, snapshot, read_only=True, fn=fn)
+        finally:
+            with suppress(Exception):
+                lock.release()
+
+    @staticmethod
+    def _map_index_read_error(exc: BaseException) -> ApiError:
+        from .lifecycle import LifecycleError
+        from .store import ModelMismatchError, SchemaVersionError
+
+        if isinstance(exc, ApiError):
+            return exc
+        if isinstance(exc, (ModelMismatchError, SchemaVersionError)):
+            return ApiError(409, "incompatible_index", _safe_message(exc))
+        if isinstance(exc, LifecycleError) or _is_busy_error(exc):
+            return ApiError(409, "busy", f"index is busy: {_safe_message(exc)}")
+        if isinstance(exc, (sqlite3.Error, OSError)):
+            return ApiError(
+                503, "index_unavailable", f"cannot read the index: {_safe_message(exc)}"
+            )
+        return ApiError(500, "internal_error", f"index operation failed: {_safe_message(exc)}")
+
+    def course(self) -> CourseView:
+        self._reject_if_shutting_down()
+        cfg = self._load_config()
+        snapshot = self._preflight_search(cfg)
+        if snapshot.state in ("missing", "empty"):
+            return CourseView(modules=())
+        try:
+            rows = self._with_read_only_store(
+                cfg, snapshot, lambda store: store.course_summary()
+            )
+        except Exception as exc:
+            raise self._map_index_read_error(exc) from exc
+
+        by_module: dict[str, tuple[set[int], int]] = {}
+        for module, week, file_count in rows:
+            if module is None:
+                continue
+            weeks, total_files = by_module.setdefault(module, (set(), 0))
+            if week is not None:
+                weeks.add(int(week))
+            by_module[module] = (weeks, total_files + int(file_count))
+
+        modules = tuple(
+            CourseModuleDTO(
+                name=name,
+                display=display_module(name) or name,
+                weeks=tuple(sorted(weeks)),
+                files=total_files,
+            )
+            for name, (weeks, total_files) in sorted(
+                by_module.items(),
+                key=lambda item: (item[0].casefold(), item[0]),
+            )
+        )
+        return CourseView(modules=modules)
+
+    def _fetch_chunk(self, chunk_id: int) -> Any:
+        self._reject_if_shutting_down()
+        if type(chunk_id) is not int or chunk_id <= 0:
+            raise ApiError(
+                400,
+                "invalid_request",
+                "chunk must be a positive integer",
+                {"chunk": "chunk must be a positive integer"},
+            )
+        if chunk_id > _SQLITE_INT_MAX:
+            raise ApiError(404, "not_found", f"chunk {chunk_id} not found")
+        cfg = self._load_config()
+        snapshot = self._preflight_search(cfg)
+        if snapshot.state in ("missing", "empty"):
+            raise ApiError(404, "not_found", f"chunk {chunk_id} not found")
+        try:
+            chunks = self._with_read_only_store(
+                cfg, snapshot, lambda store: store.fetch_chunks([chunk_id])
+            )
+        except Exception as exc:
+            raise self._map_index_read_error(exc) from exc
+        row = chunks.get(chunk_id)
+        if row is None:
+            raise ApiError(404, "not_found", f"chunk {chunk_id} not found")
+        return row
+
+    def preview(self, chunk_id: int) -> PreviewView:
+        row = self._fetch_chunk(chunk_id)
+        is_wsl = platform_info.is_wsl()
+        mounts = platform_info.read_mounts() if is_wsl else ()
+        win = platform_info.windows_path(row.path, mounts) if is_wsl else None
+        location = format_location(row.path, row.locator, windows_path=win)
+        page_image = False
+        if row.kind == "pdf":
+            try:
+                page_image = Path(row.path).is_file()
+            except OSError:
+                page_image = False
+        return PreviewView(
+            chunk=int(row.id),
+            kind=str(row.kind),
+            path=str(row.path),
+            locator=str(row.locator),
+            location=location,
+            text=str(row.text),
+            page_image=page_image,
+        )
+
+    @staticmethod
+    def _parse_pdf_page_index(locator: str) -> int:
+        text = locator.strip()
+        if not text:
+            return 0
+        match = _PDF_PAGE_LOCATOR_RE.fullmatch(text)
+        if match is None:
+            raise ApiError(404, "not_found", "PDF chunk has no valid page locator")
+        page_num = int(match.group(1))
+        if page_num < 1:
+            raise ApiError(404, "not_found", "PDF page number out of range")
+        return page_num - 1
+
+    def preview_page_png(self, chunk_id: int) -> bytes:
+        row = self._fetch_chunk(chunk_id)
+        if row.kind != "pdf":
+            raise ApiError(
+                404, "not_found", "page preview is only available for PDF chunks"
+            )
+        page_index = self._parse_pdf_page_index(str(row.locator))
+        pdf_path = Path(str(row.path))
+        try:
+            exists = pdf_path.is_file()
+        except OSError:
+            exists = False
+        if not exists:
+            raise ApiError(404, "not_found", "PDF file is not available on disk")
+
+        try:
+            import pymupdf
+        except ImportError:
+            try:
+                import fitz as pymupdf  # type: ignore[no-redef]
+            except ImportError as exc:
+                raise ApiError(
+                    500, "internal_error", "PyMuPDF is required to render PDF pages"
+                ) from exc
+
+        try:
+            doc = pymupdf.open(pdf_path)
+        except FileNotFoundError as exc:
+            raise ApiError(
+                404, "not_found", "PDF file is not available on disk"
+            ) from exc
+        except Exception as exc:
+            raise ApiError(404, "not_found", "PDF file cannot be opened") from exc
+
+        try:
+            if getattr(doc, "needs_pass", False):
+                raise ApiError(404, "not_found", "encrypted PDF cannot be previewed")
+            page_count = len(doc)
+            if page_index < 0 or page_index >= page_count:
+                raise ApiError(404, "not_found", "PDF page number out of range")
+            page = doc[page_index]
+            width = float(page.rect.width)
+            zoom = _DEFAULT_PREVIEW_ZOOM
+            if width > 0 and width * zoom > _MAX_PREVIEW_PNG_WIDTH:
+                zoom = min(_DEFAULT_PREVIEW_ZOOM, _MAX_PREVIEW_PNG_WIDTH / width)
+            pixmap = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
+            if pixmap.width > int(_MAX_PREVIEW_PNG_WIDTH) and width > 0:
+                adjusted = (_MAX_PREVIEW_PNG_WIDTH - 0.5) / width
+                pixmap = page.get_pixmap(matrix=pymupdf.Matrix(adjusted, adjusted))
+            return bytes(pixmap.tobytes("png"))
+        except ApiError:
+            raise
+        except Exception as exc:
+            raise ApiError(404, "not_found", "PDF page could not be rendered") from exc
+        finally:
+            doc.close()
+
+    def open_chunk(self, chunk_id: int) -> None:
+        from .opener import OPEN_SUCCESS_CODES, open_command
+
+        row = self._fetch_chunk(chunk_id)
+        is_wsl = platform_info.is_wsl()
+        mounts = platform_info.read_mounts() if is_wsl else ()
+
+        def to_windows(path_value: str) -> str | None:
+            return platform_info.windows_path(
+                path_value, mounts
+            ) or platform_info.wslpath_windows(path_value)
+
+        try:
+            argv = open_command(
+                str(row.path),
+                str(row.locator),
+                str(row.kind),
+                os.environ,
+                shutil.which,
+                wsl=is_wsl,
+                to_windows=to_windows,
+            )
+        except ValueError as exc:
+            raise ApiError(500, "internal_error", _safe_message(exc)) from exc
+
+        try:
+            result = subprocess.run(argv, check=False)
+        except FileNotFoundError as exc:
+            raise ApiError(
+                500,
+                "internal_error",
+                f"cannot run {argv[0]!r}: executable not found",
+            ) from exc
+        except (OSError, ValueError) as exc:
+            raise ApiError(
+                500,
+                "internal_error",
+                f"cannot run {argv[0]!r}: {_safe_message(exc)}",
+            ) from exc
+
+        success_codes = OPEN_SUCCESS_CODES.get(
+            Path(argv[0]).name.lower(), frozenset({0})
+        )
+        if result.returncode not in success_codes:
+            raise ApiError(
+                500,
+                "internal_error",
+                f"opener {argv[0]!r} exited with status {result.returncode}",
+            )
+
     # -- search ------------------------------------------------------------
 
     @staticmethod
@@ -1100,47 +1508,12 @@ class WebService:
     def _keyword_search(
         self, cfg: Config, request: SearchRequest, snapshot: _IndexSnapshot
     ) -> tuple[list[object], list[object] | None]:
-        if snapshot.dim is None or snapshot.vector_quant is None:
-            raise ApiError(503, "index_unavailable", "index metadata could not be read")
         from .cli_search import get_hits
-        from .lifecycle import LifecycleLock, LifecycleLockError
         from .search import Searcher
-        from .store import Store
 
-        deadline = time.monotonic() + self._lock_wait_seconds
-        lock: LifecycleLock | None = None
-        while lock is None:
-            candidate = LifecycleLock(cfg.db_path, shared=True, blocking=False)
-            try:
-                candidate.acquire()
-            except LifecycleLockError as exc:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise ApiError(
-                        409,
-                        "busy",
-                        f"index is busy; could not take a lifecycle lock: {_safe_message(exc)}",
-                    ) from exc
-                time.sleep(min(0.05, remaining))
-            else:
-                lock = candidate
-
-        store_factory = self._store_factory or Store
         searcher_factory = self._searcher_factory or Searcher
-        store: object | None = None
-        try:
-            try:
-                store = store_factory(
-                    snapshot.db_path,
-                    cfg.embed_model,
-                    snapshot.dim,
-                    vector_quant=snapshot.vector_quant,
-                    read_only=True,
-                )
-            except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
-                if _is_busy_error(exc):
-                    raise ApiError(409, "busy", f"index is busy: {_safe_message(exc)}") from exc
-                raise
+
+        def run_with_store(store: object) -> tuple[list[object], list[object] | None]:
             keyword_embedder = self._cached_embedder(cfg.embed_model) or _KeywordEmbedder(
                 cfg.embed_model
             )
@@ -1169,11 +1542,8 @@ class WebService:
             if request.spread:
                 spread_hits = run_query(self._spread_request(request)) if hits else []
             return hits, spread_hits
-        finally:
-            if store is not None:
-                with suppress(Exception):
-                    store.close()
-            lock.release()
+
+        return self._with_read_only_store(cfg, snapshot, run_with_store)
 
     def _hybrid_local_search(
         self, cfg: Config, request: SearchRequest
@@ -1392,25 +1762,11 @@ class WebService:
         try:
             embedder, dim = self._load_model_for_lane(cfg)
             from .indexer import Indexer
-            from .lifecycle import LifecycleLock, LifecycleLockError
             from .store import Store
 
-            deadline = time.monotonic() + self._lock_wait_seconds
-            while lock is None:
-                candidate = LifecycleLock(cfg.db_path, shared=True, blocking=False)
-                try:
-                    candidate.acquire()
-                except LifecycleLockError as exc:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise ApiError(
-                            409,
-                            "busy",
-                            f"index is in use; could not start indexing: {_safe_message(exc)}",
-                        ) from exc
-                    time.sleep(min(0.05, remaining))
-                else:
-                    lock = candidate
+            lock = self._acquire_lifecycle_lock(
+                cfg.db_path, "index is in use; could not start indexing"
+            )
 
             store_factory = self._store_factory or Store
             indexer_factory = self._indexer_factory or Indexer
@@ -1477,3 +1833,77 @@ class WebService:
                 f"embedding model {cfg.embed_model!r} is unavailable; run an explicit model check",
             )
         return self._start_job("index", lambda job_id: self._run_index_job(job_id, cfg))
+
+    # -- jobs: download ----------------------------------------------------
+
+    def _run_download_job(self, job_id: str, rerank: bool) -> None:
+        state = "failed"
+        report: dict[str, object] | None = None
+        error: str | None = "model download stopped unexpectedly"
+        try:
+            cmd = [
+                sys.executable,
+                "-m",
+                "seekr",
+                "models",
+                "pull",
+                "--yes",
+                "--grammars",
+            ]
+            if rerank:
+                cmd.append("--rerank")
+            env = dict(os.environ)
+            for key in _OFFLINE_ENV_KEYS:
+                env.pop(key, None)
+            result = subprocess.run(
+                cmd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            stdout_text = getattr(result, "stdout", None) or ""
+            stderr_text = getattr(result, "stderr", None) or ""
+            combined = "\n".join(part for part in (stdout_text, stderr_text) if part)
+            tail_lines = combined.splitlines()[-_DOWNLOAD_OUTPUT_LINES:]
+            returncode = int(getattr(result, "returncode", 1))
+            report = {
+                "rerank": rerank,
+                "returncode": returncode,
+                "lines": tail_lines,
+            }
+            if returncode == 0:
+                state = "succeeded"
+                error = None
+                with self._state_lock:
+                    if self._model_status == "unavailable":
+                        self._model_status = "unchecked"
+                        self._model_message = None
+            else:
+                last_line = next(
+                    (line.strip() for line in reversed(tail_lines) if line.strip()),
+                    None,
+                )
+                error = last_line or f"model download failed with exit code {returncode}"
+        except Exception as exc:  # noqa: BLE001 - report a safe job failure
+            error = _safe_message(exc)
+        finally:
+            self._finish_job_and_release_lane(
+                job_id, state, report=report, error=error
+            )
+
+    def start_download(self, rerank: bool = False) -> str:
+        if type(rerank) is not bool:
+            raise ApiError(
+                400,
+                "invalid_request",
+                "rerank must be a boolean",
+                {"rerank": "rerank must be a boolean"},
+            )
+        self._reject_if_shutting_down()
+        self._load_config()
+        return self._start_job(
+            "download",
+            lambda job_id: self._run_download_job(job_id, rerank),
+        )

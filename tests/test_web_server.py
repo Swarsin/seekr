@@ -44,11 +44,14 @@ from seekr.web_contract import (
 )
 from seekr.web_server import SECURITY_HEADERS, create_server, run_web
 from web_fixtures import (
+    COURSE_VIEW,
     JOB_FAILED,
     JOB_MODEL_SUCCEEDED,
     JOB_PARTIAL,
     JOB_RUNNING,
     JOB_SUCCEEDED,
+    PREVIEW_PNG_BYTES,
+    PREVIEW_VIEW,
     ROOTS_VIEW,
     SEARCH_RESULT,
     STATUS_READY,
@@ -1361,6 +1364,25 @@ _ERROR_CASES = [
     ("start_index", "POST", "/api/index", {}, "index_unavailable"),
     ("start_index", "POST", "/api/index", {}, "model_unavailable"),
     ("start_index", "POST", "/api/index", {}, "busy"),
+    ("start_download", "POST", "/api/setup/download", {}, "busy"),
+    ("start_download", "POST", "/api/setup/download", {"rerank": True}, "config_invalid"),
+    ("course", "GET", "/api/course", None, "incompatible_index"),
+    ("course", "GET", "/api/course", None, "index_unavailable"),
+    ("course", "GET", "/api/course", None, "config_invalid"),
+    ("course", "GET", "/api/course", None, "busy"),
+    ("preview", "GET", "/api/preview?chunk=1", None, "not_found"),
+    ("preview", "GET", "/api/preview?chunk=1", None, "incompatible_index"),
+    ("preview", "GET", "/api/preview?chunk=1", None, "index_unavailable"),
+    ("preview_page_png", "GET", "/api/preview/page?chunk=1", None, "not_found"),
+    ("preview_page_png", "GET", "/api/preview/page?chunk=1", None, "incompatible_index"),
+    ("open_chunk", "POST", "/api/open", {"chunk": 1}, "not_found"),
+    ("open_chunk", "POST", "/api/open", {"chunk": 1}, "internal_error"),
+    ("remove_root", "POST", "/api/roots/remove", {"path": "/p", "revision": "r"}, "invalid_root"),
+    ("remove_root", "POST", "/api/roots/remove", {"path": "/p", "revision": "r"}, "stale_config"),
+    ("remove_root", "POST", "/api/roots/remove", {"path": "/p", "revision": "r"}, "daemon_active"),
+    ("remove_root", "POST", "/api/roots/remove", {"path": "/p", "revision": "r"}, "busy"),
+    ("remove_root", "POST", "/api/roots/remove", {"path": "/p", "revision": "r"}, "config_invalid"),
+    ("remove_root", "POST", "/api/roots/remove", {"path": "/p", "revision": "r"}, "config_write_failed"),
     ("job", "GET", "/api/jobs/fixture-job", None, "job_not_found"),
 ]
 
@@ -2321,3 +2343,150 @@ def test_search_with_spread_returns_groups() -> None:
             )
             assert bad_resp.status == 400
             assert bad_resp.json()["error"]["code"] == "invalid_request"
+
+
+def test_course_preview_open_roots_remove_and_setup_download_routes() -> None:
+    with running_server() as (server, backend):
+        token = fetch_token(server)
+
+        course = request(server, "GET", "/api/course", headers={"X-Seekr-Token": token})
+        assert course.status == 200
+        assert course.json() == COURSE_VIEW.to_dict()
+
+        preview = request(
+            server, "GET", "/api/preview?chunk=12", headers={"X-Seekr-Token": token}
+        )
+        assert preview.status == 200
+        assert preview.json() == PREVIEW_VIEW.to_dict()
+        assert backend.calls[-1] == ("preview", {"chunk_id": 12})
+
+        page = request(
+            server,
+            "GET",
+            "/api/preview/page?chunk=12",
+            headers={"X-Seekr-Token": token},
+        )
+        assert page.status == 200
+        assert page.body == PREVIEW_PNG_BYTES
+        assert page.one_header("content-type") == "image/png"
+        assert page.one_header("cache-control") == "no-store"
+        assert page.one_header("x-content-type-options") == "nosniff"
+        assert not any(name.startswith("access-control-") for name in page.headers)
+
+        opened = request(
+            server,
+            "POST",
+            "/api/open",
+            headers=json_headers(token),
+            body=json.dumps({"chunk": 12}).encode(),
+        )
+        assert opened.status == 200
+        assert opened.json() == {"opened": True}
+        assert backend.calls[-1] == ("open_chunk", {"chunk_id": 12})
+
+        removed = request(
+            server,
+            "POST",
+            "/api/roots/remove",
+            headers=json_headers(token),
+            body=json.dumps(
+                {"path": "/tmp/opencode/docs", "revision": "rev-1"}
+            ).encode(),
+        )
+        assert removed.status == 200
+        assert removed.json() == ROOTS_VIEW.to_dict()
+        assert backend.calls[-1] == (
+            "remove_root",
+            {"path": "/tmp/opencode/docs", "revision": "rev-1"},
+        )
+
+        dl_default = request(
+            server,
+            "POST",
+            "/api/setup/download",
+            headers=json_headers(token),
+            body=b"{}",
+        )
+        assert dl_default.status == 202
+        assert dl_default.json() == {"job_id": "job-download-fixture"}
+        assert backend.calls[-1] == ("start_download", {"rerank": False})
+
+        dl_rerank = request(
+            server,
+            "POST",
+            "/api/setup/download",
+            headers=json_headers(token),
+            body=json.dumps({"rerank": True}).encode(),
+        )
+        assert dl_rerank.status == 202
+        assert backend.calls[-1] == ("start_download", {"rerank": True})
+
+
+def test_new_routes_validation_wrong_methods_and_error_envelopes() -> None:
+    with running_server() as (server, _backend):
+        token = fetch_token(server)
+
+        bad_posts = [
+            ("/api/open", {}),
+            ("/api/open", {"chunk": 0}),
+            ("/api/open", {"chunk": -5}),
+            ("/api/open", {"chunk": True}),
+            ("/api/open", {"chunk": "1"}),
+            ("/api/open", {"chunk": None}),
+            ("/api/open", {"chunk": 1, "extra": 1}),
+            ("/api/roots/remove", {"path": "/tmp/a"}),
+            ("/api/roots/remove", {"path": 5, "revision": "r"}),
+            ("/api/roots/remove", {"path": "/tmp/a", "revision": None}),
+            ("/api/roots/remove", {"path": "/tmp/a", "revision": "r", "extra": 1}),
+            ("/api/setup/download", {"rerank": 1}),
+            ("/api/setup/download", {"rerank": "true"}),
+            ("/api/setup/download", {"rerank": None}),
+            ("/api/setup/download", {"extra": True}),
+        ]
+        for path, payload in bad_posts:
+            resp = request(
+                server,
+                "POST",
+                path,
+                headers=json_headers(token),
+                body=json.dumps(payload).encode(),
+            )
+            assert resp.status == 400, (path, payload)
+            assert resp.json()["error"]["code"] == "invalid_request"
+
+        wrong_methods = [
+            ("POST", "/api/course", b"{}"),
+            ("POST", "/api/preview?chunk=1", b"{}"),
+            ("POST", "/api/preview/page?chunk=1", b"{}"),
+            ("GET", "/api/open", None),
+            ("GET", "/api/roots/remove", None),
+            ("GET", "/api/setup/download", None),
+            ("OPTIONS", "/api/course", None),
+            ("OPTIONS", "/api/preview?chunk=1", None),
+            ("OPTIONS", "/api/preview/page?chunk=1", None),
+            ("OPTIONS", "/api/open", None),
+            ("OPTIONS", "/api/roots/remove", None),
+            ("OPTIONS", "/api/setup/download", None),
+        ]
+        for method, path, body in wrong_methods:
+            headers = json_headers(token) if body is not None else {"X-Seekr-Token": token}
+            resp = request(server, method, path, headers=headers, body=body)
+            assert resp.status == 405, (method, path)
+            assert resp.json()["error"]["code"] == "method_not_allowed"
+            assert not any(name.startswith("access-control-") for name in resp.headers)
+
+
+def test_docs_web_api_documents_new_routes() -> None:
+    doc = (ROOT / "docs" / "web-api.md").read_text(encoding="utf-8")
+    for needle in (
+        "/api/course",
+        "/api/preview",
+        "/api/preview/page",
+        "/api/open",
+        "/api/roots/remove",
+        "/api/setup/download",
+        "image/png",
+        "2000",
+        "download",
+    ):
+        assert needle in doc, needle

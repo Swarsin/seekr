@@ -16,13 +16,17 @@ __all__ = [
     "ASSET_MIME_TYPES",
     "ERROR_STATUS",
     "INDEX_STATES",
+    "JOB_OPERATIONS",
     "JOB_STATES",
     "LANES",
     "LIMITS",
     "MODEL_STATES",
     "ApiError",
+    "CourseModuleDTO",
+    "CourseView",
     "HitDTO",
     "JobView",
+    "PreviewView",
     "RootsView",
     "SearchMode",
     "SearchRequest",
@@ -75,8 +79,9 @@ ERROR_STATUS: dict[str, int] = {
 
 INDEX_STATES: tuple[str, ...] = ("missing", "empty", "ready", "incompatible", "error")
 MODEL_STATES: tuple[str, ...] = ("unchecked", "loading", "ready", "unavailable")
+JOB_OPERATIONS: tuple[str, ...] = ("model_check", "index", "download")
 JOB_STATES: tuple[str, ...] = ("running", "succeeded", "partial", "failed")
-LANES: tuple[str, ...] = ("idle", "search", "model_check", "index")
+LANES: tuple[str, ...] = ("idle", "search", "model_check", "index", "download")
 ASSET_ALLOWLIST: tuple[str, ...] = ("/", "/index.html", "/styles.css", "/app.js")
 
 #: Exact MIME types for the packaged asset allowlist.
@@ -245,6 +250,8 @@ class JobView:
     error: str | None = None
 
     def __post_init__(self) -> None:
+        if self.operation not in JOB_OPERATIONS:
+            raise ValueError(f"unknown job operation: {self.operation!r}")
         if self.state not in JOB_STATES:
             raise ValueError(f"unknown job state: {self.state!r}")
 
@@ -258,6 +265,60 @@ class JobView:
             "elapsed_ms": self.elapsed_ms,
             "report": self.report,
             "error": self.error,
+        }
+
+
+@dataclass(frozen=True)
+class CourseModuleDTO:
+    """One module summary entry returned by ``GET /api/course``."""
+
+    name: str
+    display: str
+    weeks: tuple[int, ...] = ()
+    files: int = 0
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "display": self.display,
+            "weeks": [int(week) for week in self.weeks],
+            "files": int(self.files),
+        }
+
+
+@dataclass(frozen=True)
+class CourseView:
+    """Course module and week overview returned by ``GET /api/course``."""
+
+    modules: tuple[CourseModuleDTO, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "modules": [module.to_dict() for module in self.modules],
+        }
+
+
+@dataclass(frozen=True)
+class PreviewView:
+    """Full chunk text and metadata returned by ``GET /api/preview``."""
+
+    chunk: int
+    kind: str
+    path: str
+    locator: str
+    location: str
+    text: str
+    page_image: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "chunk": int(self.chunk),
+            "kind": self.kind,
+            "path": self.path,
+            "locator": self.locator,
+            "location": self.location,
+            "text": self.text,
+            "page_image": bool(self.page_image),
         }
 
 
@@ -300,6 +361,26 @@ class WebBackend(Protocol):
         """Validate and append one root using the stale-revision check."""
         ...
 
+    def remove_root(self, path: str, revision: str) -> RootsView:
+        """Validate and remove one root using the stale-revision check."""
+        ...
+
+    def course(self) -> CourseView:
+        """Return course module/week/file summary from the index."""
+        ...
+
+    def preview(self, chunk_id: int) -> PreviewView:
+        """Return full chunk text and metadata for ``chunk_id``."""
+        ...
+
+    def preview_page_png(self, chunk_id: int) -> bytes:
+        """Render the PDF page for ``chunk_id`` as PNG bytes."""
+        ...
+
+    def open_chunk(self, chunk_id: int) -> None:
+        """Open the source file for ``chunk_id`` at its locator."""
+        ...
+
     def search(self, request: SearchRequest) -> SearchResult:
         """Run a validated search with the frozen daemon/read-only/lane policy."""
         ...
@@ -310,6 +391,10 @@ class WebBackend(Protocol):
 
     def start_index(self) -> str:
         """Start the async index job and return its opaque job ID."""
+        ...
+
+    def start_download(self, rerank: bool = False) -> str:
+        """Start the explicit model/grammar download job and return its opaque job ID."""
         ...
 
     def job(self, job_id: str) -> JobView:

@@ -36,6 +36,7 @@ __all__ = [
     "config_revision",
     "inspect_config",
     "read_roots",
+    "remove_root",
     "set_roots",
     "toml_string",
 ]
@@ -544,6 +545,12 @@ def add_root(config_path: Path, path: str, revision: str) -> RootsConfig:
         return _add_root_locked(config_path, path, revision)
 
 
+def remove_root(config_path: Path, path: str, revision: str) -> RootsConfig:
+    """Remove one configured root canonically, preserving comments and other keys."""
+    with _WRITE_LOCK:
+        return _remove_root_locked(config_path, path, revision)
+
+
 def set_roots(
     config_path: Path,
     roots: Sequence[Path],
@@ -582,6 +589,27 @@ def _add_root_locked(config_path: Path, path: str, revision: str) -> RootsConfig
         checked_revision,
         preserve_array_padding=True,
     )
+
+
+def _remove_root_locked(config_path: Path, path: str, revision: str) -> RootsConfig:
+    validated = _validate_root_string(path)
+    target = _canonical_existing(validated)
+    checked_revision = revision if isinstance(revision, str) else ""
+
+    def compute(existing_roots: tuple[str, ...]) -> tuple[str, ...]:
+        remaining = tuple(
+            existing
+            for existing in existing_roots
+            if not (
+                existing == validated
+                or (target is not None and _canonical_existing(existing) == target)
+            )
+        )
+        if len(remaining) == len(existing_roots):
+            raise _invalid_root(f"root is not configured: {validated}")
+        return remaining
+
+    return _rewrite_roots(config_path, compute, checked_revision)
 
 
 def _set_roots_locked(
