@@ -22,6 +22,7 @@ from typing import Any
 import typer
 
 from .config import Config, load_config
+from .course import display_module
 from .embed import Embedder, build_embedder
 from .indexer import Indexer, SyncReport
 from .lifecycle import LifecycleError, lifecycle_lock, rebuild_index
@@ -193,6 +194,27 @@ def _db_size_bytes(db_path: Path) -> int:
     return total
 
 
+def _format_course_lines(
+    course_rows: list[tuple[str | None, int | None, int]],
+) -> list[str]:
+    if not course_rows:
+        return []
+    grouped: dict[str | None, list[tuple[int | None, int]]] = {}
+    for mod, wk, count in course_rows:
+        grouped.setdefault(mod, []).append((wk, count))
+    lines = ["course:"]
+    for mod, items in grouped.items():
+        display = display_module(mod) if mod is not None else "other"
+        if not display:
+            display = "other"
+        parts = [
+            f"week {wk} ({count})" if wk is not None else f"other ({count})"
+            for wk, count in items
+        ]
+        lines.append(f"  {display}: {', '.join(parts)}")
+    return lines
+
+
 def status(
     as_json: bool = typer.Option(
         False,
@@ -221,6 +243,7 @@ def status(
                                     "chunks": 0,
                                     "last_error_count": 0,
                                     "kinds": {},
+                                    "course": [],
                                     "embed_model": cfg.embed_model,
                                     "dim": None,
                                     "vector_quant": cfg.vector_quant,
@@ -250,6 +273,10 @@ def status(
                 last_errors = store.get_last_error_count()
                 detailed_fn = getattr(store, "detailed_stats", None)
                 details: dict[str, Any] = dict(detailed_fn()) if callable(detailed_fn) else {}
+                summary_fn = getattr(store, "course_summary", None)
+                course_rows: list[tuple[str | None, int | None, int]] = (
+                    list(summary_fn()) if callable(summary_fn) else []
+                )
             finally:
                 store.close()
     except typer.Exit:
@@ -271,6 +298,10 @@ def status(
                     "chunks": stats["chunks"],
                     "last_error_count": last_errors,
                     "kinds": details.get("kinds", {}),
+                    "course": [
+                        {"module": mod, "week": wk, "files": count}
+                        for mod, wk, count in course_rows
+                    ],
                     "embed_model": details.get("embed_model", cfg.embed_model),
                     "dim": details.get("dim", dim),
                     "vector_quant": details.get("vector_quant", cfg.vector_quant),
@@ -300,6 +331,8 @@ def status(
     if isinstance(kinds, dict) and kinds:
         summary = ", ".join(f"{name}={count}" for name, count in kinds.items())
         typer.echo(f"by kind: {summary}")
+    for line in _format_course_lines(course_rows):
+        typer.echo(line)
     typer.echo(_format_daemon_status(daemon_running, sock))
 
 

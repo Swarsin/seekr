@@ -51,6 +51,14 @@ _TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "Optional recency filter (e.g. '7d', '12h', '2026-01-15').",
                 },
+                "module": {
+                    "type": "string",
+                    "description": "Optional module name or unique prefix filter.",
+                },
+                "week": {
+                    "type": "string",
+                    "description": "Optional week number ('4') or inclusive range ('3-5').",
+                },
                 "explain": {
                     "type": "boolean",
                     "default": False,
@@ -82,6 +90,14 @@ _TOOLS: list[dict[str, Any]] = [
                 "since": {
                     "type": "string",
                     "description": "Optional recency filter (e.g. '7d', '12h', '2026-01-15').",
+                },
+                "module": {
+                    "type": "string",
+                    "description": "Optional module name or unique prefix filter.",
+                },
+                "week": {
+                    "type": "string",
+                    "description": "Optional week number ('4') or inclusive range ('3-5').",
                 },
             },
             "required": ["path"],
@@ -297,6 +313,8 @@ class McpServer:
             path_prefix = _optional_str(arguments.get("path"), "path")
             kind = _optional_str(arguments.get("kind"), "kind")
             since = _optional_str(arguments.get("since"), "since")
+            module = _optional_str(arguments.get("module"), "module")
+            week = _optional_str(arguments.get("week"), "week")
             explain = _optional_bool(arguments.get("explain"), "explain", default=False)
 
             extra: dict[str, Any] = {}
@@ -306,6 +324,10 @@ class McpServer:
                 extra["kind"] = kind
             if since is not None:
                 extra["since"] = since
+            if module is not None:
+                extra["module"] = module
+            if week is not None:
+                extra["week"] = week
             return self._search_fn(
                 query,
                 k=k,
@@ -327,6 +349,13 @@ class McpServer:
             path_prefix = _optional_str(arguments.get("path_prefix"), "path_prefix")
             kind = _optional_str(arguments.get("kind"), "kind")
             since = _optional_str(arguments.get("since"), "since")
+            module = _optional_str(arguments.get("module"), "module")
+            week = _optional_str(arguments.get("week"), "week")
+            extra_similar: dict[str, Any] = {}
+            if module is not None:
+                extra_similar["module"] = module
+            if week is not None:
+                extra_similar["week"] = week
             return self._similar_fn(
                 target,
                 k=k,
@@ -334,6 +363,7 @@ class McpServer:
                 path_prefix=path_prefix,
                 kind=kind,
                 since=since,
+                **extra_similar,
             )
 
         raise LookupError(f"unknown tool: {tool_name!r}; expected 'search' or 'similar'")

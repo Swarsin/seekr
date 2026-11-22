@@ -700,3 +700,130 @@ class ModuleWeekFilterTests(unittest.TestCase):
                     )
             finally:
                 empty_store.close()
+
+
+@unittest.skipUnless(_HAS_TYPER, "typer is not installed")
+class CliModuleWeekTests(unittest.TestCase):
+    def test_search_module_week_options_reach_get_hits(self) -> None:
+        from typer.testing import CliRunner
+
+        with mock.patch("seekr.cli_search.get_hits", return_value=[]) as get_hits:
+            result = CliRunner().invoke(
+                app, ["search", "x", "--module", "ml", "--week", "2-3"]
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        get_hits.assert_called_once_with(
+            "x",
+            k=10,
+            mode="hybrid",
+            per_file=2,
+            rerank=False,
+            path_prefix=None,
+            module="ml",
+            week="2-3",
+        )
+
+    def test_text_output_has_label(self) -> None:
+        from typer.testing import CliRunner
+
+        hits = [
+            Hit(
+                chunk_id=1,
+                path="/course/machine-learning/week4/trees.md",
+                locator="§Trees",
+                loc_start=1.0,
+                snippet="decision tree notes",
+                score=0.875,
+                kind="markdown",
+                module="machine-learning",
+                week=4,
+            ),
+            Hit(
+                chunk_id=2,
+                path="/course/4CCS1ML/syllabus.md",
+                locator="L1",
+                loc_start=1.0,
+                snippet="syllabus",
+                score=0.5,
+                kind="markdown",
+                module="4CCS1ML",
+                week=None,
+            ),
+            Hit(
+                chunk_id=3,
+                path="/course/week2/slides.md",
+                locator="L1",
+                loc_start=1.0,
+                snippet="slides",
+                score=0.4,
+                kind="markdown",
+                module=None,
+                week=2,
+            ),
+            Hit(
+                chunk_id=4,
+                path="/course/readme.md",
+                locator="L1",
+                loc_start=1.0,
+                snippet="readme",
+                score=0.3,
+                kind="markdown",
+            ),
+        ]
+        with mock.patch("seekr.cli_search.get_hits", return_value=hits):
+            result = CliRunner().invoke(app, ["search", "tree"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        lines = result.output.splitlines()
+        self.assertIn(
+            "machine learning · Week 4 · /course/machine-learning/week4/trees.md  (§Trees)  0.8750",
+            lines,
+        )
+        self.assertIn("4CCS1ML · /course/4CCS1ML/syllabus.md  (L1)  0.5000", lines)
+        self.assertIn("Week 2 · /course/week2/slides.md  (L1)  0.4000", lines)
+        self.assertIn("/course/readme.md  (L1)  0.3000", lines)
+
+    def test_bad_week_exits_1_with_message(self) -> None:
+        from typer.testing import CliRunner
+
+        result = CliRunner().invoke(app, ["search", "x", "--week", "5-3"])
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("invalid --week value", result.output)
+
+    def test_similar_and_pick_forward_module_and_week(self) -> None:
+        from typer.testing import CliRunner
+
+        with mock.patch("seekr.cli_search.get_similar_hits", return_value=[]) as sim_mock:
+            sim_res = CliRunner().invoke(
+                app,
+                ["similar", "/course/a.md", "--module", "ml", "--week", "2-3"],
+            )
+        self.assertEqual(sim_res.exit_code, 0, sim_res.output)
+        self.assertEqual(sim_mock.call_args.kwargs["module"], "ml")
+        self.assertEqual(sim_mock.call_args.kwargs["week"], "2-3")
+
+        bad_sim = CliRunner().invoke(app, ["similar", "/course/a.md", "--week", "abc"])
+        self.assertEqual(bad_sim.exit_code, 1)
+        self.assertIn("invalid --week value", bad_sim.output)
+
+        with mock.patch("seekr.cli_open.get_hits", return_value=[]) as pick_mock:
+            pick_res = CliRunner().invoke(
+                app,
+                ["pick", "x", "--module", "ml", "--week", "2-3"],
+            )
+        self.assertEqual(pick_res.exit_code, 0, pick_res.output)
+        pick_mock.assert_called_once_with(
+            "x",
+            k=10,
+            mode="hybrid",
+            per_file=2,
+            rerank=False,
+            path_prefix=None,
+            module="ml",
+            week="2-3",
+        )
+
+        bad_pick = CliRunner().invoke(app, ["pick", "x", "--week", "0"])
+        self.assertEqual(bad_pick.exit_code, 1)
+        self.assertIn("invalid --week value", bad_pick.output)

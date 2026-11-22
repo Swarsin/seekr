@@ -136,6 +136,8 @@ class HitDTO:
     snippet: str
     score: float
     kind: str
+    module: str | None = None
+    week: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -146,6 +148,8 @@ class HitDTO:
             "snippet": self.snippet,
             "score": self.score,
             "kind": self.kind,
+            "module": self.module,
+            "week": self.week,
         }
 
 
@@ -160,6 +164,8 @@ class SearchRequest:
     path: str | None = None
     kind: str | None = None
     since: str | None = None
+    module: str | None = None
+    week: str | None = None
 
     def to_query_kwargs(self) -> dict[str, object]:
         """Map the wire field ``path`` to ``get_hits``'s ``path_prefix``.
@@ -175,6 +181,8 @@ class SearchRequest:
             "path_prefix": self.path,
             "kind": self.kind,
             "since": self.since,
+            "module": self.module,
+            "week": self.week,
         }
 
 

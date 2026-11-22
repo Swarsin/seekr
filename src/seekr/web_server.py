@@ -252,7 +252,7 @@ def _optional_int(body: dict[str, Any], key: str, default: int, low: int, high: 
 def _validate_search(body: dict[str, Any]) -> SearchRequest:
     _reject_unknown_fields(
         body,
-        {"query", "mode", "k", "per_file", "path", "kind", "since"},
+        {"query", "mode", "k", "per_file", "path", "kind", "since", "module", "week"},
     )
     query = _require_string(body, "query")
     if len(query) > LIMITS["query_chars"]:
@@ -274,6 +274,8 @@ def _validate_search(body: dict[str, Any]) -> SearchRequest:
     path = _optional_string(body, "path")
     kind = _optional_string(body, "kind")
     since = _optional_string(body, "since")
+    module = _optional_string(body, "module")
+    week = _optional_string(body, "week")
     return SearchRequest(
         query=query,
         mode=mode,  # type: ignore[arg-type]
@@ -282,6 +284,8 @@ def _validate_search(body: dict[str, Any]) -> SearchRequest:
         path=path,
         kind=kind,
         since=since,
+        module=module,
+        week=week,
     )
 
 

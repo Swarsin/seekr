@@ -2158,3 +2158,94 @@ def test_access_log_has_no_token_or_body() -> None:
     assert log_text
     assert token not in log_text
     assert marker not in log_text
+
+
+def test_search_request_accepts_module_week() -> None:
+    backend = FakeWebBackend(search_result=SearchResult(hits=(), took_ms=0.5))
+    with running_server(backend) as (server, backend):
+        token = fetch_token(server)
+        response = request(
+            server,
+            "POST",
+            "/api/search",
+            headers=json_headers(token),
+            body=json.dumps(
+                {
+                    "query": "trees",
+                    "module": "machine-learning",
+                    "week": "2-3",
+                }
+            ).encode(),
+        )
+        assert response.status == 200
+        sent = backend.calls[-1][1]["request"]
+        assert sent == SearchRequest(
+            query="trees",
+            module="machine-learning",
+            week="2-3",
+        )
+        assert sent.to_query_kwargs() == {
+            "query": "trees",
+            "mode": "hybrid",
+            "k": 10,
+            "per_file": 2,
+            "path_prefix": None,
+            "kind": None,
+            "since": None,
+            "module": "machine-learning",
+            "week": "2-3",
+        }
+
+        for bad_payload in (
+            {"query": "trees", "module": 5},
+            {"query": "trees", "week": 5},
+            {"query": "trees", "module": "\ud800"},
+            {"query": "trees", "week": "\ud800"},
+        ):
+            bad_resp = request(
+                server,
+                "POST",
+                "/api/search",
+                headers=json_headers(token),
+                body=json.dumps(bad_payload).encode("ascii"),
+            )
+            assert bad_resp.status == 400
+            assert bad_resp.json()["error"]["code"] == "invalid_request"
+
+
+def test_hit_dto_has_labels() -> None:
+    hit = HitDTO(
+        chunk_id=101,
+        path="/course/machine-learning/week4/trees.md",
+        locator="§Trees",
+        loc_start=12.0,
+        snippet="decision trees",
+        score=0.91,
+        kind="markdown",
+        module="machine-learning",
+        week=4,
+    )
+    assert hit.to_dict() == {
+        "chunk_id": 101,
+        "path": "/course/machine-learning/week4/trees.md",
+        "locator": "§Trees",
+        "loc_start": 12.0,
+        "snippet": "decision trees",
+        "score": 0.91,
+        "kind": "markdown",
+        "module": "machine-learning",
+        "week": 4,
+    }
+
+    backend = FakeWebBackend(search_result=SearchResult(hits=(hit,), took_ms=1.0))
+    with running_server(backend) as (server, _backend):
+        token = fetch_token(server)
+        response = request(
+            server,
+            "POST",
+            "/api/search",
+            headers=json_headers(token),
+            body=json.dumps({"query": "trees"}).encode(),
+        )
+        assert response.status == 200
+        assert response.json()["hits"] == [hit.to_dict()]

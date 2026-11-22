@@ -1177,5 +1177,123 @@ class SocketPathLimitTests(unittest.TestCase):
         searcher.store.close.assert_called_once_with()
 
 
+class ModuleWeekDaemonTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+
+    def test_search_arguments_accept_module_and_week_range(self) -> None:
+        args = daemon._search_arguments(
+            {
+                "op": "search",
+                "query": "trees",
+                "module": "machine-learning",
+                "week_range": [2, 3],
+            }
+        )
+        self.assertEqual(args["module"], "machine-learning")
+        self.assertEqual(args["week_range"], (2, 3))
+
+        class _LabelFilterSearcher(_FakeSearcher):
+            def search(
+                self,
+                query: str,
+                k: int = 10,
+                mode: str = "hybrid",
+                per_file: int = 2,
+                rerank: bool = False,
+                path_prefix: str | None = None,
+                *,
+                module: str | None = None,
+                week_range: tuple[int, int] | None = None,
+            ) -> list[Hit]:
+                self.calls.append(
+                    {
+                        "query": query,
+                        "k": k,
+                        "mode": mode,
+                        "per_file": per_file,
+                        "rerank": rerank,
+                        "path_prefix": path_prefix,
+                        "module": module,
+                        "week_range": week_range,
+                    }
+                )
+                return [
+                    Hit(
+                        chunk_id=10,
+                        path="/course/ml/week3/trees.md",
+                        locator="§Trees",
+                        loc_start=1.0,
+                        snippet="trees",
+                        score=0.9,
+                        kind="markdown",
+                        module="ml",
+                        week=3,
+                    )
+                ]
+
+        searcher = _LabelFilterSearcher()
+        cfg = Config(db_path=self.tmp / "index.db", embed_model="fake")
+        searcher.daemon_metadata = {
+            "db_path": str(cfg.db_path.resolve()),
+            "embed_model": cfg.embed_model,
+        }
+        with (
+            _running_server(searcher, self.tmp) as (sock_path, *_),
+            mock.patch("seekr.client.socket_path", return_value=sock_path),
+        ):
+            hits = cli_search.try_daemon_hits(
+                "trees",
+                mode="keyword",
+                module="ml",
+                week="2-3",
+                cfg=cfg,
+            )
+        assert hits is not None
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].module, "ml")
+        self.assertEqual(hits[0].week, 3)
+        self.assertEqual(searcher.calls[0]["module"], "ml")
+        self.assertEqual(searcher.calls[0]["week_range"], (2, 3))
+
+    def test_week_range_must_be_two_ints(self) -> None:
+        searcher = _FakeSearcher()
+        with _running_server(searcher, self.tmp) as (sock_path, *_):
+            for bad_week_range in ([3], ["a", 1], [5, 3], [True, 3], [0, 3], [1, 100]):
+                with self.subTest(week_range=bad_week_range):
+                    response = _request(
+                        sock_path,
+                        {
+                            "op": "search",
+                            "query": "alpha",
+                            "week_range": bad_week_range,
+                        },
+                    )
+                    self.assertFalse(response["ok"])
+                    self.assertIn("week_range", response["error"])
+
+    def test_hit_dict_roundtrip_includes_labels(self) -> None:
+        hit = Hit(
+            chunk_id=42,
+            path="/course/machine-learning/week4/trees.md",
+            locator="§Trees",
+            loc_start=12.0,
+            snippet="decision trees",
+            score=0.8125,
+            kind="markdown",
+            module="machine-learning",
+            week=4,
+        )
+        wire = daemon._hit_to_dict(hit)
+        self.assertEqual(wire["module"], "machine-learning")
+        self.assertEqual(wire["week"], 4)
+        self.assertEqual(client._hit_from_dict(wire), hit)
+
+        unlabelled = _hit()
+        self.assertEqual(client._hit_from_dict(daemon._hit_to_dict(unlabelled)), unlabelled)
+
+
 if __name__ == "__main__":
     unittest.main()

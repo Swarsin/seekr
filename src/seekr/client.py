@@ -191,6 +191,12 @@ def _hit_from_dict(payload: object) -> Hit:
     except (TypeError, ValueError) as exc:
         raise DaemonError("daemon hit has invalid numeric fields") from exc
     explain = _explain_from_dict(payload.get("explain"))
+    module = payload.get("module")
+    if module is not None and not isinstance(module, str):
+        raise DaemonError("daemon hit field 'module' must be a string or null")
+    week = payload.get("week")
+    if week is not None and (isinstance(week, bool) or not isinstance(week, int)):
+        raise DaemonError("daemon hit field 'week' must be an integer or null")
     return Hit(
         chunk_id=chunk_id,
         path=path,
@@ -200,6 +206,8 @@ def _hit_from_dict(payload: object) -> Hit:
         score=score_value,
         kind=kind,
         explain=explain,
+        module=module,
+        week=week,
     )
 
 

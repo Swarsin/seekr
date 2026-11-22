@@ -197,3 +197,74 @@ class PolishedStatusTests(unittest.TestCase):
         self.assertIn("daemon: stopped", result.output)
         self.assertIn("socket path too long", result.output)
         self.assertIn(str(runtime_dir / "seekr.sock"), result.output)
+
+    def _create_course_index(self, base: Path) -> Config:
+        root = base / "course"
+        (root / "machine-learning" / "week1").mkdir(parents=True)
+        (root / "machine-learning" / "week2").mkdir(parents=True)
+        (root / "4CCS1ML" / "week-01").mkdir(parents=True)
+        for i in range(1, 4):
+            (root / "machine-learning" / "week1" / f"w1_{i}.md").write_text(
+                f"ml week1 {i}", encoding="utf-8"
+            )
+        for i in range(1, 5):
+            (root / "machine-learning" / "week2" / f"w2_{i}.md").write_text(
+                f"ml week2 {i}", encoding="utf-8"
+            )
+        (root / "machine-learning" / "syllabus.md").write_text("syllabus", encoding="utf-8")
+        (root / "4CCS1ML" / "week-01" / "notes.md").write_text("4ccs1ml", encoding="utf-8")
+        (root / "general.md").write_text("general", encoding="utf-8")
+
+        db_path = base / "index.db"
+        cfg = Config(roots=(root,), db_path=db_path, embed_model="fake")
+        store = Store(db_path, "fake", 8, vector_quant="int8")
+        try:
+            Indexer(store, FakeEmbedder(dim=8), cfg).sync([root])
+        finally:
+            store.close()
+        return cfg
+
+    def test_status_prints_course_table(self) -> None:
+        from typer.testing import CliRunner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = self._create_course_index(base)
+            sock = base / "seekr.sock"
+            with (
+                mock.patch("seekr.cli_index._load_config", return_value=cfg),
+                mock.patch("seekr.cli_index._daemon_status", return_value=(False, sock)),
+            ):
+                result = CliRunner().invoke(app, ["status"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("course:", result.output)
+        self.assertIn("  4CCS1ML: week 1 (1)", result.output)
+        self.assertIn("  machine learning: week 1 (3), week 2 (4), other (1)", result.output)
+        self.assertIn("  other: other (1)", result.output)
+
+    def test_status_json_has_course(self) -> None:
+        from typer.testing import CliRunner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = self._create_course_index(base)
+            sock = base / "seekr.sock"
+            with (
+                mock.patch("seekr.cli_index._load_config", return_value=cfg),
+                mock.patch("seekr.cli_index._daemon_status", return_value=(False, sock)),
+            ):
+                result = CliRunner().invoke(app, ["status", "--json"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        parsed = json.loads(result.stdout)
+        self.assertEqual(
+            parsed["course"],
+            [
+                {"module": "4CCS1ML", "week": 1, "files": 1},
+                {"module": "machine-learning", "week": 1, "files": 3},
+                {"module": "machine-learning", "week": 2, "files": 4},
+                {"module": "machine-learning", "week": None, "files": 1},
+                {"module": None, "week": None, "files": 1},
+            ],
+        )

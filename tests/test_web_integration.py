@@ -533,6 +533,8 @@ def test_novice_flow_over_http_with_real_service(tmp_path: Path) -> None:
                     "snippet",
                     "score",
                     "kind",
+                    "module",
+                    "week",
                 }
                 assert Path(hit["path"]).resolve() in (
                     docs / "notes.md",
@@ -564,6 +566,8 @@ def test_novice_flow_over_http_with_real_service(tmp_path: Path) -> None:
                 snippet=hit.snippet,
                 score=hit.score,
                 kind=hit.kind,
+                module=hit.module,
+                week=hit.week,
             ).to_dict()
             for hit in expected
         ]

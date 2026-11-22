@@ -18,8 +18,9 @@ from typing import TYPE_CHECKING, Any, NoReturn
 
 from .client import DaemonError, DaemonMismatchError, try_daemon_search
 from .config import Config, load_config
+from .course import display_module
 from .embed import build_embedder
-from .filters import normalise_kind, parse_since
+from .filters import normalise_kind, parse_since, parse_week
 from .lifecycle import LifecycleError, lifecycle_lock
 from .logging_config import log_event
 from .models import Hit, HitExplain
@@ -255,6 +256,8 @@ def _daemon_search(
     explain: bool = False,
     kind: str | None = None,
     since_mtime_ns: int | None = None,
+    module: str | None = None,
+    week_range: tuple[int, int] | None = None,
 ) -> list[Hit] | None:
     """Try the warm daemon without opening a Store or loading any model.
 
@@ -286,6 +289,10 @@ def _daemon_search(
         params["kind"] = kind
     if since_mtime_ns is not None:
         params["since_mtime_ns"] = since_mtime_ns
+    if module is not None:
+        params["module"] = module
+    if week_range is not None:
+        params["week_range"] = [week_range[0], week_range[1]]
     try:
         hits = try_daemon_search(params, expected=expected)
     except DaemonMismatchError:
@@ -309,6 +316,15 @@ def _daemon_search(
     return hits
 
 
+def _normalise_module(module: str | None) -> str | None:
+    if module is None:
+        return None
+    if not isinstance(module, str):
+        raise TypeError("module filter must be a string")
+    stripped = module.strip()
+    return stripped or None
+
+
 def _validate_query(
     query: str,
     k: int,
@@ -316,7 +332,9 @@ def _validate_query(
     per_file: int,
     kind: str | None,
     since: str | None,
-) -> tuple[str | None, int | None]:
+    module: str | None = None,
+    week: str | None = None,
+) -> tuple[str | None, int | None, str | None, tuple[int, int] | None]:
     """Apply the shared query/filter validation used by both entry points."""
     if mode not in SEARCH_MODES:
         raise SearchError(
@@ -326,7 +344,12 @@ def _validate_query(
         raise SearchError("k must be a positive integer")
     if per_file <= 0:
         raise SearchError("per-file must be a positive integer")
-    return normalise_kind(kind), parse_since(since)
+    return (
+        normalise_kind(kind),
+        parse_since(since),
+        _normalise_module(module),
+        parse_week(week),
+    )
 
 
 def get_hits(
@@ -340,6 +363,8 @@ def get_hits(
     explain: bool = False,
     kind: str | None = None,
     since: str | None = None,
+    module: str | None = None,
+    week: str | None = None,
     cfg: Config | None = None,
     searcher: Searcher | None = None,
     embedder: Embedder | None = None,
@@ -353,7 +378,9 @@ def get_hits(
     ``embedder``; ordinary CLI calls leave both unset.  ``use_daemon=False``
     forces the local configured index even when a daemon is listening.
     """
-    kind_val, since_mtime_ns = _validate_query(query, k, mode, per_file, kind, since)
+    kind_val, since_mtime_ns, module_val, week_range = _validate_query(
+        query, k, mode, per_file, kind, since, module, week
+    )
     if not query.strip():
         # An empty or whitespace-only query can never match.  Short-circuit
         # before the daemon, config load or any embedder/store construction so
@@ -367,6 +394,10 @@ def get_hits(
         searcher_kwargs["kind"] = kind_val
     if since_mtime_ns is not None:
         searcher_kwargs["since_mtime_ns"] = since_mtime_ns
+    if module_val is not None:
+        searcher_kwargs["module"] = module_val
+    if week_range is not None:
+        searcher_kwargs["week_range"] = week_range
     if searcher is not None:
         return searcher.get_hits(
             query,
@@ -391,6 +422,8 @@ def get_hits(
             explain=explain,
             kind=kind_val,
             since_mtime_ns=since_mtime_ns,
+            module=module_val,
+            week_range=week_range,
         )
         if daemon_hits is not None:
             return daemon_hits
@@ -437,6 +470,8 @@ def try_daemon_hits(
     explain: bool = False,
     kind: str | None = None,
     since: str | None = None,
+    module: str | None = None,
+    week: str | None = None,
     cfg: Config | None = None,
 ) -> list[Hit] | None:
     """Ask the daemon for hits, or return ``None`` when it cannot be used.
@@ -447,7 +482,9 @@ def try_daemon_hits(
     :class:`DaemonError` propagates so a reachable broken daemon is never
     silently replaced by a local search.
     """
-    kind_val, since_mtime_ns = _validate_query(query, k, mode, per_file, kind, since)
+    kind_val, since_mtime_ns, module_val, week_range = _validate_query(
+        query, k, mode, per_file, kind, since, module, week
+    )
     if not query.strip():
         return []
     selected_cfg = cfg if cfg is not None else load_config()
@@ -462,6 +499,8 @@ def try_daemon_hits(
         explain=explain,
         kind=kind_val,
         since_mtime_ns=since_mtime_ns,
+        module=module_val,
+        week_range=week_range,
     )
 
 
@@ -513,6 +552,8 @@ def get_similar_hits(
     kind: str | None = None,
     since: str | None = None,
     *,
+    module: str | None = None,
+    week: str | None = None,
     cfg: Config | None = None,
     searcher: Searcher | None = None,
 ) -> list[Hit]:
@@ -523,6 +564,13 @@ def get_similar_hits(
         raise SearchError("per-file must be a positive integer")
     kind_val = normalise_kind(kind)
     since_mtime_ns = parse_since(since)
+    module_val = _normalise_module(module)
+    week_range = parse_week(week)
+    similar_kwargs: dict[str, Any] = {}
+    if module_val is not None:
+        similar_kwargs["module"] = module_val
+    if week_range is not None:
+        similar_kwargs["week_range"] = week_range
     target_path = Path(target).expanduser().resolve(strict=False)
     selected_cfg = cfg if cfg is not None else load_config()
 
@@ -538,6 +586,7 @@ def get_similar_hits(
             kind=kind_val,
             since_mtime_ns=since_mtime_ns,
             exclude_path=str(target_path),
+            **similar_kwargs,
         )
 
     log_event(
@@ -573,6 +622,7 @@ def get_similar_hits(
                 kind=kind_val,
                 since_mtime_ns=since_mtime_ns,
                 exclude_path=str(target_path),
+                **similar_kwargs,
             )
         finally:
             store.close()
@@ -601,6 +651,17 @@ def _format_explain_line(info: HitExplain) -> str:
     return "  explain: " + ("  ".join(parts) if parts else "none")
 
 
+def _hit_label_prefix(hit: Hit) -> str:
+    parts: list[str] = []
+    if hit.module:
+        display = display_module(hit.module)
+        if display:
+            parts.append(display)
+    if hit.week is not None:
+        parts.append(f"Week {hit.week}")
+    return f"{' · '.join(parts)} · " if parts else ""
+
+
 def _echo_hits(
     typer_module: Any,
     hits: list[Hit],
@@ -618,7 +679,8 @@ def _echo_hits(
         return
 
     for hit in hits:
-        typer_module.echo(f"{hit.path}  ({hit.locator})  {hit.score:.4f}")
+        label = _hit_label_prefix(hit)
+        typer_module.echo(f"{label}{hit.path}  ({hit.locator})  {hit.score:.4f}")
         if explain and hit.explain is not None:
             typer_module.echo(_format_explain_line(hit.explain))
         typer_module.echo(hit.snippet)
@@ -670,6 +732,12 @@ def _build_search_command(typer_module: Any) -> Any:
             "--since",
             help="Only include files modified since duration (e.g. 7d, 12h) or ISO date.",
         ),
+        module: str | None = typer_module.Option(
+            None, "--module", help="Filter by module name or unique prefix."
+        ),
+        week: str | None = typer_module.Option(
+            None, "--week", help="Filter by week N or inclusive range N-M."
+        ),
         as_json: bool = typer_module.Option(
             False, "--json", help="Emit results as JSON."
         ),
@@ -685,6 +753,10 @@ def _build_search_command(typer_module: Any) -> Any:
             extra["kind"] = kind
         if since is not None:
             extra["since"] = since
+        if module is not None:
+            extra["module"] = module
+        if week is not None:
+            extra["week"] = week
         try:
             hits = get_hits(
                 query,
@@ -736,11 +808,22 @@ def _build_similar_command(typer_module: Any) -> Any:
             "--since",
             help="Only include files modified since duration (e.g. 7d, 12h) or ISO date.",
         ),
+        module: str | None = typer_module.Option(
+            None, "--module", help="Filter by module name or unique prefix."
+        ),
+        week: str | None = typer_module.Option(
+            None, "--week", help="Filter by week N or inclusive range N-M."
+        ),
         as_json: bool = typer_module.Option(
             False, "--json", help="Emit results as JSON."
         ),
     ) -> None:
         """Find indexed files semantically related to PATH."""
+        extra: dict[str, Any] = {}
+        if module is not None:
+            extra["module"] = module
+        if week is not None:
+            extra["week"] = week
         try:
             hits = get_similar_hits(
                 target,
@@ -749,6 +832,7 @@ def _build_similar_command(typer_module: Any) -> Any:
                 path_prefix=path_prefix,
                 kind=kind,
                 since=since,
+                **extra,
             )
         except _CLI_SEARCH_ERRORS as exc:
             _exit_error(str(exc), command="similar")

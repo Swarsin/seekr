@@ -1388,3 +1388,89 @@ def test_begin_shutdown_rejects_work_and_shutdown_joins_active_job(
     finally:
         paused.release.set()
         service.shutdown()
+
+
+@pytest.mark.parametrize("mode", ["keyword", "vector", "hybrid"])
+@pytest.mark.parametrize("bad_week", ["5-3", "0", "abc", 123])
+def test_invalid_week_is_400_invalid_request(
+    tmp_path: Path, mode: str, bad_week: object
+) -> None:
+    config_path = _write_config(tmp_path)
+    daemon_calls: list[object] = []
+
+    def daemon(*args, **kwargs):
+        daemon_calls.append((args, kwargs))
+        raise AssertionError("daemon must not be called for invalid week")
+
+    with (
+        _service(
+            config_path,
+            tmp_path,
+            daemon_probe=lambda _path: True,
+            daemon_search=daemon,
+        ) as service,
+        pytest.raises(ApiError) as raised,
+    ):
+        service.search(SearchRequest("alpha", mode=mode, week=bad_week))  # type: ignore[arg-type]
+
+    exc = raised.value
+    assert exc.status == 400
+    assert exc.code == "invalid_request"
+    assert set(exc.fields or {}) == {"week"}
+    assert daemon_calls == []
+
+
+def test_module_and_week_filters_and_labels_in_web_service(tmp_path: Path) -> None:
+    docs = _root(tmp_path)
+    _write_docs(
+        docs,
+        {
+            "machine-learning/week4/trees.md": "# Trees\n\ngradient boosted trees\n",
+            "maths/week1/algebra.md": "# Algebra\n\ngradient vectors\n",
+        },
+    )
+    config_path = _write_config(tmp_path, roots=[docs])
+    embedder = FakeEmbedder(dim=64)
+
+    with _service(config_path, tmp_path, embedder_factory=lambda _cfg: embedder) as service:
+        job = _wait_job(service, service.start_index())
+        assert job.state == "succeeded"
+
+        for mode in ("keyword", "hybrid"):
+            res = service.search(
+                SearchRequest("gradient", mode=mode, module="Machine Learning", week="3-5")
+            )
+            assert len(res.hits) == 1
+            assert res.hits[0].module == "machine-learning"
+            assert res.hits[0].week == 4
+
+        with pytest.raises(ApiError) as unknown_err:
+            service.search(SearchRequest("gradient", mode="keyword", module="biology"))
+        assert unknown_err.value.status == 400
+        assert unknown_err.value.code == "invalid_request"
+        assert "module" in (unknown_err.value.fields or {})
+
+        with pytest.raises(ApiError) as ambig_err:
+            service.search(SearchRequest("gradient", mode="hybrid", module="m"))
+        assert ambig_err.value.status == 400
+        assert ambig_err.value.code == "invalid_request"
+        assert "module" in (ambig_err.value.fields or {})
+
+    from seekr.client import DaemonError
+
+    def bad_module_daemon(*args, **kwargs):
+        raise DaemonError("unknown module 'biology'; known modules: machine-learning")
+
+    with (
+        _service(
+            config_path,
+            tmp_path,
+            daemon_probe=lambda _path: True,
+            daemon_search=bad_module_daemon,
+        ) as service,
+        pytest.raises(ApiError) as daemon_err,
+    ):
+        service.search(SearchRequest("gradient", mode="hybrid", module="biology"))
+    assert daemon_err.value.status == 400
+    assert daemon_err.value.code == "invalid_request"
+    assert "module" in (daemon_err.value.fields or {})

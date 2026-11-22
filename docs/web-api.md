@@ -72,7 +72,7 @@ diagnosable security rule, not a missing-token accident.
 | `GET /api/status` | Token; no body | `200` status object; never loads a model or takes the lifecycle lock | `403 forbidden`, `405 method_not_allowed`, `500 internal_error` |
 | `GET /api/roots` | Token; no body | `200 {roots: string[], config_path: string, revision: string}`; roots in stored order and form | `403 forbidden`, `405 method_not_allowed`, `409 config_invalid`, `500 internal_error` |
 | `POST /api/roots` | Token; JSON `{path: string, revision: string}` | `200 {roots, config_path, revision, daemon_restart_required: boolean, warning: string or null}` | `400 invalid_request`, `400 invalid_root`, `400 roots_limit`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 stale_config`, `409 duplicate_root`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `500 config_write_failed` |
-| `POST /api/search` | Token; JSON `{query, mode?, k?, per_file?, path?, kind?, since?}` | `200 {hits: Hit[], took_ms: number}` | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable`, `503 model_unavailable`, `503 daemon_failure` |
+| `POST /api/search` | Token; JSON `{query, mode?, k?, per_file?, path?, kind?, since?, module?, week?}` | `200 {hits: Hit[], took_ms: number}` | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable`, `503 model_unavailable`, `503 daemon_failure` |
 | `POST /api/model/check` | Token; JSON exactly `{}` | `202 {job_id: string}`; job result arrives through the job endpoint | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error` |
 | `POST /api/index` | Token; JSON exactly `{}`; targets come only from validated config | `202 {job_id: string}` | `400 invalid_request`, `400 no_roots`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 daemon_active`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable`, `503 model_unavailable` |
 | `GET /api/jobs/{job_id}` | Token; no body; job ID is a server-issued opaque string | `200` job object with state, operation, timestamps, report/error, and truncation flags | `403 forbidden`, `404 job_not_found`, `405 method_not_allowed`, `500 internal_error` |
@@ -290,13 +290,16 @@ Config-write safety details are part of the contract:
 - `mode` is `keyword`, `vector`, or `hybrid`; default `hybrid`. `k` defaults to
   10 and is 1–50; `per_file` defaults to 2 and is 1–10; booleans are rejected.
 - `path` is an optional path-prefix filter (default null), `kind` uses existing
-  kind names (default null), and `since` uses the existing duration/ISO parser
-  (default null). Invalid values are `400 invalid_request`.
-- Preserve result ordering from `Searcher`/`get_hits`. Serialize only `Hit`
-  fields `chunk_id`, `path`, `locator`, `loc_start`, `snippet`, `score`, and
-  `kind`; omit `explain` entirely (do not emit `explain: null`). Do not
-  mislabel scores as confidence percentages. Rerank/explain controls are out
-  of scope.
+  kind names (default null), `since` uses the existing duration/ISO parser
+  (default null), `module` is an optional module name or unique prefix
+  (default null), and `week` is an optional week number (`"4"`) or inclusive
+  range (`"3-5"`, default null). Invalid filter values or unknown/ambiguous
+  modules are `400 invalid_request`.
+- Preserve result ordering from `Searcher`/`get_hits`. Serialize `Hit` fields
+  `chunk_id`, `path`, `locator`, `loc_start`, `snippet`, `score`, `kind`,
+  `module`, and `week`; omit `explain` entirely (do not emit `explain: null`).
+  Do not mislabel scores as confidence percentages. Rerank/explain controls
+  are out of scope.
 - `took_ms` is the server-measured search duration, excluding HTTP body parsing
   and response writing. It is a number, not a formatted string.
 - Keyword search bypasses the engine lane with the true read-only path below
@@ -407,6 +410,8 @@ def try_daemon_hits(
     explain: bool = False,
     kind: str | None = None,
     since: str | None = None,
+    module: str | None = None,
+    week: str | None = None,
     cfg: Config | None = None,
 ) -> list[Hit] | None: ...
 
@@ -573,7 +578,7 @@ request bodies, document text, tracebacks, or the token.
 
 | HTTP | Code | Meaning and applicable endpoints |
 | --- | --- | --- |
-| 400 | `invalid_request` | Malformed JSON, unknown fields/types, duplicate sensitive headers, missing content length, invalid query/mode/k/per_file/since, bootstrap-header failure. All body-taking routes and session. |
+| 400 | `invalid_request` | Malformed JSON, unknown fields/types, duplicate sensitive headers, missing content length, invalid query/mode/k/per_file/kind/since/module/week (including unknown or ambiguous module), bootstrap-header failure. All body-taking routes and session. |
 | 400 | `invalid_root` | Submitted root is missing, not a readable directory, contains NUL, is not valid UTF-8, or exceeds 4,096 bytes. `POST /api/roots`. |
 | 400 | `roots_limit` | The 50-root limit would be exceeded. `POST /api/roots`. |
 | 400 | `no_roots` | Index requested with no configured roots. `POST /api/index`. |
@@ -671,13 +676,14 @@ must respect the lane, daemon, read-only, and lifecycle rules above.
 
 DTOs are frozen dataclasses with `to_dict()` methods:
 
-- `HitDTO(chunk_id, path, locator, loc_start, snippet, score, kind)`; no
-  `explain` field, and `to_dict()` must not emit `explain`.
+- `HitDTO(chunk_id, path, locator, loc_start, snippet, score, kind,
+  module=None, week=None)`; no `explain` field, and `to_dict()` must not emit
+  `explain`.
 - `SearchRequest(query, mode="hybrid", k=10, per_file=2, path=None, kind=None,
-  since=None)`. `to_query_kwargs()` maps wire field `path` to
-  `get_hits(path_prefix=...)` and returns exactly `query`, `mode`, `k`,
-  `per_file`, `path_prefix`, `kind`, and `since`. The caller chooses
-  `use_daemon` and the read-only keyword path.
+  since=None, module=None, week=None)`. `to_query_kwargs()` maps wire field
+  `path` to `get_hits(path_prefix=...)` and returns exactly `query`, `mode`,
+  `k`, `per_file`, `path_prefix`, `kind`, `since`, `module`, and `week`. The
+  caller chooses `use_daemon` and the read-only keyword path.
 - `SearchResult(hits: tuple[HitDTO, ...], took_ms: float)` serializes to
   `{"hits": [...], "took_ms": number}`.
 - `RootsView(roots: tuple[str, ...], config_path, revision,

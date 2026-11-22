@@ -68,6 +68,12 @@ def _build_pick_command(typer_module: Any) -> Any:
             "--since",
             help="Only include files modified since duration (e.g. 7d, 12h) or ISO date.",
         ),
+        module: str | None = typer_module.Option(
+            None, "--module", help="Filter by module name or unique prefix."
+        ),
+        week: str | None = typer_module.Option(
+            None, "--week", help="Filter by week N or inclusive range N-M."
+        ),
     ) -> None:
         """Print one pick line per hit, ready for dmenu or rofi."""
         extra: dict[str, Any] = {}
@@ -75,6 +81,10 @@ def _build_pick_command(typer_module: Any) -> Any:
             extra["kind"] = kind
         if since is not None:
             extra["since"] = since
+        if module is not None:
+            extra["module"] = module
+        if week is not None:
+            extra["week"] = week
         try:
             hits = get_hits(
                 query,

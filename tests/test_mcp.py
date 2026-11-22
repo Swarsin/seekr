@@ -294,3 +294,77 @@ class SubprocessMcpRoundtripTests(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["path"], str(note_md.resolve()))
         self.assertEqual(hits[0]["explain"]["keyword_rank"], 1)
+
+
+class McpModuleWeekTests(unittest.TestCase):
+    def test_tools_list_has_module_and_week(self) -> None:
+        server = McpServer()
+        response = server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        assert response is not None
+        tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+        for tool_name in ("search", "similar"):
+            props = tools[tool_name]["inputSchema"]["properties"]
+            self.assertIn("module", props)
+            self.assertEqual(props["module"]["type"], "string")
+            self.assertIn("week", props)
+            self.assertEqual(props["week"]["type"], "string")
+
+    def test_search_tool_passes_module_week(self) -> None:
+        search_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        similar_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        def fake_search(*args: Any, **kwargs: Any) -> list[Hit]:
+            search_calls.append((args, kwargs))
+            return [
+                Hit(
+                    chunk_id=1,
+                    path="/course/ml/week4/trees.md",
+                    locator="§Intro",
+                    loc_start=1.0,
+                    snippet="trees",
+                    score=0.9,
+                    kind="markdown",
+                    module="ml",
+                    week=4,
+                )
+            ]
+
+        def fake_similar(*args: Any, **kwargs: Any) -> list[Hit]:
+            similar_calls.append((args, kwargs))
+            return []
+
+        server = McpServer(search_fn=fake_search, similar_fn=fake_similar)
+        search_resp = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "search",
+                    "arguments": {"query": "trees", "module": "ml", "week": "3-5"},
+                },
+            }
+        )
+        assert search_resp is not None
+        self.assertFalse(search_resp["result"]["isError"])
+        self.assertEqual(search_calls[0][1]["module"], "ml")
+        self.assertEqual(search_calls[0][1]["week"], "3-5")
+        payload = json.loads(search_resp["result"]["content"][0]["text"])
+        self.assertEqual(payload[0]["module"], "ml")
+        self.assertEqual(payload[0]["week"], 4)
+
+        sim_resp = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "similar",
+                    "arguments": {"path": "/course/a.md", "module": "ml", "week": "4"},
+                },
+            }
+        )
+        assert sim_resp is not None
+        self.assertFalse(sim_resp["result"]["isError"])
+        self.assertEqual(similar_calls[0][1]["module"], "ml")
+        self.assertEqual(similar_calls[0][1]["week"], "4")

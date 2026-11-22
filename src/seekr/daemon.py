@@ -22,7 +22,7 @@ import stat
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -168,6 +168,26 @@ def _positive_int(value: object, name: str) -> int:
     return value
 
 
+def _parse_week_range_arg(raw: object) -> tuple[int, int] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence) or len(raw) != 2:
+        raise ValueError(
+            "week_range must be a 2-element list [low, high] with 1 <= low <= high <= 99"
+        )
+    low, high = raw[0], raw[1]
+    if (
+        isinstance(low, bool)
+        or isinstance(high, bool)
+        or not isinstance(low, int)
+        or not isinstance(high, int)
+    ):
+        raise TypeError("week_range entries must be integers")
+    if not (1 <= low <= high <= 99):
+        raise ValueError("week_range must satisfy 1 <= low <= high <= 99")
+    return (low, high)
+
+
 def _search_arguments(request: Mapping[str, Any]) -> dict[str, Any]:
     query = request.get("query")
     if not isinstance(query, str):
@@ -195,6 +215,11 @@ def _search_arguments(request: Mapping[str, Any]) -> dict[str, Any]:
         isinstance(since_mtime_ns, bool) or not isinstance(since_mtime_ns, int)
     ):
         raise TypeError("since_mtime_ns must be an integer or null")
+    raw_module = request.get("module")
+    if raw_module is not None and not isinstance(raw_module, str):
+        raise TypeError("module must be a string or null")
+    module = raw_module.strip() or None if raw_module is not None else None
+    week_range = _parse_week_range_arg(request.get("week_range"))
     arguments: dict[str, Any] = {
         "query": query,
         "k": _positive_int(request.get("k", 10), "k"),
@@ -209,6 +234,10 @@ def _search_arguments(request: Mapping[str, Any]) -> dict[str, Any]:
         arguments["kind"] = kind
     if since_mtime_ns is not None:
         arguments["since_mtime_ns"] = since_mtime_ns
+    if module is not None:
+        arguments["module"] = module
+    if week_range is not None:
+        arguments["week_range"] = week_range
     return arguments
 
 
@@ -300,6 +329,8 @@ def _handle_request(
         return {"ok": False, "error": "search is unavailable on this daemon"}
     try:
         hits = list(search(**arguments))
+    except ValueError as exc:
+        return {"ok": False, "error": _error_text(exc)}
     except Exception as exc:  # noqa: BLE001 - isolate every query failure
         return {"ok": False, "error": f"search failed: {_error_text(exc)}"}
     try:

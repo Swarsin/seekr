@@ -70,6 +70,18 @@ def _safe_message(exc: BaseException) -> str:
     return text or exc.__class__.__name__
 
 
+def _is_module_filter_error(message: str) -> bool:
+    return (
+        message.startswith("unknown module ")
+        or "is ambiguous; matches:" in message
+        or "no modules are labelled yet" in message
+    )
+
+
+def _is_week_filter_error(message: str) -> bool:
+    return "invalid --week value" in message or "week_range must" in message
+
+
 def _is_busy_error(exc: BaseException) -> bool:
     if not isinstance(exc, sqlite3.OperationalError):
         return False
@@ -931,6 +943,8 @@ class WebService:
 
     @staticmethod
     def _hit_dto(hit: object) -> HitDTO:
+        raw_module = getattr(hit, "module", None)
+        raw_week = getattr(hit, "week", None)
         return HitDTO(
             chunk_id=int(hit.chunk_id),  # type: ignore[attr-defined]
             path=str(hit.path),  # type: ignore[attr-defined]
@@ -939,6 +953,8 @@ class WebService:
             snippet=str(hit.snippet),  # type: ignore[attr-defined]
             score=float(hit.score),  # type: ignore[attr-defined]
             kind=str(hit.kind),  # type: ignore[attr-defined]
+            module=str(raw_module) if raw_module is not None else None,
+            week=int(raw_week) if raw_week is not None else None,
         )
 
     def _search_result(self, hits: list[object], started: float) -> SearchResult:
@@ -948,7 +964,17 @@ class WebService:
             took_ms=took_ms,
         )
 
+    @staticmethod
+    def _optional_filter_kwargs(request: SearchRequest) -> dict[str, object]:
+        extra: dict[str, object] = {}
+        if request.module is not None:
+            extra["module"] = request.module
+        if request.week is not None:
+            extra["week"] = request.week
+        return extra
+
     def _call_daemon_search(self, cfg: Config, request: SearchRequest) -> list[object] | None:
+        extra = self._optional_filter_kwargs(request)
         if self._daemon_search is not None:
             return self._daemon_search(
                 request.query,
@@ -961,6 +987,7 @@ class WebService:
                 kind=request.kind,
                 since=request.since,
                 cfg=cfg,
+                **extra,
             )
         from .cli_search import try_daemon_hits
 
@@ -975,12 +1002,13 @@ class WebService:
             kind=request.kind,
             since=request.since,
             cfg=cfg,
+            **extra,
         )
 
     def _call_local_search(
         self, cfg: Config, request: SearchRequest, embedder: Embedder
     ) -> list[object]:
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "k": request.k,
             "mode": request.mode,
             "per_file": request.per_file,
@@ -991,6 +1019,7 @@ class WebService:
             "cfg": cfg,
             "embedder": embedder,
             "use_daemon": False,
+            **self._optional_filter_kwargs(request),
         }
         if self._local_search is not None:
             return self._local_search(request.query, **kwargs)
@@ -1009,13 +1038,24 @@ class WebService:
         if isinstance(exc, DaemonMismatchError):
             return ApiError(409, "busy", "daemon configuration changed; retry the search")
         if isinstance(exc, DaemonError):
-            return ApiError(503, "daemon_failure", f"daemon search failed: {_safe_message(exc)}")
+            message = _safe_message(exc)
+            if _is_module_filter_error(message):
+                return ApiError(400, "invalid_request", message, {"module": message})
+            if _is_week_filter_error(message):
+                return ApiError(400, "invalid_request", message, {"week": message})
+            return ApiError(503, "daemon_failure", f"daemon search failed: {message}")
         if isinstance(exc, (ModelMismatchError, SchemaVersionError)):
             return ApiError(409, "incompatible_index", _safe_message(exc))
         if isinstance(exc, LifecycleError):
             return ApiError(409, "busy", f"index is in use: {_safe_message(exc)}")
         if _is_busy_error(exc):
             return ApiError(409, "busy", f"index is busy: {_safe_message(exc)}")
+        if isinstance(exc, ValueError):
+            message = _safe_message(exc)
+            if _is_module_filter_error(message):
+                return ApiError(400, "invalid_request", message, {"module": message})
+            if _is_week_filter_error(message):
+                return ApiError(400, "invalid_request", message, {"week": message})
         if isinstance(exc, (SearchError, sqlite3.Error, OSError)):
             return ApiError(503, "index_unavailable", f"cannot read the index: {_safe_message(exc)}")
         return ApiError(500, "internal_error", "search failed unexpectedly")
@@ -1081,6 +1121,7 @@ class WebService:
                     cfg=cfg,
                     searcher=searcher,
                     use_daemon=False,
+                    **self._optional_filter_kwargs(request),
                 )
             )
         finally:
@@ -1101,8 +1142,8 @@ class WebService:
 
     @staticmethod
     def _validate_search_filters(request: SearchRequest) -> None:
-        """Validate kind/since before any daemon or local search path runs."""
-        from .filters import normalise_kind, parse_since
+        """Validate kind/since/module/week before any daemon or local search path runs."""
+        from .filters import normalise_kind, parse_since, parse_week
 
         try:
             normalise_kind(request.kind)
@@ -1135,6 +1176,26 @@ class WebService:
                 message,
                 {"since": message},
             )
+
+        if request.module is not None and not isinstance(request.module, str):
+            message = "module filter must be a string"
+            raise ApiError(
+                400,
+                "invalid_request",
+                f"invalid module filter: {message}",
+                {"module": message},
+            )
+
+        try:
+            parse_week(request.week)
+        except (ValueError, TypeError) as exc:
+            message = _safe_message(exc)
+            raise ApiError(
+                400,
+                "invalid_request",
+                f"invalid week filter: {message}",
+                {"week": message},
+            ) from exc
 
     def search(self, request: SearchRequest) -> SearchResult:
         self._reject_if_shutting_down()
