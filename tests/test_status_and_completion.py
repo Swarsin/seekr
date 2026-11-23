@@ -95,7 +95,8 @@ class PolishedStatusTests(unittest.TestCase):
             self.assertIn("last error count: 1", text_res.output)
             self.assertIn("database:", text_res.output)
             self.assertIn(
-                f"model: fake (dim=8, quant=int8, schema=v{SCHEMA_VERSION})",
+                f"model: fake (dim=8, quant=int8, schema=v{SCHEMA_VERSION}, "
+                f"backend={cfg.embed_backend})",
                 text_res.output,
             )
             self.assertIn("by kind: code=1, markdown=1", text_res.output)
@@ -112,6 +113,7 @@ class PolishedStatusTests(unittest.TestCase):
             self.assertEqual(parsed["dim"], 8)
             self.assertEqual(parsed["vector_quant"], "int8")
             self.assertEqual(parsed["schema_version"], SCHEMA_VERSION)
+            self.assertEqual(parsed["embed_backend"], cfg.embed_backend)
             self.assertEqual(parsed["daemon"], {"running": True, "socket": str(sock)})
             self.assertGreater(parsed["size_bytes"], 0)
 
@@ -134,6 +136,26 @@ class PolishedStatusTests(unittest.TestCase):
         self.assertEqual(parsed["chunks"], 0)
         self.assertEqual(parsed["last_error_count"], 0)
         self.assertFalse(parsed["daemon"]["running"])
+
+    def test_status_shows_backend(self) -> None:
+        from typer.testing import CliRunner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sock = Path(tmp) / "seekr.sock"
+            for backend in ("onnx", "torch"):
+                cfg = Config(
+                    db_path=Path(tmp) / "missing.db", embed_model="fake", embed_backend=backend
+                )
+                with (
+                    self.subTest(backend=backend),
+                    mock.patch("seekr.cli_index._load_config", return_value=cfg),
+                    mock.patch("seekr.cli_index._daemon_status", return_value=(False, sock)),
+                ):
+                    text = CliRunner().invoke(app, ["status"])
+                    data = CliRunner().invoke(app, ["status", "--json"])
+                    self.assertEqual(text.exit_code, 0, text.output)
+                    self.assertIn(f"backend={backend}", text.output)
+                    self.assertEqual(json.loads(data.stdout)["embed_backend"], backend)
 
     def test_status_reports_stopped_for_long_socket_path(self) -> None:
         from typer.testing import CliRunner

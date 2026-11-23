@@ -143,9 +143,10 @@ def load_local_model(
     except ImportError as exc:
         raise ModelUnavailableError(
             f"could not import sentence-transformers for model {raw!r}: {exc}. "
-            "Install seekr's runtime dependencies (for example "
-            "`pip install sentence-transformers`) before using a real embedding or "
-            "reranking model; seekr never downloads models implicitly."
+            'The PyTorch backend (embed_backend = "torch") needs the torch extra: '
+            "`pipx install 'seekr-search[torch]'`, or for an existing pipx install "
+            "`pipx inject seekr-search sentence-transformers`. Alternatively set "
+            'embed_backend = "onnx". seekr never downloads models implicitly.'
         ) from exc
 
     model_class = getattr(sentence_transformers, _MODEL_ATTRIBUTES[kind])

@@ -44,12 +44,19 @@ _USE_CONFIG = object()
 
 
 def _open_store(
-    cfg: Config, dim: int, *, vector_quant: object = _USE_CONFIG
+    cfg: Config,
+    dim: int,
+    *,
+    vector_quant: object = _USE_CONFIG,
+    record_backend: bool = True,
 ) -> Store:
     quant = cfg.vector_quant if vector_quant is _USE_CONFIG else vector_quant
+    backend = cfg.embed_backend if record_backend else None
     if quant is None:
-        return Store(cfg.db_path, cfg.embed_model, dim)
-    return Store(cfg.db_path, cfg.embed_model, dim, vector_quant=str(quant))
+        return Store(cfg.db_path, cfg.embed_model, dim, embed_backend=backend)
+    return Store(
+        cfg.db_path, cfg.embed_model, dim, vector_quant=str(quant), embed_backend=backend
+    )
 
 
 def _stored_dim(cfg: Config) -> int | None:
@@ -303,6 +310,7 @@ def status(
                                     "embed_model": cfg.embed_model,
                                     "dim": None,
                                     "vector_quant": cfg.vector_quant,
+                                    "embed_backend": cfg.embed_backend,
                                     "schema_version": None,
                                     "daemon": {
                                         "running": daemon_running,
@@ -318,12 +326,15 @@ def status(
                     typer.echo("chunks: 0")
                     typer.echo("last error count: 0")
                     typer.echo(f"database: {db_path} (not initialized)")
-                    typer.echo(f"model: {cfg.embed_model} (quant={cfg.vector_quant})")
+                    typer.echo(
+                        f"model: {cfg.embed_model} "
+                        f"(quant={cfg.vector_quant}, backend={cfg.embed_backend})"
+                    )
                     _echo_daemon_status(daemon_running, sock, cfg)
                     return
                 dim = _build_embedder(cfg).dim
 
-            store = _open_store(cfg, dim, vector_quant=None)
+            store = _open_store(cfg, dim, vector_quant=None, record_backend=False)
             try:
                 stats = store.stats()
                 last_errors = store.get_last_error_count()
@@ -362,6 +373,7 @@ def status(
                     "dim": details.get("dim", dim),
                     "vector_quant": details.get("vector_quant", cfg.vector_quant),
                     "schema_version": details.get("schema_version"),
+                    "embed_backend": cfg.embed_backend,
                     "daemon": {
                         "running": daemon_running,
                         "socket": str(sock),
@@ -381,7 +393,7 @@ def status(
         typer.echo(
             f"model: {details['embed_model']} "
             f"(dim={details['dim']}, quant={details['vector_quant']}, "
-            f"schema=v{details['schema_version']})"
+            f"schema=v{details['schema_version']}, backend={cfg.embed_backend})"
         )
     kinds = details.get("kinds")
     if isinstance(kinds, dict) and kinds:

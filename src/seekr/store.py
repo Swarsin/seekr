@@ -335,6 +335,7 @@ class Store:
         *,
         vector_quant: str | None = None,
         read_only: bool = False,
+        embed_backend: str | None = None,
     ) -> None:
         if not isinstance(embed_model, str) or not embed_model.strip():
             raise ValueError("embed_model must be a non-empty string")
@@ -346,8 +347,16 @@ class Store:
             choices = ", ".join(sorted(VECTOR_QUANTS))
             raise ValueError(f"vector_quant must be one of {choices}")
 
+        if embed_backend is not None and (
+            not isinstance(embed_backend, str) or not embed_backend.strip()
+        ):
+            raise ValueError("embed_backend must be a non-empty string")
+
         self._db_path = Path(db_path)
         self._embed_model = embed_model
+        # Informational only: indexes are compatible across backends that run
+        # the same model, so the recorded backend is never compared.
+        self._embed_backend = embed_backend
         self._dim = dim
         self._read_only = bool(read_only)
         self._stubbed_backend = (
@@ -406,6 +415,12 @@ class Store:
                 _create_vector_table(conn, dim)
             if needs_metadata:
                 self._write_metadata(conn)
+            if self._embed_backend is not None:
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES ('embed_backend', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (self._embed_backend,),
+                )
         except BaseException:
             conn.close()
             raise

@@ -115,7 +115,11 @@ class CrossEncoderReranker:
 
 
 def build_reranker(cfg: Config) -> Reranker:
-    """Build the configured lazy cross-encoder reranking backend."""
+    """Build the configured lazy cross-encoder backend (``cfg.embed_backend``)."""
+    if cfg.embed_backend == "onnx":
+        from .onnx_backend import OnnxReranker
+
+        return OnnxReranker(cfg.rerank_model)
     return CrossEncoderReranker(cfg.rerank_model)
 
 

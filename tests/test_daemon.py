@@ -969,7 +969,11 @@ class DaemonRunnerTests(unittest.TestCase):
         self.assertLess(events.index("sync"), events.index("embedder.dim"))
         self.assertLess(events.index("watcher.resume"), events.index("embedder.dim"))
         store_cls.assert_called_once_with(
-            db_path, cfg.embed_model, 12, vector_quant=cfg.vector_quant
+            db_path,
+            cfg.embed_model,
+            12,
+            vector_quant=cfg.vector_quant,
+            embed_backend=cfg.embed_backend,
         )
         self.assertEqual(searcher.daemon_metadata["dim"], 12)
         self.assertEqual(searcher.daemon_metadata["vector_quant"], cfg.vector_quant)

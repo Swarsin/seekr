@@ -377,7 +377,11 @@ def rebuild_index(
 
     resolved_store_factory = store_factory or (
         lambda path, model, vector_dim: Store(
-            path, model, vector_dim, vector_quant=cfg.vector_quant
+            path,
+            model,
+            vector_dim,
+            vector_quant=cfg.vector_quant,
+            embed_backend=cfg.embed_backend,
         )
     )
     indexer_factory = indexer_factory or Indexer

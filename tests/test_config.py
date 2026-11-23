@@ -62,6 +62,18 @@ class ConfigLoadingTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 load_config(bad_path)
 
+    def test_embed_backend_override_and_validation(self) -> None:
+        self.assertIn(Config().embed_backend, {"onnx", "torch"})
+        with tempfile.TemporaryDirectory() as tmp:
+            for value in ("onnx", "torch"):
+                cfg = load_config(self._write(Path(tmp), f'embed_backend = "{value}"\n'))
+                self.assertEqual(cfg.embed_backend, value)
+
+            for bad in ('"cuda"', '""', "1"):
+                with self.subTest(bad=bad), self.assertRaises(ConfigError) as raised:
+                    load_config(self._write(Path(tmp), f"embed_backend = {bad}\n"))
+                self.assertIn("embed_backend", str(raised.exception))
+
     def test_db_path_expands_tilde(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = self._write(Path(tmp), 'db_path = "~/data/index.db"\n')

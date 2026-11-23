@@ -191,7 +191,11 @@ class SentenceTransformerEmbedder:
 
 
 def build_embedder(cfg: Config) -> Embedder:
-    """Build the configured lazy embedding backend."""
+    """Build the configured lazy embedding backend (``cfg.embed_backend``)."""
+    if cfg.embed_backend == "onnx":
+        from .onnx_backend import OnnxEmbedder
+
+        return OnnxEmbedder(cfg.embed_model)
     return SentenceTransformerEmbedder(cfg.embed_model)
 
 
