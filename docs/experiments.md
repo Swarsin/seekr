@@ -376,3 +376,21 @@ Small, length-sorted batches are fastest for ONNX Runtime on CPU (less padding, 
 | 1 | 22.4 | 771 ms |
 
 Batch size 4 keeps nearly all of the gain while still batching. The PyTorch backend keeps batches of 32, which suit CUDA.
+
+### Experiment: int8-quantized ONNX embedding weights (not adopted)
+
+`bge-small-en-v1.5` publishes no quantized ONNX file, so a copy was quantized locally with `onnxruntime.quantization.quantize_dynamic` (`QInt8` weights) and run through the same gate:
+
+```bash
+CUDA_VISIBLE_DEVICES= python bench/onnx_equivalence.py --corpus eval/data/scifact/corpus --chunks 1000 --rerank-queries 0 --quantize-to /tmp/bge-small-int8.onnx
+```
+
+| Metric | fp32 ONNX (default) | int8 ONNX | Gate |
+| --- | ---: | ---: | --- |
+| Model file size | 133.1 MB | 33.8 MB | — |
+| Embedding 1,000 chunks, CPU | 46.31 s | 41.09 s | — |
+| Mean / min cosine vs PyTorch | 1.000000 / 1.000000 | 0.982592 / 0.957661 | `>= 0.999` / `>= 0.995` — **fail** |
+| SciFact vector / hybrid `ndcg@10` | 0.7109 / 0.7320 | 0.6957 / 0.7241 | hybrid within 0.50 pts — **fail** (−0.79) |
+| NFCorpus vector / hybrid `ndcg@10` | 0.3410 / 0.3632 | 0.3273 / 0.3606 | hybrid within 0.50 pts — pass (−0.26) |
+
+Quantizing cuts the model file to a quarter but is only ~11% faster on this CPU and costs up to 1.5 pts of vector `ndcg@10`. It fails the gate, so it is not offered as an option; the default stays fp32.

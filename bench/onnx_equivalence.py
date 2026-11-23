@@ -14,6 +14,10 @@ Both models must already be cached locally with their PyTorch and ONNX files
         --chunks 1000 --rerank-queries 50
 
 Gate: mean cosine >= 0.999, min cosine >= 0.995, mean Kendall tau >= 0.95.
+
+``--quantize-to PATH`` writes a dynamically int8-quantized copy of the
+embedding model and compares that instead; it needs the ``onnx`` package
+(``pip install onnx``), which seekr itself does not depend on.
 """
 
 from __future__ import annotations
