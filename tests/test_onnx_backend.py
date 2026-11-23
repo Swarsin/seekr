@@ -16,10 +16,14 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from seekr.embed import BATCH_SIZE, QUERY_PREFIX
+from seekr.embed import QUERY_PREFIX
 from seekr.offline import ModelUnavailableError
 
 _HAS_NUMPY = importlib.util.find_spec("numpy") is not None
+
+# Small batches are fastest for ONNX Runtime on CPU (little padding, better
+# cache use), so the ONNX backends batch independently of seekr.embed.BATCH_SIZE.
+BATCH_SIZE = 4
 
 if _HAS_NUMPY:
     import numpy as np
@@ -173,6 +177,9 @@ class OnnxEmbedderTests(unittest.TestCase):
         self.assertEqual(self.tokenizer.seen[-1], [QUERY_PREFIX + "what is wal"])
 
     def test_batches_of_batch_size(self) -> None:
+        from seekr.onnx_backend import ONNX_BATCH_SIZE
+
+        self.assertEqual(ONNX_BATCH_SIZE, BATCH_SIZE)
         embedder = self._embedder()
         out = embedder.embed_documents(["word"] * (BATCH_SIZE + 1))
         self.assertEqual(out.shape, (BATCH_SIZE + 1, 4))
@@ -419,6 +426,10 @@ class OnnxRerankerTests(unittest.TestCase):
         self.assertEqual(len(self.session.calls), 2)
         # Query "q" adds one word; CLS adds one token.
         self.assertEqual(scores, [float(i % 5 + 1 + 2) for i in range(BATCH_SIZE + 3)])
+        # Pairs are batched by length: the first batch holds the shortest pairs.
+        widths = [call["input_ids"].shape[1] for call in self.session.calls]
+        self.assertEqual(widths, sorted(widths))
+        self.assertLess(widths[0], widths[-1])
 
     def test_rerank_missing_files_name_models_pull(self) -> None:
         from seekr.onnx_backend import OnnxReranker
