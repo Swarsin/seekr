@@ -269,5 +269,30 @@ class DoctorExpandedTests(unittest.TestCase):
         self.assertFalse(bad_checks["roots"].ok)
 
 
+    def test_doctor_detail_names_backend(self) -> None:
+        seen: list[object] = []
+
+        def cached(asset: object) -> bool:
+            seen.append(asset)
+            return True
+
+        for backend in ("onnx", "torch"):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as tmp:
+                seen.clear()
+                probes = DoctorProbes(
+                    model_cached=cached,
+                    grammars_missing=list,
+                    mounts=list,
+                    is_wsl=lambda: False,
+                    daemon_state=lambda: "stopped (/tmp/seekr.sock)",
+                )
+                cfg = Config(roots=(Path(tmp),), embed_backend=backend)
+                report = run_doctor(cfg=cfg, probes=probes, **_healthy_sqlite_kwargs())  # type: ignore[arg-type]
+                checks = {check.name: check for check in report.checks}
+                self.assertIn(f"{backend} backend", checks["embedding model"].detail)
+                self.assertIn(f"{backend} backend", checks["reranker model"].detail)
+                self.assertEqual({a.backend for a in seen}, {backend})  # type: ignore[attr-defined]
+
+
 if __name__ == "__main__":
     unittest.main()

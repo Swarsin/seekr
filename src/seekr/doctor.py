@@ -321,7 +321,8 @@ def _check_models(cfg: Config | None, probes: DoctorProbes) -> list[DoctorCheck]
                 DoctorCheck(
                     "embedding model",
                     cached,
-                    f"{asset.repo_id} ({'cached' if cached else 'not cached'})",
+                    f"{asset.repo_id} ({'cached' if cached else 'not cached'}, "
+                    f"{asset.backend} backend)",
                     "" if cached else "seekr models pull",
                     severity="error",
                 )
@@ -331,7 +332,8 @@ def _check_models(cfg: Config | None, probes: DoctorProbes) -> list[DoctorCheck]
                 DoctorCheck(
                     "reranker model",
                     cached,
-                    f"{asset.repo_id} ({'cached' if cached else 'not cached; optional'})",
+                    f"{asset.repo_id} "
+                    f"({'cached' if cached else 'not cached; optional'}, {asset.backend} backend)",
                     "" if cached else "seekr models pull --rerank",
                     severity="info",
                 )

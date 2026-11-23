@@ -13,8 +13,22 @@ from .config import Config
 from .extract import _LANGUAGE_BY_SUFFIX
 
 TORCH_PATTERNS: tuple[str, ...] = ("*.json", "*.txt", "model.safetensors", "1_Pooling/*")
+ONNX_PATTERNS: tuple[str, ...] = (
+    "onnx/model.onnx",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "config.json",
+    "1_Pooling/config.json",
+)
+# Files whose presence means a model is usable offline by each backend.
+_CACHE_MARKERS: dict[str, tuple[str, ...]] = {
+    "onnx": ("onnx/model.onnx",),
+    "torch": ("config.json", "model.safetensors"),
+}
 
 __all__ = [
+    "ONNX_PATTERNS",
     "TORCH_PATTERNS",
     "ModelAsset",
     "ProvisionError",
@@ -39,23 +53,28 @@ class ModelAsset:
     repo_id: str
     allow_patterns: tuple[str, ...]
     purpose: Literal["embedding", "rerank"]
+    backend: Literal["onnx", "torch"] = "torch"
 
 
 def assets_for(cfg: Config, *, rerank: bool = False) -> list[ModelAsset]:
-    """Return the model assets configured for *cfg*."""
+    """Return the model assets configured for *cfg* and its ``embed_backend``."""
+    backend: Literal["onnx", "torch"] = "onnx" if cfg.embed_backend == "onnx" else "torch"
+    patterns = ONNX_PATTERNS if backend == "onnx" else TORCH_PATTERNS
     assets = [
         ModelAsset(
             repo_id=cfg.embed_model,
-            allow_patterns=TORCH_PATTERNS,
+            allow_patterns=patterns,
             purpose="embedding",
+            backend=backend,
         )
     ]
     if rerank and cfg.rerank_model and cfg.rerank_model.strip():
         assets.append(
             ModelAsset(
                 repo_id=cfg.rerank_model,
-                allow_patterns=TORCH_PATTERNS,
+                allow_patterns=patterns,
                 purpose="rerank",
+                backend=backend,
             )
         )
     return assets
@@ -93,8 +112,15 @@ def _hub_error_types(hf_errors: object) -> tuple[type[BaseException], ...]:
 
 
 def is_cached(asset: ModelAsset) -> bool:
-    """Return ``True`` when *asset* is present locally without accessing the network."""
-    if _local_model_dir(asset.repo_id) is not None:
+    """Return ``True`` when *asset* is present locally without accessing the network.
+
+    A local model directory needs ``config.json`` (and ``onnx/model.onnx`` for
+    the ONNX backend); a cached Hub model needs the backend's marker files.
+    """
+    local_dir = _local_model_dir(asset.repo_id)
+    if local_dir is not None:
+        if asset.backend == "onnx":
+            return (local_dir / "onnx" / "model.onnx").is_file()
         return True
     if not isinstance(asset.repo_id, str) or not asset.repo_id.strip():
         return False
@@ -102,11 +128,14 @@ def is_cached(asset: ModelAsset) -> bool:
         from huggingface_hub import try_to_load_from_cache
     except ImportError:
         return False
-    try:
-        cached = try_to_load_from_cache(asset.repo_id, "config.json")
-    except (OSError, ValueError, RuntimeError):
-        return False
-    return isinstance(cached, str)
+    for marker in _CACHE_MARKERS.get(asset.backend, _CACHE_MARKERS["torch"]):
+        try:
+            cached = try_to_load_from_cache(asset.repo_id, marker)
+        except (OSError, ValueError, RuntimeError):
+            return False
+        if not isinstance(cached, str):
+            return False
+    return True
 
 
 def estimate_bytes(asset: ModelAsset) -> int | None:
