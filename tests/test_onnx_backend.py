@@ -180,6 +180,27 @@ class OnnxEmbedderTests(unittest.TestCase):
         self.assertEqual(self.session.calls[0]["input_ids"].shape[0], BATCH_SIZE)
         self.assertEqual(self.session.calls[1]["input_ids"].shape[0], 1)
 
+    def test_length_sorted_batches_keep_input_order(self) -> None:
+        class LengthSession(FakeEmbedSession):
+            def run(self, _outputs: Any, feed: dict[str, Any]) -> list[Any]:
+                self.calls.append(feed)
+                batch, seq = feed["input_ids"].shape
+                out = np.zeros((batch, seq, self.dim), np.float32)
+                out[:, 0, 0] = feed["attention_mask"].sum(axis=1)  # real token count
+                out[:, 0, 1] = 1.0
+                return [out]
+
+        embedder = self._embedder(session=LengthSession())
+        lengths = [(i * 7) % 50 + 1 for i in range(BATCH_SIZE * 2 + 5)]
+        texts = [" ".join(["w"] * n) for n in lengths]
+        vecs = embedder.embed_documents(texts)
+        for row, n in zip(vecs, lengths, strict=True):
+            expected = np.array([n + 1, 1.0, 0.0, 0.0], np.float32)
+            np.testing.assert_allclose(row, expected / np.linalg.norm(expected), rtol=1e-6)
+        # Short texts are batched together, so the first batch pads far less.
+        widths = [call["input_ids"].shape[1] for call in self.session.calls]
+        self.assertLess(widths[0], widths[-1])
+
     def test_feed_uses_session_input_names_as_int64(self) -> None:
         embedder = self._embedder()
         embedder.embed_documents(["a b"])

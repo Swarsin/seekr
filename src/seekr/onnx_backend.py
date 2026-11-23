@@ -256,11 +256,17 @@ class OnnxEmbedder(_OnnxModel):
         self._ensure_loaded()
         if not batch:
             return np.empty((0, self.dim), dtype=np.float32)
+        # Batch texts of similar length together to minimise padding (as
+        # sentence-transformers does), then restore the caller's order.
+        order = sorted(range(len(batch)), key=lambda i: len(batch[i]))
+        ordered = [batch[i] for i in order]
         parts = [
-            self._embed_batch(batch[start : start + BATCH_SIZE])
-            for start in range(0, len(batch), BATCH_SIZE)
+            self._embed_batch(ordered[start : start + BATCH_SIZE])
+            for start in range(0, len(ordered), BATCH_SIZE)
         ]
-        matrix = np.concatenate(parts, axis=0)
+        sorted_matrix = np.concatenate(parts, axis=0)
+        matrix = np.empty_like(sorted_matrix)
+        matrix[np.asarray(order)] = sorted_matrix
         if self._dim is None:
             self._dim = int(matrix.shape[1])
         return matrix
