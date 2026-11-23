@@ -11,6 +11,7 @@ is first used.
 from __future__ import annotations
 
 import json
+import math
 import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 ONNX_MODEL_FILE = "onnx/model.onnx"
 ONNX_EMBED_FILES: tuple[str, ...] = (ONNX_MODEL_FILE, "tokenizer.json", "config.json")
 ONNX_EMBED_OPTIONAL_FILES: tuple[str, ...] = ("1_Pooling/config.json",)
+ONNX_RERANK_FILES: tuple[str, ...] = (ONNX_MODEL_FILE, "tokenizer.json", "config.json")
 MAX_SEQ_LEN = 512
 _FEED_NAMES = frozenset({"input_ids", "attention_mask", "token_type_ids"})
 _DEFAULT_PROVIDERS = ("CPUExecutionProvider",)
@@ -267,11 +269,48 @@ class OnnxEmbedder(_OnnxModel):
         return self.embed_documents([QUERY_PREFIX + text])[0]
 
 
+class OnnxReranker(_OnnxModel):
+    """Lazy, local-only ONNX Runtime cross-encoder reranker.
+
+    Scores are the model's raw logits. The torch backend may apply an
+    activation, so ``--explain`` rerank scores can differ in scale between
+    backends; the ranking order is what the two backends agree on.
+    """
+
+    _required = ONNX_RERANK_FILES
+
+    def score(self, query: str, passages: list[str]) -> list[float]:
+        import numpy as np
+
+        batch = list(passages)
+        if not batch:
+            return []
+        self._ensure_loaded()
+        scores: list[float] = []
+        for start in range(0, len(batch), BATCH_SIZE):
+            pairs = [(query, passage) for passage in batch[start : start + BATCH_SIZE]]
+            logits, _mask = self._run(pairs)
+            values = np.asarray(logits, dtype=np.float64)
+            if values.ndim == 2:
+                values = values[:, 0]
+            if values.shape != (len(pairs),):
+                raise ValueError(
+                    f"cross-encoder returned shape {logits.shape} for {len(pairs)} passages"
+                )
+            for value in values.tolist():
+                if not math.isfinite(value):
+                    raise ValueError(f"cross-encoder returned a non-finite score: {value!r}")
+                scores.append(float(value))
+        return scores
+
+
 __all__ = [
     "MAX_SEQ_LEN",
     "ONNX_EMBED_FILES",
     "ONNX_MODEL_FILE",
+    "ONNX_RERANK_FILES",
     "OnnxEmbedder",
+    "OnnxReranker",
     "read_pooling_mode",
     "resolve_model_files",
 ]

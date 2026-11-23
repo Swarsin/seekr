@@ -316,5 +316,98 @@ class ResolveModelFilesTests(unittest.TestCase):
             self.assertEqual(files["tokenizer.json"], root / "tokenizer.json")
 
 
+class FakeRerankSession:
+    def __init__(self, logits: list[list[float]] | None = None, *, flat: bool = False) -> None:
+        self.logits = logits
+        self.flat = flat
+        self.calls: list[dict[str, Any]] = []
+
+    def get_inputs(self) -> list[_Port]:
+        return [_Port("input_ids"), _Port("attention_mask"), _Port("token_type_ids")]
+
+    def get_outputs(self) -> list[_Port]:
+        return [_Port("logits", ["batch", 1])]
+
+    def run(self, _outputs: Any, feed: dict[str, Any]) -> list[Any]:
+        self.calls.append(feed)
+        batch = feed["input_ids"].shape[0]
+        if self.logits is not None:
+            out = np.asarray(self.logits, np.float32)
+        else:
+            # Score = number of real tokens, so order is checkable per batch.
+            out = feed["attention_mask"].sum(axis=1, keepdims=True).astype(np.float32)
+        out = out[:batch]
+        return [out.reshape(-1) if self.flat else out]
+
+
+@unittest.skipUnless(_HAS_NUMPY, "numpy is not installed")
+class OnnxRerankerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = _model_dir(Path(self._tmp.name), pooling=None)
+
+    def _reranker(self, session: Any) -> Any:
+        from seekr.onnx_backend import OnnxReranker
+
+        self.session = session
+        self.tokenizer = FakeTokenizer()
+        return OnnxReranker(
+            "cross-encoder/ms-marco-MiniLM-L-6-v2",
+            model_dir=self.root,
+            session_factory=lambda _path: self.session,
+            tokenizer_factory=lambda _path: self.tokenizer,
+        )
+
+    def test_rerank_returns_raw_logits_in_order(self) -> None:
+        reranker = self._reranker(FakeRerankSession([[0.1], [2.0], [-1.0]]))
+        scores = reranker.score("q", ["p1", "p2", "p3"])
+        self.assertEqual(len(scores), 3)
+        for got, want in zip(scores, [0.1, 2.0, -1.0], strict=True):
+            self.assertAlmostEqual(got, want, places=6)
+        self.assertTrue(all(type(value) is float for value in scores))
+
+    def test_rerank_flat_logits_supported(self) -> None:
+        reranker = self._reranker(FakeRerankSession([[0.5], [1.5]], flat=True))
+        self.assertEqual(reranker.score("q", ["a", "b"]), [0.5, 1.5])
+
+    def test_rerank_pair_encoding(self) -> None:
+        reranker = self._reranker(FakeRerankSession([[0.0], [0.0], [0.0]]))
+        reranker.score("q", ["p1", "p2", "p3"])
+        self.assertEqual(self.tokenizer.seen[-1], [("q", "p1"), ("q", "p2"), ("q", "p3")])
+        self.assertEqual(self.tokenizer.truncation["max_length"], 512)
+        self.assertEqual(
+            set(self.session.calls[0]), {"input_ids", "attention_mask", "token_type_ids"}
+        )
+
+    def test_rerank_empty_passages_skip_session(self) -> None:
+        reranker = self._reranker(FakeRerankSession())
+        self.assertEqual(reranker.score("q", []), [])
+        self.assertEqual(self.session.calls, [])
+
+    def test_rerank_nan_logits_raise(self) -> None:
+        reranker = self._reranker(FakeRerankSession([[float("nan")]]))
+        with self.assertRaises(ValueError):
+            reranker.score("q", ["p"])
+
+    def test_rerank_batches_of_batch_size(self) -> None:
+        reranker = self._reranker(FakeRerankSession())
+        passages = ["w " * (i % 5 + 1) for i in range(BATCH_SIZE + 3)]
+        scores = reranker.score("q", passages)
+        self.assertEqual(len(scores), BATCH_SIZE + 3)
+        self.assertEqual(len(self.session.calls), 2)
+        # Query "q" adds one word; CLS adds one token.
+        self.assertEqual(scores, [float(i % 5 + 1 + 2) for i in range(BATCH_SIZE + 3)])
+
+    def test_rerank_missing_files_name_models_pull(self) -> None:
+        from seekr.onnx_backend import OnnxReranker
+
+        with (
+            mock.patch("huggingface_hub.try_to_load_from_cache", return_value=None),
+            self.assertRaisesRegex(ModelUnavailableError, "seekr models pull"),
+        ):
+            OnnxReranker("cross-encoder/ms-marco-MiniLM-L-6-v2").score("q", ["p"])
+
+
 if __name__ == "__main__":
     unittest.main()
