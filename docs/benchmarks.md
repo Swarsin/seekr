@@ -73,6 +73,26 @@ python bench/latency.py --chunks 20000
 | 20k synthetic populate time / DB size (`bench/latency.py`) | 2.09 s / 44.88 MiB (`float32` opt.) | **1.83 s / 22.35 MiB** | **2.01x smaller DB** |
 | 20k peak process RSS (incl. CUDA model) | 1327.5 MiB | **1330.5 MiB** | Flat |
 
+### CPU only (ONNX Runtime, default install)
+
+The table above used CUDA PyTorch. The default install runs on the CPU with ONNX Runtime; these numbers were measured with `CUDA_VISIBLE_DEVICES=` on the same machine (`bench/latency-results-cpu-onnx.md`):
+
+```bash
+CUDA_VISIBLE_DEVICES= python bench/latency.py --chunks 20000 --embed-backend onnx --device cpu --out bench/latency-results-cpu-onnx.md
+python bench/cold_start.py --config <demo-course config> --runs 5
+```
+
+| Benchmark | PyTorch | ONNX Runtime (default) |
+| --- | ---: | ---: |
+| Query embedding p50 / p95 (CPU, 50 warm queries) | 15.57 / 17.85 ms | **9.61 / 11.85 ms** |
+| Cold one-shot `seekr search` (no daemon, median of 5) | 5.923 s (CUDA) | **0.677 s** |
+| `seekr daemon` time to `ping` / to first answered search (median of 5) | 0.227 / 5.219 s (CUDA) | **0.227 / 0.626 s** |
+| SciFact fresh `seekr index` (5,183 docs / 5,820 chunks) | 26.432 s (CUDA, 220.2 chunks/s) | 269.8 s (CPU, 21.6 chunks/s) |
+| 20k synthetic `hybrid` p50 / p95 (excl. embed) | 10.96 / 11.39 ms | 9.35 / 9.89 ms |
+| Peak process RSS (latency benchmark) | 930.5 MiB (CPU) | **267.9 MiB** |
+
+On the CPU, ONNX Runtime embeds queries faster than PyTorch and starts about `8.7x` faster for a one-shot search because it skips importing PyTorch. Bulk indexing is GPU-bound: a CUDA GPU with the `torch` extra indexes about `10x` faster than the CPU, so large first-time indexes are where `embed_backend = "torch"` still pays off.
+
 Query embedding latency (`BAAI/bge-small-en-v1.5`, CUDA, 50 warm queries) measured `10.17 / 11.02 ms` (`bench/latency-results.md` Phase 0) and `18.32 / 19.65 ms` (Phase 2 run; higher tail variance across isolated runs).
 
 **100,000-chunk scale test (`tests/test_scale_100k.py`, `@pytest.mark.slow`, `int8`):** `2,500` documents × `40` chunks (`100,000` chunks) populated in `9.11 s` (`10,977 chunks/sec`), producing a `110.45 MiB` database with warm query latencies `keyword 4.35 / 5.00 ms`, `vector 41.39 / 42.55 ms`, and `hybrid 44.37 / 46.38 ms` (p50 / p95 over 30 queries).

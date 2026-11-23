@@ -115,6 +115,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="queries.jsonl (default: <corpus>/../queries.jsonl)")
     parser.add_argument("--chunks", type=int, default=1000)
     parser.add_argument("--rerank-queries", type=int, default=50)
+    parser.add_argument(
+        "--onnx-path",
+        type=Path,
+        default=None,
+        help="compare this ONNX embedding model file (e.g. an int8-quantized copy) "
+        "instead of the cached onnx/model.onnx",
+    )
+    parser.add_argument(
+        "--quantize-to",
+        type=Path,
+        default=None,
+        help="write a dynamically int8-quantized copy of the cached embedding model "
+        "here first, then compare it (implies --onnx-path)",
+    )
     args = parser.parse_args(argv)
 
     import numpy as np
@@ -128,8 +142,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     texts = _corpus_chunks(args.corpus, args.chunks)
     print(f"chunks: {len(texts)}")
 
+    onnx_path = args.onnx_path
+    if args.quantize_to is not None:
+        from onnxruntime.quantization import QuantType, quantize_dynamic
+
+        from seekr.onnx_backend import ONNX_EMBED_FILES, resolve_model_files
+
+        source = resolve_model_files(cfg.embed_model, ONNX_EMBED_FILES)["onnx/model.onnx"]
+        args.quantize_to.parent.mkdir(parents=True, exist_ok=True)
+        quantize_dynamic(str(source), str(args.quantize_to), weight_type=QuantType.QInt8)
+        onnx_path = args.quantize_to
+    if onnx_path is not None:
+        print(f"onnx_file: {onnx_path} ({onnx_path.stat().st_size / 1e6:.1f} MB)")
+
     torch_embedder = SentenceTransformerEmbedder(cfg.embed_model, device="cpu")
-    onnx_embedder = OnnxEmbedder(cfg.embed_model)
+    if onnx_path is None:
+        onnx_embedder = OnnxEmbedder(cfg.embed_model)
+    else:
+        import onnxruntime
+
+        def session_factory(_cached: Path) -> object:
+            return onnxruntime.InferenceSession(
+                str(onnx_path), providers=["CPUExecutionProvider"]
+            )
+
+        onnx_embedder = OnnxEmbedder(cfg.embed_model, session_factory=session_factory)
 
     started = time.perf_counter()
     torch_vecs = torch_embedder.embed_documents(texts)
