@@ -77,6 +77,20 @@ Query embedding latency (`BAAI/bge-small-en-v1.5`, CUDA, 50 warm queries) measur
 
 **100,000-chunk scale test (`tests/test_scale_100k.py`, `@pytest.mark.slow`, `int8`):** `2,500` documents × `40` chunks (`100,000` chunks) populated in `9.11 s` (`10,977 chunks/sec`), producing a `110.45 MiB` database with warm query latencies `keyword 4.35 / 5.00 ms`, `vector 41.39 / 42.55 ms`, and `hybrid 44.37 / 46.38 ms` (p50 / p95 over 30 queries).
 
+## ONNX Runtime vs PyTorch backend
+
+The default install runs both models with ONNX Runtime; PyTorch is the optional `seekr-search[torch]` extra. Equivalence was measured before switching the default (full tables in [`experiments.md`](experiments.md#onnx-runtime-backend-equivalence-default-since-020)):
+
+| Check | PyTorch | ONNX Runtime |
+| --- | ---: | ---: |
+| Embedding cosine vs PyTorch, 1,000 chunks (mean / min) | — | 1.000000 / 1.000000 |
+| Reranker Kendall τ vs PyTorch, top 30 × 50 queries (mean / min) | — | 1.000000 / 1.000000 |
+| SciFact hybrid `ndcg@10` | 0.7320 | 0.7320 |
+| NFCorpus hybrid `ndcg@10` | 0.3632 | 0.3632 |
+| Embedding 1,000 chunks on CPU | 59.44 s | 46.31 s |
+| Default install size (site-packages, `bench/install_size.py`) | several GB with CUDA PyTorch | 349.1 MB |
+| Model download (`seekr models pull`, embedding / reranker) | safetensors + tokenizer files | 128 MB / 88 MB |
+
 ## Windows-drive sync overhead under WSL2 (`bench/drvfs_sync.py`)
 
 Measured with `bench/drvfs_sync.py` across `20` copies of the packaged demo course (`500` indexed files, `1,500` chunks, `20` skipped `queries.jsonl` files) using `FakeEmbedder(dim=64)` and an isolated SQLite database under Linux `/tmp` (matching real WSL setups where `index.db` stays in `~/.local/share/seekr` even when course folders live on `/mnt/c`):

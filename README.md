@@ -19,7 +19,17 @@ seekr init ~/Documents/ai-course
 seekr search "bias variance tradeoff" --module machine-learning
 ```
 
-`seekr init` writes `~/.config/seekr/config.toml`, explicitly prompts to download `BAAI/bge-small-en-v1.5` and tree-sitter code grammars (via `seekr models pull`), and builds your initial index. Want to try it before pointing at your own folders? Run `seekr init --demo` to copy and index the packaged sample course, or use `seekr models pull --rerank` / `--all`, `seekr models status`, and `seekr doctor` to inspect local readiness.
+`seekr init` writes `~/.config/seekr/config.toml`, explicitly prompts to download `BAAI/bge-small-en-v1.5` (~130 MB of ONNX model files) and tree-sitter code grammars (via `seekr models pull`), and builds your initial index. The default install runs the models with ONNX Runtime on the CPU and is about 350 MB on disk — no PyTorch required. Want to try it before pointing at your own folders? Run `seekr init --demo` to copy and index the packaged sample course, or use `seekr models pull --rerank` / `--all`, `seekr models status`, and `seekr doctor` to inspect local readiness.
+
+### GPU / PyTorch backend
+
+The default ONNX Runtime backend gives the same results as PyTorch (mean cosine similarity 1.000 on 1,000 chunks, identical reranker order; see [`docs/benchmarks.md`](https://github.com/Swarsin/seekr/blob/main/docs/benchmarks.md)). To run the models with PyTorch instead — for example on a CUDA GPU — install the extra and switch the backend; existing indexes keep working without a reindex:
+
+```bash
+pipx install 'seekr-search[torch]'     # or: pipx inject seekr-search sentence-transformers
+echo 'embed_backend = "torch"' >> ~/.config/seekr/config.toml
+seekr models pull
+```
 
 ## What it does
 
@@ -67,8 +77,8 @@ code / transcripts / text (UTF-8, UTF-8/UTF-16 BOM, latin-1 fallback)
   tree-sitter AST chunks, transcript cues, slide/cell blocks
                   │
                   ▼
-  batched embed locally (BAAI/bge-small-en-v1.5, 384-d L2-normalised,
-  int8 quantized by default in sqlite-vec)
+  batched embed locally with ONNX Runtime (BAAI/bge-small-en-v1.5,
+  384-d L2-normalised, int8 quantized by default in sqlite-vec)
                   │
                   ▼
         one SQLite WAL index (schema v3)
@@ -91,7 +101,7 @@ query ──► BGE query prefix + embed locally
                                                      CLI, web preview, warm Unix daemon, or `seekr mcp`
 ```
 
-Indexing runs in batches (up to 64 files / 128 chunks per transaction) and keys each chunk by the SHA-256 of its normalised text, so unchanged passages reuse stored vectors across edits and renames. Configuration lives at `$XDG_CONFIG_HOME/seekr/config.toml` (`roots`, `db_path`, `ignore_globs`, `embed_model`, `rerank_model`, `vector_quant`, `course_structure`, `week_pattern`, `poll_interval_seconds`), and `schema_version = 3` migrates older v1/v2 and `float32` databases inside an atomic transaction. Once models are cached locally, `seekr.offline` sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, passes `local_files_only=True`, disables telemetry, and rejects `trust_remote_code`; network access happens only during explicit `seekr models pull` (or the setup download button) and BEIR dataset converters in `eval/beir_*.py` unless `--no-download` is passed.
+Indexing runs in batches (up to 64 files / 128 chunks per transaction) and keys each chunk by the SHA-256 of its normalised text, so unchanged passages reuse stored vectors across edits and renames. Configuration lives at `$XDG_CONFIG_HOME/seekr/config.toml` (`roots`, `db_path`, `ignore_globs`, `embed_model`, `rerank_model`, `embed_backend`, `vector_quant`, `course_structure`, `week_pattern`, `poll_interval_seconds`), and `schema_version = 3` migrates older v1/v2 and `float32` databases inside an atomic transaction. Once models are cached locally, `seekr.offline` sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` and disables telemetry; the ONNX backend reads model files straight from the local cache, and the optional PyTorch backend passes `local_files_only=True` and rejects `trust_remote_code`; network access happens only during explicit `seekr models pull` (or the setup download button) and BEIR dataset converters in `eval/beir_*.py` unless `--no-download` is passed.
 
 ## Benchmarks
 
@@ -114,13 +124,13 @@ See [`docs/benchmarks.md`](https://github.com/Swarsin/seekr/blob/main/docs/bench
 ## Development
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev]"          # add ,torch to also test the PyTorch backend
 ruff check .
 pytest -m "not slow"
 pytest -m slow          # real cached models, sqlite-vec int8, and 100k scale test
 ```
 
-CI ([`.github/workflows/ci.yml`](https://github.com/Swarsin/seekr/blob/main/.github/workflows/ci.yml)) runs `ruff check .`, `pytest -m "not slow"`, and wheel installation checks on Python 3.11–3.13 on Ubuntu.
+CI ([`.github/workflows/ci.yml`](https://github.com/Swarsin/seekr/blob/main/.github/workflows/ci.yml)) runs `ruff check .` and `pytest -m "not slow"` on Python 3.11–3.13 on Ubuntu, the default suite again in a wheel install without PyTorch, and wheel installation checks.
 
 ## License
 

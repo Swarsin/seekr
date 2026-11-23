@@ -1,4 +1,7 @@
-"""Slow evaluation test against the packaged demo course with a real model."""
+"""Slow evaluation test against the packaged demo course with the default real model.
+
+Uses the default ONNX Runtime backend, so it checks what a default install gets.
+"""
 
 from __future__ import annotations
 
@@ -12,9 +15,9 @@ from pathlib import Path
 import seekr
 from seekr import offline, provision
 from seekr.config import Config
-from seekr.embed import SentenceTransformerEmbedder
 from seekr.evaluation import load_queries
 from seekr.indexer import Indexer
+from seekr.onnx_backend import OnnxEmbedder
 from seekr.search import Searcher
 from seekr.store import Store
 
@@ -39,7 +42,8 @@ def _has_fts5() -> bool:
 
 
 class DemoEvalSlowTests(unittest.TestCase):
-    def _load_embedder(self) -> SentenceTransformerEmbedder:
+    def _load_embedder(self) -> OnnxEmbedder:
+        cfg = Config()
         raw_dir = os.environ.get(_MODEL_DIR_ENV)
         if raw_dir is not None and raw_dir.strip():
             model_dir = Path(raw_dir).expanduser()
@@ -47,27 +51,26 @@ class DemoEvalSlowTests(unittest.TestCase):
                 model_dir.is_dir(),
                 f"{_MODEL_DIR_ENV} must point to an existing model directory: {model_dir}",
             )
-            return SentenceTransformerEmbedder(str(model_dir))
+            return OnnxEmbedder(cfg.embed_model, model_dir=model_dir)
 
         if (
             importlib.util.find_spec("numpy") is None
             or importlib.util.find_spec("sqlite_vec") is None
-            or importlib.util.find_spec("sentence_transformers") is None
+            or importlib.util.find_spec("onnxruntime") is None
             or not _has_fts5()
         ):
             self.skipTest(
-                "numpy, sqlite-vec, sentence-transformers and FTS5 are required "
+                "numpy, sqlite-vec, onnxruntime and FTS5 are required "
                 "for the demo evaluation slow test"
             )
 
-        cfg = Config()
         assets = provision.assets_for(cfg)
         offline.configure_offline_environment()
         if provision.is_cached(assets[0]):
-            return SentenceTransformerEmbedder(cfg.embed_model)
+            return OnnxEmbedder(cfg.embed_model)
 
         self.skipTest(
-            f"set {_MODEL_DIR_ENV} or cache {cfg.embed_model!r} locally to run demo eval"
+            f"set {_MODEL_DIR_ENV} or run `seekr models pull` to cache {cfg.embed_model!r}"
         )
 
     def test_demo_course_hybrid_recall_at_3(self) -> None:

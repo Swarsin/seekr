@@ -369,8 +369,9 @@ class ModelsCliTests(unittest.TestCase):
         dl.assert_called_once_with(
             provision.ModelAsset(
                 repo_id=cfg.embed_model,
-                allow_patterns=provision.TORCH_PATTERNS,
+                allow_patterns=provision.ONNX_PATTERNS,
                 purpose="embedding",
+                backend="onnx",
             )
         )
         dl_grammars.assert_not_called()

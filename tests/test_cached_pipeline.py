@@ -18,7 +18,7 @@ Three goals:
    numpy, the sqlite-vec extension or FTS5 are missing.  seekr modules are
    imported lazily inside tests so unrelated in-progress modules are never
    imported at collection time.
-3. Opt-in end-to-end test with a real sentence-transformers model, skipped
+3. Opt-in end-to-end test with the real default (ONNX) model, skipped
    unless ``SEEKR_TEST_EMBED_MODEL_DIR`` names a pre-provisioned local model
    directory.  Once the environment variable is set, this is a regression
    suite: missing dependencies or a broken model fail the test instead of
@@ -490,7 +490,7 @@ class CachedRealModelOfflineTests(unittest.TestCase):
         """Fail loudly on missing heavy deps instead of skipping."""
         missing = [
             name
-            for name in ("numpy", "sqlite_vec", "sentence_transformers")
+            for name in ("numpy", "sqlite_vec", "onnxruntime", "tokenizers")
             if importlib.util.find_spec(name) is None
         ]
         if missing:
@@ -513,8 +513,8 @@ class CachedRealModelOfflineTests(unittest.TestCase):
 
         # Lazy imports: heavy seekr modules load only inside the opted-in test.
         from seekr.config import Config
-        from seekr.embed import SentenceTransformerEmbedder
         from seekr.indexer import Indexer
+        from seekr.onnx_backend import OnnxEmbedder
         from seekr.rerank import FakeReranker
         from seekr.search import Searcher
         from seekr.store import Store
@@ -525,7 +525,7 @@ class CachedRealModelOfflineTests(unittest.TestCase):
             # Constructing the embedder and reading ``dim`` trigger the first
             # model load; the reranker is built here too so initial lazy setup
             # is covered by the outbound-attempt audit.
-            embedder = SentenceTransformerEmbedder(str(model_dir))
+            embedder = OnnxEmbedder(str(model_dir))
             store = Store(
                 db_path=root / ".seekr" / "index.db",
                 embed_model=embedder.model_name,
