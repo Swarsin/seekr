@@ -204,7 +204,14 @@ def download(asset: ModelAsset) -> Path:
         )
     except (OSError, ValueError, RuntimeError, *_hub_error_types(hf_errors)) as exc:
         raise ProvisionError(f"failed to download model {asset.repo_id!r}: {exc}") from exc
-    return Path(str(downloaded))
+    snapshot = Path(str(downloaded))
+    if asset.backend == "onnx" and not (snapshot / "onnx" / "model.onnx").is_file():
+        raise ProvisionError(
+            f"model {asset.repo_id!r} does not publish an ONNX export (onnx/model.onnx); "
+            'set embed_backend = "torch" in config.toml (needs '
+            "`pipx install 'seekr-search[torch]'`) or choose a model with an ONNX export"
+        )
+    return snapshot
 
 
 def grammar_languages() -> list[str]:

@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **Breaking for the PyTorch backend:** the default install no longer includes PyTorch or sentence-transformers (about 350 MB on disk instead of several GB). Users who set `embed_backend = "torch"` must install the `torch` extra.
 - `seekr models pull` downloads only the files the active backend needs (about 130 MB for the embedding model and 90 MB for the reranker with ONNX).
+- **Upgrading from 0.1.x:** run `seekr models pull` once (add `--rerank` if you use reranking) to fetch the ONNX model files; until then searches that need the model fail with a message naming that command. Existing indexes keep working without a reindex. `seekr models pull` now also stops with an explanation when a configured model publishes no ONNX export.
 - Upgraded SQLite index schema to `schema_version = 3` (with automatic transactional migration from v1/v2) to store and index `module` and `week` document metadata.
 - Updated `README.md` quickstart to use `seekr init`, refreshed feature/architecture docs, and re-recorded `docs/img/demo.gif`.
 

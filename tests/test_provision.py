@@ -293,6 +293,38 @@ class ProvisionUnitTests(unittest.TestCase):
         ):
             provision.download(asset)
 
+    def test_download_onnx_without_export_explains_torch_backend(self) -> None:
+        from seekr import provision
+
+        asset = provision.ModelAsset(
+            repo_id="org/no-onnx-model",
+            allow_patterns=provision.ONNX_PATTERNS,
+            purpose="embedding",
+            backend="onnx",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = Path(tmp) / "snapshot"
+            snapshot.mkdir()
+            (snapshot / "config.json").write_text("{}", encoding="utf-8")
+            with (
+                mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", False),
+                mock.patch("huggingface_hub.snapshot_download", return_value=str(snapshot)),
+                self.assertRaises(provision.ProvisionError) as raised,
+            ):
+                provision.download(asset)
+            message = str(raised.exception)
+            self.assertIn("org/no-onnx-model", message)
+            self.assertIn("onnx/model.onnx", message)
+            self.assertIn('embed_backend = "torch"', message)
+
+            (snapshot / "onnx").mkdir()
+            (snapshot / "onnx" / "model.onnx").write_bytes(b"x")
+            with (
+                mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", False),
+                mock.patch("huggingface_hub.snapshot_download", return_value=str(snapshot)),
+            ):
+                self.assertEqual(provision.download(asset), snapshot)
+
     def test_grammar_languages(self) -> None:
         from seekr import extract, provision
 
