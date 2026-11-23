@@ -83,7 +83,7 @@ class _UnsupportedExtensionConnection:
 
 class VersionTests(unittest.TestCase):
     def test_version_constant(self) -> None:
-        self.assertEqual(__version__, "0.1.1")
+        self.assertEqual(__version__, "0.2.0")
 
 
 class DoctorReportTests(unittest.TestCase):
@@ -181,7 +181,7 @@ class CliTests(unittest.TestCase):
         result = self._runner().invoke(app, ["--version"])
 
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("seekr 0.1.1", result.output)
+        self.assertIn("seekr 0.2.0", result.output)
 
     @unittest.skipUnless(
         _HAS_SQLITE_VEC and _HAS_FTS5 and _HAS_LOAD_EXTENSION,

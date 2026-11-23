@@ -137,6 +137,7 @@ def run_daemon(
                 selected_cfg.embed_model,
                 dim,
                 vector_quant=selected_cfg.vector_quant,
+                embed_backend=selected_cfg.embed_backend,
             )
             try:
                 searcher = Searcher(store, active_embedder, None)

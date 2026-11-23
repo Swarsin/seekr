@@ -23,7 +23,7 @@ class ProvisionUnitTests(unittest.TestCase):
     def test_assets_for_default_config(self) -> None:
         from seekr import provision
 
-        cfg = Config()
+        cfg = Config(embed_backend="torch")
         self.assertEqual(
             provision.TORCH_PATTERNS,
             ("*.json", "*.txt", "model.safetensors", "1_Pooling/*"),
@@ -81,10 +81,23 @@ class ProvisionUnitTests(unittest.TestCase):
         )
         with mock.patch(
             "huggingface_hub.try_to_load_from_cache",
-            return_value="/cache/snapshots/abc/config.json",
+            side_effect=lambda repo, name: f"/cache/snapshots/abc/{name}",
         ) as cached_lookup:
             self.assertTrue(provision.is_cached(hub_asset))
-        cached_lookup.assert_called_once_with("BAAI/bge-small-en-v1.5", "config.json")
+        self.assertEqual(
+            [c.args for c in cached_lookup.call_args_list],
+            [
+                ("BAAI/bge-small-en-v1.5", "config.json"),
+                ("BAAI/bge-small-en-v1.5", "model.safetensors"),
+            ],
+        )
+
+        # ONNX-only cache (no safetensors) does not satisfy the torch backend.
+        with mock.patch(
+            "huggingface_hub.try_to_load_from_cache",
+            side_effect=lambda repo, name: None if name == "model.safetensors" else name,
+        ):
+            self.assertFalse(provision.is_cached(hub_asset))
 
         with mock.patch("huggingface_hub.try_to_load_from_cache", return_value=None):
             self.assertFalse(provision.is_cached(hub_asset))
@@ -94,6 +107,65 @@ class ProvisionUnitTests(unittest.TestCase):
             side_effect=ValueError("invalid repo id"),
         ):
             self.assertFalse(provision.is_cached(hub_asset))
+
+    def test_onnx_assets_use_onnx_patterns(self) -> None:
+        from seekr import provision
+
+        self.assertEqual(
+            provision.ONNX_PATTERNS,
+            (
+                "onnx/model.onnx",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "special_tokens_map.json",
+                "config.json",
+                "1_Pooling/config.json",
+            ),
+        )
+        cfg = Config(embed_backend="onnx")
+        assets = provision.assets_for(cfg, rerank=True)
+        self.assertEqual([a.repo_id for a in assets], [cfg.embed_model, cfg.rerank_model])
+        for asset in assets:
+            self.assertEqual(asset.allow_patterns, provision.ONNX_PATTERNS)
+            self.assertEqual(asset.backend, "onnx")
+        torch_assets = provision.assets_for(Config(embed_backend="torch"), rerank=True)
+        self.assertEqual({a.backend for a in torch_assets}, {"torch"})
+
+    def test_is_cached_onnx_requires_model_onnx(self) -> None:
+        from seekr import provision
+
+        asset = provision.ModelAsset(
+            repo_id="BAAI/bge-small-en-v1.5",
+            allow_patterns=provision.ONNX_PATTERNS,
+            purpose="embedding",
+            backend="onnx",
+        )
+        # Torch-only cache: config.json present, no onnx/model.onnx.
+        with mock.patch(
+            "huggingface_hub.try_to_load_from_cache",
+            side_effect=lambda repo, name: f"/c/{name}" if name == "config.json" else None,
+        ):
+            self.assertFalse(provision.is_cached(asset))
+        with mock.patch(
+            "huggingface_hub.try_to_load_from_cache",
+            side_effect=lambda repo, name: f"/c/{name}",
+        ) as lookup:
+            self.assertTrue(provision.is_cached(asset))
+        self.assertIn(("BAAI/bge-small-en-v1.5", "onnx/model.onnx"), [c.args for c in lookup.call_args_list])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp)
+            (local / "config.json").write_text("{}", encoding="utf-8")
+            local_asset = provision.ModelAsset(
+                repo_id=str(local),
+                allow_patterns=provision.ONNX_PATTERNS,
+                purpose="embedding",
+                backend="onnx",
+            )
+            self.assertFalse(provision.is_cached(local_asset))
+            (local / "onnx").mkdir()
+            (local / "onnx" / "model.onnx").write_bytes(b"x")
+            self.assertTrue(provision.is_cached(local_asset))
 
     def test_estimate_bytes_filters_by_allow_patterns_and_handles_errors(self) -> None:
         from seekr import provision
@@ -221,6 +293,38 @@ class ProvisionUnitTests(unittest.TestCase):
         ):
             provision.download(asset)
 
+    def test_download_onnx_without_export_explains_torch_backend(self) -> None:
+        from seekr import provision
+
+        asset = provision.ModelAsset(
+            repo_id="org/no-onnx-model",
+            allow_patterns=provision.ONNX_PATTERNS,
+            purpose="embedding",
+            backend="onnx",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = Path(tmp) / "snapshot"
+            snapshot.mkdir()
+            (snapshot / "config.json").write_text("{}", encoding="utf-8")
+            with (
+                mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", False),
+                mock.patch("huggingface_hub.snapshot_download", return_value=str(snapshot)),
+                self.assertRaises(provision.ProvisionError) as raised,
+            ):
+                provision.download(asset)
+            message = str(raised.exception)
+            self.assertIn("org/no-onnx-model", message)
+            self.assertIn("onnx/model.onnx", message)
+            self.assertIn('embed_backend = "torch"', message)
+
+            (snapshot / "onnx").mkdir()
+            (snapshot / "onnx" / "model.onnx").write_bytes(b"x")
+            with (
+                mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", False),
+                mock.patch("huggingface_hub.snapshot_download", return_value=str(snapshot)),
+            ):
+                self.assertEqual(provision.download(asset), snapshot)
+
     def test_grammar_languages(self) -> None:
         from seekr import extract, provision
 
@@ -297,8 +401,9 @@ class ModelsCliTests(unittest.TestCase):
         dl.assert_called_once_with(
             provision.ModelAsset(
                 repo_id=cfg.embed_model,
-                allow_patterns=provision.TORCH_PATTERNS,
+                allow_patterns=provision.ONNX_PATTERNS,
                 purpose="embedding",
+                backend="onnx",
             )
         )
         dl_grammars.assert_not_called()
@@ -372,7 +477,7 @@ class ModelsCliTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "seekr 0.1.1")
+        self.assertEqual(proc.stdout.strip(), "seekr 0.2.0")
 
         doctor_proc = subprocess.run(
             [sys.executable, "-m", "seekr", "doctor", "--env-only"],

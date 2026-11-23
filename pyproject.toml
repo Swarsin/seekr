@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "seekr-search"
-version = "0.1.1"
+version = "0.2.0"
 description = "Offline hybrid semantic and keyword search over your own files"
 readme = "README.md"
 license = { text = "MIT" }
@@ -20,7 +20,7 @@ keywords = [
     "sqlite-vec",
     "retrieval",
     "rrf",
-    "sentence-transformers",
+    "onnxruntime",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -36,10 +36,8 @@ classifiers = [
     "Topic :: Text Processing :: Indexing",
 ]
 dependencies = [
-    # Documented conservative minimum: SentenceTransformer and CrossEncoder are
-    # assumed to accept local_files_only/trust_remote_code (src/seekr/offline.py)
-    # from sentence-transformers 3.0 onward; this is an assumption, not a pin.
-    "sentence-transformers>=3.0",
+    "onnxruntime>=1.17",
+    "tokenizers>=0.15",
     "huggingface_hub>=0.23",
     "sqlite-vec>=0.1",
     "pymupdf>=1.23",
@@ -53,6 +51,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# PyTorch backend (embed_backend = "torch"), e.g. for CUDA GPUs. SentenceTransformer
+# and CrossEncoder are assumed to accept local_files_only/trust_remote_code
+# (src/seekr/offline.py) from sentence-transformers 3.0 onward.
+torch = ["sentence-transformers>=3.0"]
 dev = [
     "build>=1.2",
     "hypothesis>=6.100",

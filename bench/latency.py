@@ -42,6 +42,10 @@ DEFAULT_K = 10
 DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_SEED = 202_611_18
 DEFAULT_QUANT = "int8"
+DEFAULT_BACKEND = "onnx"
+DEFAULT_DEVICE = "cpu"
+EMBED_BACKENDS = ("onnx", "torch")
+DEVICES = ("cpu", "cuda")
 VECTOR_QUANTS = ("float32", "int8")
 MODES = ("keyword", "vector", "hybrid")
 RESULTS_PATH = Path(__file__).resolve().parents[1] / "bench" / "latency-results.md"
@@ -319,14 +323,26 @@ def measure_query_embedding(
     model_name: str,
     *,
     repetitions: int = 1,
+    embed_backend: str = DEFAULT_BACKEND,
+    device: str = DEFAULT_DEVICE,
 ) -> tuple[list[float] | None, str | None]:
-    """Time the real embedding model if it is already available locally."""
+    """Time the real embedding model if it is already available locally.
+
+    ``embed_backend`` selects ONNX Runtime (CPU) or PyTorch on ``device``.
+    """
     if not queries or repetitions <= 0:
         raise ValueError("queries and repetitions must be positive")
+    if embed_backend == "onnx" and device != "cpu":
+        return None, "the ONNX backend runs on CPU only; use --embed-backend torch for CUDA"
     try:
-        from seekr.embed import SentenceTransformerEmbedder
+        if embed_backend == "onnx":
+            from seekr import onnx_backend
 
-        embedder = SentenceTransformerEmbedder(model_name)
+            embedder = onnx_backend.OnnxEmbedder(model_name)
+        else:
+            from seekr import embed
+
+            embedder = embed.SentenceTransformerEmbedder(model_name, device=device)
         embedder.embed_query(queries[0].text)
         samples: list[float] = []
         for _ in range(repetitions):
@@ -560,6 +576,8 @@ def run_benchmark(
     dim: int = DIM,
     k: int = DEFAULT_K,
     quant: str = DEFAULT_QUANT,
+    embed_backend: str = DEFAULT_BACKEND,
+    device: str = DEFAULT_DEVICE,
 ) -> Path:
     """Run the benchmark and write measured results to *out*."""
     np_module, store_class, _ = _require_runtime()
@@ -612,7 +630,7 @@ def run_benchmark(
             temporary.cleanup()
 
     embedding_samples, embedding_note = measure_query_embedding(
-        query_list, model, repetitions=repetitions
+        query_list, model, repetitions=repetitions, embed_backend=embed_backend, device=device
     )
     peak_rss_mib = _peak_rss_mib()
     text = render_results(
@@ -622,7 +640,7 @@ def run_benchmark(
         mode_samples=mode_samples,
         embedding_samples=embedding_samples,
         embedding_note=embedding_note,
-        model_name=model,
+        model_name=f"{model} ({embed_backend}, {device})",
         notes=environment_notes(np_module),
         index_seconds=index_seconds,
         peak_rss_mib=peak_rss_mib,
@@ -699,6 +717,18 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"hits requested per query (default: {DEFAULT_K})",
     )
     parser.add_argument(
+        "--embed-backend",
+        choices=EMBED_BACKENDS,
+        default=DEFAULT_BACKEND,
+        help=f"runtime for the query-embedding timing (default: {DEFAULT_BACKEND})",
+    )
+    parser.add_argument(
+        "--device",
+        choices=DEVICES,
+        default=DEFAULT_DEVICE,
+        help=f"device for the PyTorch backend (default: {DEFAULT_DEVICE})",
+    )
+    parser.add_argument(
         "--quant",
         choices=VECTOR_QUANTS,
         default=DEFAULT_QUANT,
@@ -721,6 +751,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             seed=args.seed,
             k=args.k,
             quant=args.quant,
+            embed_backend=args.embed_backend,
+            device=args.device,
         )
     except BenchmarkError as exc:
         print(f"seekr latency benchmark: {exc}", file=sys.stderr)

@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-23
+
 ### Added
+- ONNX Runtime backend for the embedding model and cross-encoder reranker (`embed_backend = "onnx"`, the new default), reading `onnx/model.onnx` and `tokenizer.json` from the local model cache; verified equivalent to PyTorch (mean/min cosine 1.000 over 1,000 chunks, identical reranker order on 50 queries).
+- `embed_backend` config key (`onnx` or `torch`), shown by `seekr status` and `seekr doctor`; switching backends for the same model keeps the existing index.
+- Optional `seekr-search[torch]` extra for the PyTorch (sentence-transformers) backend, e.g. on CUDA GPUs.
 - One-command setup via `seekr init` (with `--demo`, `--yes`, `--no-download`, and `--force`) that scans folders, writes `config.toml`, downloads models and code grammars explicitly, and builds the initial index.
 - Explicit offline provisioning CLI (`seekr models pull` with `--rerank`, `--grammars`, `--all`, `--yes`; `seekr models status`) and expanded `seekr doctor` checks for cached models, code grammars, WSL status, slow mounts, and daemon readiness.
 - Extraction and chunking support for Word documents (`.docx`), PowerPoint slides (`.pptx`), and Jupyter notebooks (`.ipynb`), with warnings for legacy `.doc`/`.ppt` binary files.
@@ -18,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Personal course evaluation guidance in `docs/eval.md` (with `eval/personal/` git-ignored), real-model demo course evaluation test (`tests/test_demo_eval_slow.py`), and Windows-drive sync benchmark (`bench/drvfs_sync.py`) recorded in `docs/benchmarks.md`.
 
 ### Changed
+- **Breaking for the PyTorch backend:** the default install no longer includes PyTorch or sentence-transformers (about 350 MB on disk instead of several GB). Users who set `embed_backend = "torch"` must install the `torch` extra.
+- `seekr models pull` downloads only the files the active backend needs (about 130 MB for the embedding model and 90 MB for the reranker with ONNX).
+- **Upgrading from 0.1.x:** run `seekr models pull` once (add `--rerank` if you use reranking) to fetch the ONNX model files; until then searches that need the model fail with a message naming that command. Existing indexes keep working without a reindex. `seekr models pull` now also stops with an explanation when a configured model publishes no ONNX export.
 - Upgraded SQLite index schema to `schema_version = 3` (with automatic transactional migration from v1/v2) to store and index `module` and `week` document metadata.
 - Updated `README.md` quickstart to use `seekr init`, refreshed feature/architecture docs, and re-recorded `docs/img/demo.gif`.
 

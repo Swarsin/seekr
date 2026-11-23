@@ -172,7 +172,8 @@ class LoadLocalModelTests(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("sentence-transformers", message)
         self.assertIn("install", message.lower())
-        self.assertIn("pip install sentence-transformers", message)
+        self.assertIn("pipx install 'seekr-search[torch]'", message)
+        self.assertIn("pipx inject seekr-search sentence-transformers", message)
         self.assertIn("No module named", message)
         self.assertIn("never downloads", message)
         self.assertIs(raised.exception.__cause__, error)
@@ -522,11 +523,35 @@ class SentenceTransformerEmbedderTests(unittest.TestCase):
 
     def test_build_embedder_returns_a_lazy_sentence_transformer_embedder(self) -> None:
         with mock.patch.object(offline, "load_local_model") as load:
-            embedder = build_embedder(Config(embed_model="org/model"))
+            embedder = build_embedder(Config(embed_model="org/model", embed_backend="torch"))
 
         self.assertIsInstance(embedder, SentenceTransformerEmbedder)
         self.assertEqual(embedder.model_name, "org/model")
         load.assert_not_called()
+
+    def test_build_embedder_dispatch(self) -> None:
+        from seekr.onnx_backend import OnnxEmbedder
+
+        with (
+            mock.patch.object(offline, "load_local_model") as load,
+            mock.patch("seekr.onnx_backend.resolve_model_files") as resolve,
+        ):
+            onnx = build_embedder(Config(embed_model="org/model", embed_backend="onnx"))
+            torch = build_embedder(Config(embed_model="org/model", embed_backend="torch"))
+
+        self.assertIsInstance(onnx, OnnxEmbedder)
+        self.assertEqual(onnx.model_name, "org/model")
+        self.assertIsInstance(torch, SentenceTransformerEmbedder)
+        load.assert_not_called()
+        resolve.assert_not_called()
+
+    def test_torch_backend_without_extra_explains_install(self) -> None:
+        error = ImportError("No module named 'sentence_transformers'")
+        with (
+            mock.patch.object(offline, "_import_sentence_transformers", side_effect=error),
+            self.assertRaisesRegex(offline.ModelUnavailableError, r"seekr-search\[torch\]"),
+        ):
+            _ = build_embedder(Config(embed_backend="torch")).dim
 
     def test_import_does_not_eagerly_import_heavy_modules(self) -> None:
         root = Path(__file__).resolve().parents[1]

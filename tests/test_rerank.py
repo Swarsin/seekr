@@ -155,13 +155,27 @@ class CrossEncoderRerankerTests(unittest.TestCase):
     def test_constructor_and_build_reranker_are_lazy(self) -> None:
         with mock.patch.object(offline, "load_local_model") as load:
             reranker = CrossEncoderReranker("org/cross-encoder")
-            built = build_reranker(Config(rerank_model="org/other-cross-encoder"))
+            built = build_reranker(
+                Config(rerank_model="org/other-cross-encoder", embed_backend="torch")
+            )
 
         load.assert_not_called()
         self.assertIsInstance(reranker, CrossEncoderReranker)
         self.assertEqual(reranker.model_name, "org/cross-encoder")
         self.assertIsInstance(built, CrossEncoderReranker)
         self.assertEqual(built.model_name, "org/other-cross-encoder")
+
+    def test_build_reranker_dispatch(self) -> None:
+        from seekr.onnx_backend import OnnxReranker
+
+        with mock.patch.object(offline, "load_local_model") as load:
+            onnx = build_reranker(Config(rerank_model="org/ce", embed_backend="onnx"))
+            torch = build_reranker(Config(rerank_model="org/ce", embed_backend="torch"))
+
+        self.assertIsInstance(onnx, OnnxReranker)
+        self.assertEqual(onnx.model_name, "org/ce")
+        self.assertIsInstance(torch, CrossEncoderReranker)
+        load.assert_not_called()
 
     def test_empty_passages_return_empty_without_loading_the_model(self) -> None:
         with mock.patch.object(offline, "load_local_model") as load:

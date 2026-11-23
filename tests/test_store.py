@@ -384,6 +384,22 @@ class StoreMetadataTests(_FakeBackendTestCase):
         self.assertEqual(reopened.stats(), {"documents": 1, "chunks": 1})
         self.assertEqual(len(reopened.keyword_search("keepword", 10)), 1)
 
+    def test_index_built_with_torch_opens_with_onnx(self) -> None:
+        store = Store(self.db_path, "test/model", 8, embed_backend="torch")
+        _add_document(store, "/notes/a.md", _stored_chunk("keepword", 1))
+        self.assertEqual(store.get_meta_value("embed_backend"), "torch")
+        store.close()
+
+        reopened = Store(self.db_path, "test/model", 8, embed_backend="onnx")
+        self._stores.append(reopened)
+        self.assertEqual(reopened.get_meta_value("embed_backend"), "onnx")
+        self.assertEqual(len(reopened.keyword_search("keepword", 10)), 1)
+
+    def test_store_without_backend_leaves_recorded_backend(self) -> None:
+        Store(self.db_path, "test/model", 8, embed_backend="onnx").close()
+        plain = self.open_store()
+        self.assertEqual(plain.get_meta_value("embed_backend"), "onnx")
+
     def test_changed_config_embedding_model_is_rejected(self) -> None:
         cfg = Config()
         store = self.open_store(model=cfg.embed_model)

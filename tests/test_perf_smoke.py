@@ -89,6 +89,39 @@ class PercentileTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bench.percentile([], 0.95)
 
+    def test_parser_accepts_backend_and_device(self) -> None:
+        args = bench.build_parser().parse_args(["--embed-backend", "torch", "--device", "cuda"])
+        self.assertEqual((args.embed_backend, args.device), ("torch", "cuda"))
+        defaults = bench.build_parser().parse_args([])
+        self.assertEqual((defaults.embed_backend, defaults.device), ("onnx", "cpu"))
+        with self.assertRaises(SystemExit):
+            bench.build_parser().parse_args(["--embed-backend", "tf"])
+
+    def test_query_embedding_uses_selected_backend(self) -> None:
+        from unittest import mock
+
+        built: list[tuple[str, dict[str, object]]] = []
+
+        class _Recorder:
+            def __init__(self, name: str, **kwargs: object) -> None:
+                built.append((name, kwargs))
+
+            def embed_query(self, _text: str) -> list[float]:
+                return [0.0]
+
+        queries = [bench.Query(text="alpha", vector=None)]
+        with (
+            mock.patch("seekr.onnx_backend.OnnxEmbedder", _Recorder),
+            mock.patch("seekr.embed.SentenceTransformerEmbedder", _Recorder),
+        ):
+            samples, note = bench.measure_query_embedding(
+                queries, "m", embed_backend="onnx", device="cpu"
+            )
+            self.assertIsNone(note)
+            self.assertEqual(len(samples), 1)
+            bench.measure_query_embedding(queries, "m", embed_backend="torch", device="cuda")
+        self.assertEqual(built, [("m", {}), ("m", {"device": "cuda"})])
+
     def test_render_results_includes_optional_indexing_and_memory(self) -> None:
         samples = {"keyword": [1.0, 2.0], "vector": [3.0, 4.0], "hybrid": [5.0, 6.0]}
         without = bench.render_results(
