@@ -54,7 +54,7 @@ jobs:
           /tmp/v/bin/pip install dist/*.whl
           version="$(/tmp/v/bin/seekr --version)"
           echo "$version"
-          test "$version" = "seekr 0.1.1"
+          test "$version" = "seekr 0.2.0"
           /tmp/v/bin/seekr doctor --env-only
 
   slow:

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-23
+
 ### Added
 - ONNX Runtime backend for the embedding model and cross-encoder reranker (`embed_backend = "onnx"`, the new default), reading `onnx/model.onnx` and `tokenizer.json` from the local model cache; verified equivalent to PyTorch (mean/min cosine 1.000 over 1,000 chunks, identical reranker order on 50 queries).
 - `embed_backend` config key (`onnx` or `torch`), shown by `seekr status` and `seekr doctor`; switching backends for the same model keeps the existing index.

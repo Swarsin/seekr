@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib.resources
 from pathlib import Path
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 __all__ = ["__version__", "demo_course_path"]
 
