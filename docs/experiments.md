@@ -325,3 +325,54 @@ Measured on `100,000` synthetic chunks (`2,500` documents × `40` chunks/doc, 38
 | FiQA | hybrid+rerank | 0.3780 | 0.4482 | 0.4446 | 0.3761 | 187.93 | 501.65 s |
 
 3-Dataset Macro-Average `ndcg@10` (`int8` default): `keyword` = `0.4176`, `vector` = `0.4827`, `hybrid` = `0.4847`, `hybrid+rerank` = `0.4784`. SciFact+NFCorpus `hybrid` macro-avg moved only `-0.04` pts (`0.5480 -> 0.5476`: SciFact `+0.02`, NFCorpus `-0.10`). On FiQA (conversational personal-finance Q&A), `OR`-joined FTS5 queries match many weak lexical postings (72.13 ms `p50`), so pure `vector` (`0.3963`) beats equal-weight `hybrid` (`0.3589`) while `--rerank` recovers `+1.72` pts over `hybrid` (`0.3761`).
+
+## ONNX Runtime Backend Equivalence (default since 0.2.0)
+
+The default backend runs the same two models with ONNX Runtime (`onnxruntime 1.32.0`, `tokenizers 0.23.3`) using each repository's published `onnx/model.onnx`, instead of PyTorch + sentence-transformers. The switch was gated on equivalence to the PyTorch backend: mean cosine `>= 0.999` and min cosine `>= 0.995` over 1,000 chunks, mean reranker Kendall τ `>= 0.95` over the hybrid top 30 for 50 queries, and hybrid `ndcg@10` within `0.50` pts on SciFact and NFCorpus.
+
+### Embeddings and reranker order (`bench/onnx_equivalence.py`, CPU only)
+
+```bash
+CUDA_VISIBLE_DEVICES= python bench/onnx_equivalence.py --corpus eval/data/scifact/corpus --chunks 1000 --rerank-queries 50
+```
+
+| Check | Result | Gate |
+| --- | ---: | --- |
+| Mean cosine, 1,000 SciFact chunks (PyTorch vs ONNX) | 1.000000 | `>= 0.999` — pass |
+| Min cosine, 1,000 SciFact chunks | 1.000000 | `>= 0.995` — pass |
+| Reranker Kendall τ, hybrid top 30, mean over 50 queries | 1.000000 | `>= 0.95` — pass |
+| Reranker Kendall τ, minimum over 50 queries | 1.000000 | — |
+| Embedding time, 1,000 chunks, PyTorch CPU | 59.44 s | — |
+| Embedding time, 1,000 chunks, ONNX CPU | 46.31 s | — |
+
+Cosines are identical to six decimal places, and the two cross-encoders rank every candidate list identically. ONNX scores are raw logits; the PyTorch backend may apply an activation, so `--explain` rerank score values can differ in scale while the order matches.
+
+### Retrieval quality (`seekr eval`, configs differing only in `embed_backend`)
+
+| Dataset | Mode | ndcg@10 (PyTorch) | ndcg@10 (ONNX) | Δ (pts) |
+| --- | --- | ---: | ---: | ---: |
+| SciFact | keyword | 0.6866 | 0.6866 | 0.00 |
+| SciFact | vector | 0.7109 | 0.7109 | 0.00 |
+| SciFact | **hybrid** | **0.7320** | **0.7320** | **0.00** |
+| SciFact | hybrid+rerank | 0.7020 | 0.7020 | 0.00 |
+| NFCorpus | keyword | 0.3214 | 0.3214 | 0.00 |
+| NFCorpus | vector | 0.3410 | 0.3410 | 0.00 |
+| NFCorpus | **hybrid** | **0.3632** | **0.3632** | **0.00** |
+| NFCorpus | hybrid+rerank | 0.3570 | 0.3570 | 0.00 |
+
+recall@5, recall@10 and mrr@10 also match to four decimal places in every row. Gate: pass. (These evaluations ran before the batch-size change below; that change only alters padding, which is masked, and the re-run embedding check above still gives cosine 1.000000.)
+
+### CPU batching
+
+Small, length-sorted batches are fastest for ONNX Runtime on CPU (less padding, better cache use). Measured on 400 SciFact chunks and 30-passage rerank calls (median of 5):
+
+| Batch size | Embedding (chunks/s) | Rerank 30 passages |
+| ---: | ---: | ---: |
+| 32 | 14.7 | 1,329 ms |
+| 16 | 15.5 | 1,137 ms |
+| 8 | 16.7 | 1,206 ms |
+| **4 (adopted)** | **21.0** | **840 ms** |
+| 2 | 22.2 | 832 ms |
+| 1 | 22.4 | 771 ms |
+
+Batch size 4 keeps nearly all of the gain while still batching. The PyTorch backend keeps batches of 32, which suit CUDA.
