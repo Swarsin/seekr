@@ -183,18 +183,26 @@ class AuditHookTests(unittest.TestCase):
 
     def test_af_unix_and_loopback_allowed_and_recorded(self) -> None:
         # Real AF_UNIX IPC under the hook - local only, no network packets.
-        root = Path(tempfile.mkdtemp(prefix="seekr_audit_unix_", dir=_TEMP_ROOT))
-        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        unix_path = str(root / "hook.sock")
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(unix_path)
-        server.listen(1)
-        self.addCleanup(server.close)
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.addCleanup(client.close)
+        # Python has no AF_UNIX on Windows; the loopback checks still apply.
+        has_unix = hasattr(socket, "AF_UNIX")
+        unix_path = ""
+        client: socket.socket | None = None
+        if has_unix:
+            root = Path(tempfile.mkdtemp(prefix="seekr_audit_unix_", dir=_TEMP_ROOT))
+            self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+            unix_path = str(root / "hook.sock")
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(unix_path)
+            server.listen(1)
+            self.addCleanup(server.close)
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(client.close)
+        loopback = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(loopback.close)
 
         with netaudit.offline_network_audit() as record:
-            client.connect(unix_path)
+            if client is not None:
+                client.connect(unix_path)
             # Loopback/non-outbound dispatches must be allowed too.
             sys.audit(
                 "socket.getaddrinfo",
@@ -204,18 +212,17 @@ class AuditHookTests(unittest.TestCase):
                 socket.SOCK_STREAM,
                 socket.IPPROTO_TCP,
             )
-            sys.audit("socket.connect", client, ("127.0.0.1", 0))
+            sys.audit("socket.connect", loopback, ("127.0.0.1", 0))
             sys.audit("socket.create_connection", ("::1", 6379), 5, None)
         self.assertEqual(record.blocked, [])
-        self.assertEqual(
-            sorted(event for event, _ in record.allowed),
-            [
-                "socket.connect",  # the real AF_UNIX connect above
-                "socket.connect",  # the 127.0.0.1 dispatch
-                "socket.create_connection",
-                "socket.getaddrinfo",
-            ],
-        )
+        expected = [
+            "socket.connect",  # the 127.0.0.1 dispatch
+            "socket.create_connection",
+            "socket.getaddrinfo",
+        ]
+        if has_unix:
+            expected.insert(0, "socket.connect")  # the real AF_UNIX connect above
+        self.assertEqual(sorted(event for event, _ in record.allowed), expected)
 
     def test_hook_is_inert_when_no_scope_is_active(self) -> None:
         # Without an active scope the singleton hook must neither block nor
