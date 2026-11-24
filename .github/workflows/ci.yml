@@ -179,3 +179,80 @@ jobs:
           python -c 'from sentence_transformers import SentenceTransformer; SentenceTransformer("BAAI/bge-small-en-v1.5")'
           python -c 'from sentence_transformers import CrossEncoder; CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")'
       - run: pytest -m slow
+
+  smoke:
+    # Installs the built wheel into a fresh venv and runs the first-run path:
+    # demo init (downloads models), search, then the background service.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo "VENV=$RUNNER_TEMP/s" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = Windows ]; then echo "BIN=Scripts" >> "$GITHUB_ENV"; else echo "BIN=bin" >> "$GITHUB_ENV"; fi
+          # Windows and macOS use the runner's home; Linux gets isolated dirs.
+          if [ "$RUNNER_OS" = Linux ]; then
+            echo "XDG_CONFIG_HOME=$RUNNER_TEMP/xdg/config" >> "$GITHUB_ENV"
+            echo "XDG_DATA_HOME=$RUNNER_TEMP/xdg/data" >> "$GITHUB_ENV"
+            echo "XDG_STATE_HOME=$RUNNER_TEMP/xdg/state" >> "$GITHUB_ENV"
+            echo "XDG_CACHE_HOME=$RUNNER_TEMP/xdg/cache" >> "$GITHUB_ENV"
+          fi
+      # The macOS python.org build that actions/setup-python installs lacks
+      # sqlite3 extension loading, which sqlite-vec needs; uv's managed CPython
+      # has it. Linux and Windows keep setup-python.
+      - if: runner.os != 'macOS'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - if: runner.os == 'macOS'
+        uses: astral-sh/setup-uv@v6
+      - if: runner.os == 'macOS'
+        shell: bash
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
+        run: |
+          uv python install "3.12"
+          uv venv --seed --python "3.12" "$RUNNER_TEMP/py"
+          echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
+      - run: python -c "import sqlite3, sys; print(sys.version); sqlite3.connect(':memory:').enable_load_extension(False)"
+      - run: pip install build
+      - run: python -m build --wheel
+      - name: Install the wheel into a fresh venv
+        run: |
+          python -m venv "$VENV"
+          "$VENV/$BIN/python" -m pip install dist/*.whl
+          "$VENV/$BIN/seekr" --version
+          "$VENV/$BIN/seekr" doctor --env-only
+      - name: Demo init downloads models and builds the index
+        run: |
+          "$VENV/$BIN/seekr" init --demo --yes
+      - name: Search returns results
+        run: |
+          "$VENV/$BIN/seekr" search "bias variance" --json > search.json
+          "$VENV/$BIN/python" -c "import json, sys; hits = json.load(open('search.json')); print(len(hits), 'results'); sys.exit(0 if hits else 1)"
+      - name: seekr web starts the service
+        run: |
+          "$VENV/$BIN/seekr" web
+      - name: Service reports running
+        run: |
+          out="$("$VENV/$BIN/seekr" service status | tr -d '\r')"
+          echo "$out"
+          echo "$out" | grep -q '^pid: '
+          echo "$out" | grep -q '^port: '
+      - name: Stop the service
+        run: |
+          "$VENV/$BIN/seekr" service stop
+          out="$("$VENV/$BIN/seekr" service status | tr -d '\r')"
+          echo "$out"
+          echo "$out" | grep -q 'not running'
+      - name: Stop the service if a step failed
+        if: failure()
+        run: |
+          "$VENV/$BIN/seekr" service stop || true
