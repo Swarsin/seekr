@@ -616,6 +616,15 @@ def test_index_falls_back_when_service_unreachable(env: Path, monkeypatch) -> No
     assert result.output.splitlines()[0] == "added: 2"
 
 
+def _stat_error(path: Path) -> str:
+    """Return this host's wording of the error from stat()ing *path*."""
+    try:
+        path.stat()
+    except OSError as exc:
+        return str(exc)
+    raise AssertionError(f"{path} exists")
+
+
 def test_index_reports_missing_paths_like_local(env: Path, request, monkeypatch) -> None:
     svc = _started_service(request)
     monkeypatch.setattr(cli_index, "_JOB_POLL_SECONDS", 0.05)
@@ -634,8 +643,7 @@ def test_index_reports_missing_paths_like_local(env: Path, request, monkeypatch)
         "added: 1", "updated: 0", "unchanged: 0", "removed: 0", "skipped: 0",
         "errors: 1", "warnings: 0",
         (
-            f"error: {missing}: root is missing or offline: "
-            f"[Errno 2] No such file or directory: '{missing}'"
+            f"error: {missing}: root is missing or offline: {_stat_error(missing)}"
         ),
     ]
     assert int(svc.backend.status().index["documents"] or 0) == 3

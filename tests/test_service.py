@@ -432,6 +432,11 @@ def test_second_start_in_another_process_is_refused(env, request) -> None:
     port = first.start()
     before = read_service_info(paths.service_file())
     code = (
+        # Windows ignores XDG_STATE_HOME: share the parent's state folder.
+        "import os, pathlib\n"
+        "from seekr import paths\n"
+        "paths.state_dir = lambda *, platform=None: "
+        "pathlib.Path(os.environ['XDG_STATE_HOME']) / 'seekr'\n"
         "from seekr.embed import FakeEmbedder\n"
         "from seekr.service import SeekrService, ServiceAlreadyRunning\n"
         "svc = SeekrService(port=0, handshake_stdout=True,"
