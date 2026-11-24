@@ -17,7 +17,6 @@ loaded only by :meth:`SeekrService.start`.
 
 from __future__ import annotations
 
-import http.client
 import json
 import logging
 import os
@@ -35,7 +34,7 @@ from typing import TYPE_CHECKING, Any, TextIO
 from . import __version__, paths
 from .config import Config, ConfigError, default_config_path, load_config
 from .logging_config import log_event
-from .service_client import service_request
+from .service_client import service_answers, service_request
 from .service_discovery import (
     ServiceInfo,
     read_service_info,
@@ -116,13 +115,7 @@ def start_prewarm(embedder: Embedder, stop_event: threading.Event) -> threading.
 
 
 def _answers(info: ServiceInfo) -> bool:
-    try:
-        status, _ = service_request(
-            info.port, "GET", "/api/status", token=info.token, timeout=_LIVENESS_TIMEOUT
-        )
-    except (OSError, ValueError, http.client.HTTPException):
-        return False
-    return status == 200
+    return service_answers(info, timeout=_LIVENESS_TIMEOUT)
 
 
 def find_running_service(path: Path | None = None) -> ServiceInfo | None:

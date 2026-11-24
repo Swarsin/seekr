@@ -5,11 +5,13 @@ index jobs to a running ``seekr service`` and fall back to working locally when
 none answers.  Importing this module is cheap: it uses only the standard
 library, the discovery file reader and the import-safe web contract.
 
-A service that cannot be reached (connection refused or reset, a timeout, a
-broken response, or one that has begun shutting down) raises
-:class:`ServiceUnavailable`, which callers treat as "no service".  Any other
-HTTP error raises :class:`ServiceError` carrying the server's code and message,
-and callers surface it rather than silently searching locally.
+Before its first real call a client checks, with a 1-second authenticated
+``GET /api/status``, that a seekr service (not some other program that reused
+a stale port) answers.  A service that cannot be reached or verified, or that
+has begun shutting down, raises :class:`ServiceUnavailable`, which callers
+treat as "no service".  An error response in the seekr error envelope raises
+:class:`ServiceError` carrying the server's code and message, and callers
+surface it rather than silently searching locally.
 """
 
 from __future__ import annotations
@@ -26,9 +28,11 @@ from .service_discovery import ServiceInfo, read_service_info
 
 __all__ = [
     "ServiceClient",
+    "ServiceConnectError",
     "ServiceError",
     "ServiceUnavailable",
     "hit_from_wire",
+    "service_answers",
     "service_request",
 ]
 
@@ -38,6 +42,7 @@ CONNECT_TIMEOUT = 1.0
 STATUS_TIMEOUT = 1.0
 REQUEST_TIMEOUT = 30.0
 
+_STATUS_SECTIONS = ("index", "model", "daemon", "config", "activity")
 _EXPLAIN_FIELDS = (
     "keyword_rank",
     "keyword_bm25",
@@ -66,6 +71,10 @@ class ServiceUnavailable(ServiceError):
     """No usable service answered; the caller should work locally."""
 
 
+class ServiceConnectError(OSError):
+    """The TCP connection failed, so the request was never sent."""
+
+
 def service_request(
     port: int,
     method: str,
@@ -79,7 +88,8 @@ def service_request(
     """Make one authenticated loopback API call; return (status, JSON body).
 
     ``connect_timeout`` (default ``timeout``) bounds the TCP connect; ``timeout``
-    bounds each later socket operation.  Socket and protocol failures propagate
+    bounds each later socket operation.  A failed connect raises
+    :class:`ServiceConnectError`; later socket and protocol failures propagate
     as :class:`OSError` or :class:`http.client.HTTPException`.
     """
     data = None if body is None else json.dumps(body).encode("utf-8")
@@ -89,7 +99,10 @@ def service_request(
         timeout=timeout if connect_timeout is None else connect_timeout,
     )
     try:
-        conn.connect()
+        try:
+            conn.connect()
+        except OSError as exc:
+            raise ServiceConnectError(str(exc) or exc.__class__.__name__) from exc
         if conn.sock is not None:
             conn.sock.settimeout(timeout)
         headers = {"X-Seekr-Token": token}
@@ -105,6 +118,36 @@ def service_request(
     except ValueError:
         payload = None
     return status, payload
+
+
+def service_answers(info: ServiceInfo, *, timeout: float = STATUS_TIMEOUT) -> bool:
+    """Return whether ``info`` names a live seekr service that accepts its token.
+
+    The token-authenticated ``GET /api/status`` must return 200 with the
+    status object's sections; a service that is shutting down refuses it.
+    """
+    try:
+        status, payload = service_request(
+            info.port, "GET", "/api/status", token=info.token, timeout=timeout
+        )
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
+    return (
+        status == 200
+        and isinstance(payload, dict)
+        and all(isinstance(payload.get(name), dict) for name in _STATUS_SECTIONS)
+    )
+
+
+def _seekr_error(payload: object) -> tuple[str, str] | None:
+    """Return (code, message) from a seekr error envelope, or ``None``."""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        return None
+    code, message = error.get("code"), error.get("message")
+    if not isinstance(code, str) or not isinstance(message, str):
+        return None
+    return code, message
 
 
 def _optional_float(value: object) -> float | None:
@@ -152,6 +195,7 @@ class ServiceClient:
 
     def __init__(self, info: ServiceInfo) -> None:
         self.info = info
+        self._verified = False
 
     @classmethod
     def from_discovery(cls, path: Path | None = None) -> ServiceClient | None:
@@ -159,7 +203,8 @@ class ServiceClient:
 
         ``None`` means no live discovery file, or a service of another seekr
         version (logged once per version at debug level).  Reachability is
-        not checked here; a dead service shows up as :class:`ServiceUnavailable`.
+        checked by the first call; a dead or foreign listener shows up as
+        :class:`ServiceUnavailable`.
         """
         info = read_service_info(path or paths.service_file())
         if info is None:
@@ -175,9 +220,34 @@ class ServiceClient:
             return None
         return cls(info)
 
+    def _verify(self) -> None:
+        """Probe ``/api/status`` once per client before slower calls."""
+        if self._verified:
+            return
+        if not service_answers(self.info):
+            raise ServiceUnavailable(
+                f"no seekr service answers on port {self.info.port}"
+            )
+        self._verified = True
+
     def _call(
-        self, method: str, path: str, body: object = None, *, timeout: float
+        self,
+        method: str,
+        path: str,
+        body: object = None,
+        *,
+        timeout: float,
+        retry_safe: bool = True,
+        verify: bool = True,
     ) -> Any:
+        """Make one verified call and return its JSON body.
+
+        ``retry_safe`` says whether a failure after the request was sent may
+        be treated as "no service".  It is false for calls that start work
+        (an index job), where the service may have acted on the request.
+        """
+        if verify:
+            self._verify()
         try:
             status, payload = service_request(
                 self.info.port,
@@ -188,19 +258,29 @@ class ServiceClient:
                 timeout=timeout,
                 connect_timeout=CONNECT_TIMEOUT,
             )
-        except (OSError, http.client.HTTPException) as exc:
+        except ServiceConnectError as exc:
             raise ServiceUnavailable(f"seekr service is not reachable: {exc}") from exc
+        except (OSError, http.client.HTTPException) as exc:
+            if retry_safe:
+                raise ServiceUnavailable(
+                    f"seekr service did not answer: {exc}"
+                ) from exc
+            raise ServiceError(
+                f"the seekr service did not confirm {method} {path} ({exc}); "
+                "it may still be working on it, see `seekr service status`"
+            ) from exc
         if 200 <= status < 300:
             return payload
-        code: str | None = None
-        message = f"seekr service returned HTTP {status}"
-        error = payload.get("error") if isinstance(payload, dict) else None
-        if isinstance(error, dict):
-            if isinstance(error.get("code"), str):
-                code = error["code"]
-            if isinstance(error.get("message"), str):
-                message = error["message"]
-        if code == "busy" and "shutting down" in message:
+        error = _seekr_error(payload)
+        if error is None:
+            # Not a seekr answer: another program owns the port now.
+            raise ServiceUnavailable(
+                f"port {self.info.port} answered HTTP {status} without a seekr error",
+                status=status,
+            )
+        code, message = error
+        if code == "busy" and not service_answers(self.info):
+            # The status probe is refused once shutdown has begun.
             raise ServiceUnavailable(message, status=status, code=code)
         raise ServiceError(message, status=status, code=code)
 
@@ -225,7 +305,7 @@ class ServiceClient:
         return self._hits("/api/similar", request)
 
     def status(self) -> dict[str, Any]:
-        payload = self._call("GET", "/api/status", timeout=STATUS_TIMEOUT)
+        payload = self._call("GET", "/api/status", timeout=STATUS_TIMEOUT, verify=False)
         if not isinstance(payload, dict):
             raise ServiceError("seekr service returned a malformed status response")
         return payload
@@ -238,12 +318,20 @@ class ServiceClient:
 
     def index_roots(self) -> str:
         """Start indexing the configured roots; return the job id."""
-        return self._job_id(self._call("POST", "/api/index", {}, timeout=REQUEST_TIMEOUT))
+        return self._job_id(
+            self._call("POST", "/api/index", {}, timeout=REQUEST_TIMEOUT, retry_safe=False)
+        )
 
     def index_paths(self, paths: list[str]) -> str:
         """Start indexing absolute ``paths``; return the job id."""
         return self._job_id(
-            self._call("POST", "/api/index/paths", {"paths": paths}, timeout=REQUEST_TIMEOUT)
+            self._call(
+                "POST",
+                "/api/index/paths",
+                {"paths": paths},
+                timeout=REQUEST_TIMEOUT,
+                retry_safe=False,
+            )
         )
 
     def job(self, job_id: str) -> dict[str, Any]:

@@ -27,7 +27,7 @@ from . import platform_info
 from .config import Config, load_config
 from .course import display_module
 from .embed import Embedder, build_embedder
-from .indexer import Indexer, SyncReport
+from .indexer import Indexer, SyncReport, _error_text
 from .lifecycle import LifecycleError, lifecycle_lock, rebuild_index
 from .service_client import ServiceClient, ServiceError, ServiceUnavailable
 from .store import Store
@@ -146,16 +146,57 @@ def _print_report_dict(report: dict[str, Any]) -> None:
     )
 
 
+def _split_index_paths(paths: list[Path]) -> tuple[list[str], list[tuple[str, str]]]:
+    """Resolve ``paths`` and split off the ones the service would refuse.
+
+    Unusable paths get the same per-path error text a local ``Indexer.sync``
+    reports, so a delegated run prints the same report.
+    """
+    usable: list[str] = []
+    errors: list[tuple[str, str]] = []
+    for raw in paths:
+        resolved, issue = Indexer._resolve(Path(raw))
+        if resolved is None:
+            errors.append((str(raw), issue or "cannot resolve root"))
+            continue
+        try:
+            resolved.stat()
+        except FileNotFoundError as exc:
+            errors.append((str(resolved), f"root is missing or offline: {_error_text(exc)}"))
+            continue
+        except OSError as exc:
+            errors.append((str(resolved), f"cannot stat root: {_error_text(exc)}"))
+            continue
+        usable.append(str(resolved))
+    return usable, errors
+
+
+def _with_path_errors(
+    report: dict[str, Any], errors: list[tuple[str, str]]
+) -> dict[str, Any]:
+    if not errors:
+        return report
+    merged = dict(report)
+    merged["errors"] = [
+        {"path": path, "message": message} for path, message in errors
+    ] + list(report.get("errors") or [])
+    merged["error_total"] = int(report.get("error_total", 0)) + len(errors)
+    return merged
+
+
 def _index_via_service(client: ServiceClient, paths: list[Path] | None) -> dict[str, Any]:
     """Run an index job in the service and return its report.
 
-    :class:`ServiceUnavailable` before the job starts means "index locally";
-    once the job is running, losing the service is an error.
+    :class:`ServiceUnavailable` before the request is sent means "index
+    locally"; once the service may have started the job, any failure is an
+    error so two writers never run.
     """
+    path_errors: list[tuple[str, str]] = []
     if paths:
-        job_id = client.index_paths(
-            [str(Path(item).expanduser().resolve()) for item in paths]
-        )
+        usable, path_errors = _split_index_paths(paths)
+        if not usable:
+            return _with_path_errors({name: 0 for name in _COUNT_NAMES}, path_errors)
+        job_id = client.index_paths(usable)
     else:
         job_id = client.index_roots()
     while True:
@@ -171,7 +212,7 @@ def _index_via_service(client: ServiceClient, paths: list[Path] | None) -> dict[
             continue
         report = job.get("report")
         if state in ("succeeded", "partial") and isinstance(report, dict):
-            return report
+            return _with_path_errors(report, path_errors)
         raise ServiceError(str(job.get("error") or f"index job ended in state {state!r}"))
 
 

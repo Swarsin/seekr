@@ -170,8 +170,19 @@ class _Spy:
 # -- stub server --------------------------------------------------------------
 
 
+_STATUS_OK = {name: {} for name in ("index", "model", "daemon", "config", "activity")}
+
+
 class _StubHandler(BaseHTTPRequestHandler):
+    """Replies from queued responses; ``/api/status`` has its own queue.
+
+    Status probes default to a valid 200 status and are not recorded in
+    ``seen``.  A ``bytes`` payload is sent verbatim as HTML.
+    """
+
     responses: ClassVar[list[tuple[int, object]]] = []
+    status_responses: ClassVar[list[tuple[int, object]]] = []
+    status_calls: ClassVar[list[str]] = []
     seen: ClassVar[list[tuple[str, str, object, str | None]]] = []
 
     def log_message(self, format: str, *args: object) -> None:
@@ -181,13 +192,21 @@ class _StubHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
         body = json.loads(raw) if raw else None
-        type(self).seen.append(
-            (self.command, self.path, body, self.headers.get("X-Seekr-Token"))
-        )
-        status, payload = type(self).responses.pop(0) if type(self).responses else (200, {})
-        data = json.dumps(payload).encode("utf-8")
+        cls = type(self)
+        if self.path == "/api/status":
+            cls.status_calls.append(str(self.headers.get("X-Seekr-Token")))
+            queue, default = cls.status_responses, (200, _STATUS_OK)
+        else:
+            cls.seen.append((self.command, self.path, body, self.headers.get("X-Seekr-Token")))
+            queue, default = cls.responses, (200, {})
+        status, payload = queue.pop(0) if queue else default
+        if payload == "hang":
+            time.sleep(0.6)
+            return
+        is_raw = isinstance(payload, bytes)
+        data = payload if is_raw else json.dumps(payload).encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "text/html" if is_raw else "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -198,7 +217,11 @@ class _StubHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def stub(env: Path, request: pytest.FixtureRequest) -> type[_StubHandler]:
-    handler = type("Handler", (_StubHandler,), {"responses": [], "seen": []})
+    handler = type(
+        "Handler",
+        (_StubHandler,),
+        {"responses": [], "status_responses": [], "status_calls": [], "seen": []},
+    )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(
         target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
@@ -402,11 +425,66 @@ def test_service_busy_and_5xx_surface(stub, monkeypatch, status, code, message) 
 
 def test_shutting_down_service_falls_back(stub, env: Path) -> None:
     _index_locally(env)
-    stub.responses.append((409, _error("busy", "the web service is shutting down")))
+    stub.responses.append((409, _error("busy", "index is being replaced")))
+    # The first probe passes; the one after ``busy`` is refused (shutdown).
+    stub.status_responses.extend(
+        [(200, _STATUS_OK), (409, _error("busy", "the web service is shutting down"))]
+    )
 
     hits = get_hits("xylophones", mode="keyword")
 
     assert {Path(hit.path).name for hit in hits} == {"a.md", "b.md"}
+    assert len(stub.status_calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("status", "payload"),
+    [(404, b"<html>Not Found</html>"), (401, b"unauthorized"), (404, {"detail": "nope"})],
+)
+def test_foreign_http_server_falls_back(stub, env: Path, status, payload) -> None:
+    _index_locally(env)
+    stub.responses.append((status, payload))
+
+    hits = get_hits("xylophones", mode="keyword")
+
+    assert {Path(hit.path).name for hit in hits} == {"a.md", "b.md"}
+
+
+def test_failed_probe_falls_back_without_calling(stub, env: Path) -> None:
+    _index_locally(env)
+    stub.status_responses.append((404, b"<html>Not Found</html>"))
+
+    hits = get_hits("xylophones", mode="keyword")
+
+    assert {Path(hit.path).name for hit in hits} == {"a.md", "b.md"}
+    assert stub.seen == []
+
+
+def test_probe_runs_once_per_client(stub) -> None:
+    stub.responses.extend([(200, {"hits": []}), (200, {"hits": []})])
+    client = ServiceClient.from_discovery()
+    assert client is not None
+    client.search({"query": "a"})
+    client.search({"query": "b"})
+    assert stub.status_calls == ["test-token"]
+
+
+def test_silent_listener_falls_back_quickly(env: Path) -> None:
+    _index_locally(env)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        _write_discovery(int(listener.getsockname()[1]))
+
+        started = time.monotonic()
+        hits = get_hits("xylophones", mode="keyword")
+        elapsed = time.monotonic() - started
+    finally:
+        listener.close()
+
+    assert {Path(hit.path).name for hit in hits} == {"a.md", "b.md"}
+    assert elapsed < 1.5
 
 
 def test_client_error_carries_status_and_code(stub) -> None:
@@ -536,3 +614,66 @@ def test_index_falls_back_when_service_unreachable(env: Path, monkeypatch) -> No
     result = CliRunner().invoke(app, ["index"])
     assert result.exit_code == 0, result.output
     assert result.output.splitlines()[0] == "added: 2"
+
+
+def test_index_reports_missing_paths_like_local(env: Path, request, monkeypatch) -> None:
+    svc = _started_service(request)
+    monkeypatch.setattr(cli_index, "_JOB_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(
+        cli_index, "_build_embedder", lambda cfg: pytest.fail("indexed locally")
+    )
+    docs = env / "docs"
+    (docs / "c.md").write_text("gamma xylophones\n", encoding="utf-8")
+    monkeypatch.chdir(docs)
+    missing = docs / "missing.md"
+
+    result = CliRunner().invoke(app, ["index", "c.md", "missing.md"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines() == [
+        "added: 1", "updated: 0", "unchanged: 0", "removed: 0", "skipped: 0",
+        "errors: 1", "warnings: 0",
+        (
+            f"error: {missing}: root is missing or offline: "
+            f"[Errno 2] No such file or directory: '{missing}'"
+        ),
+    ]
+    assert int(svc.backend.status().index["documents"] or 0) == 3
+
+
+def test_missing_paths_match_local_report(env: Path, monkeypatch) -> None:
+    monkeypatch.chdir(env / "docs")
+    targets = [Path("a.md"), Path("missing.md"), Path("gone/deeper.md")]
+    cfg = load_config()
+    embedder = FakeEmbedder()
+    store = Store(cfg.db_path, cfg.embed_model, embedder.dim, vector_quant=cfg.vector_quant)
+    try:
+        local = Indexer(store, embedder, cfg).sync(targets)
+    finally:
+        store.close()
+
+    usable, errors = cli_index._split_index_paths(targets)
+
+    assert usable == [str(env / "docs" / "a.md")]
+    assert errors == local.errors
+
+
+def test_index_with_only_missing_paths_skips_the_call(stub, env: Path, monkeypatch) -> None:
+    monkeypatch.chdir(env)
+    result = CliRunner().invoke(app, ["index", "missing.md"])
+    assert result.exit_code == 0, result.output
+    assert "errors: 1" in result.output.splitlines()
+    assert stub.seen == []
+
+
+def test_index_start_timeout_is_fatal_not_local(stub, monkeypatch) -> None:
+    monkeypatch.setattr(service_client, "REQUEST_TIMEOUT", 0.2)
+    monkeypatch.setattr(
+        cli_index, "_build_embedder", lambda cfg: pytest.fail("indexed locally")
+    )
+    stub.responses.append((202, "hang"))
+
+    result = CliRunner().invoke(app, ["index"])
+
+    assert result.exit_code == 1
+    assert "did not confirm POST /api/index" in result.output
