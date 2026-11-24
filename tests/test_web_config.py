@@ -27,7 +27,7 @@ from seekr.web_contract import ApiError
 
 def _write(path: Path, text: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    path.write_text(text, encoding="utf-8", newline="")  # keep CRLF exactly
     return path
 
 
@@ -156,15 +156,11 @@ def test_byte_preservation_outside_the_replaced_span(tmp_path: Path) -> None:
 
 
 def test_toml_safe_escaping_for_hostile_directory_names(tmp_path: Path) -> None:
-    names = [
-        'quote"dir',
-        "back\\slash",
-        "tab\tdir",
-        "new\nline",
-        "control\x01dir",
-        "hyphen-dir",
-        "unicodé",
-    ]
+    names = ["hyphen-dir", "unicodé", "apos'trophe", "semi;colon"]
+    if os.name == "posix":
+        # Windows forbids these characters in file names (and treats the
+        # backslash as a separator, which every Windows root already has).
+        names += ['quote"dir', "back\\slash", "tab\tdir", "new\nline", "control\x01dir"]
     config = _write(tmp_path / "config.toml", 'embed_model = "fake"\n')
     added: list[Path] = []
     for name in names:
@@ -176,7 +172,10 @@ def test_toml_safe_escaping_for_hostile_directory_names(tmp_path: Path) -> None:
     loaded = load_config(config)
     assert loaded.roots == tuple(added)
     text = config.read_text(encoding="utf-8")
-    assert "\\n" in text and "\\t" in text and "\\\\" in text and '\\"' in text
+    if os.name == "posix":
+        assert "\\n" in text and "\\t" in text and "\\\\" in text and '\\"' in text
+    else:
+        assert "\\\\" in text  # escaped path separators
 
 
 def test_unicode_line_separator_is_not_a_toml_newline(tmp_path: Path) -> None:
@@ -307,6 +306,20 @@ def test_atomic_replace_failure_preserves_existing_file(tmp_path: Path) -> None:
     assert list(tmp_path.glob(".config.toml.*.tmp")) == []
 
 
+def test_add_root_works_without_fchmod(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Windows Python before 3.13 has no os.fchmod.
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    root = _root(tmp_path, "docs")
+    config = _config_with_roots(tmp_path, [])
+
+    snapshot = add_root(config, str(root), config_revision(config))
+
+    assert snapshot.roots == (str(root),)
+    assert load_config(config).roots == (root,)
+    assert list(tmp_path.glob(".config.toml.*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes do not exist on Windows")
 def test_existing_mode_is_preserved_and_new_files_are_private(tmp_path: Path) -> None:
     root = _root(tmp_path, "docs")
     config = _config_with_roots(tmp_path, [])
@@ -324,6 +337,7 @@ def test_existing_mode_is_preserved_and_new_files_are_private(tmp_path: Path) ->
     assert load_config(nested).roots == (new_root,)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes do not exist on Windows")
 def test_existing_parent_mode_is_not_changed(tmp_path: Path) -> None:
     root = _root(tmp_path, "docs")
     parent = tmp_path / "existing"
