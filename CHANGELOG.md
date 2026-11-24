@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Adding or removing folders from the web UI or service no longer fails on Windows with Python before 3.13 (`os.fchmod` is missing there).
+- `seekr web` reports a busy port as "already in use" on Windows instead of an access-permission error; the local server no longer sets `SO_REUSEADDR` there, where it lets a second socket bind a port in use.
+- A corrupt PDF is no longer kept locked on Windows after indexing it fails.
+- The deprecated `seekr daemon` is now unavailable on macOS, where clients could never verify it and every search through it failed; searches run locally instead.
+- Model-path errors show Windows paths without doubled backslashes.
+
 ## [0.2.0] - 2026-11-23
 
 ### Added
