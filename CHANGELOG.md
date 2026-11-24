@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - An edit that keeps a file's size and lands within one filesystem timestamp tick of indexing it is now caught when the file is checked again soon after, before the index records other writes more than 2 s later (for example, a quick re-save picked up by the next sync or watcher event). Files modified within 2 s of the latest index write are hashed instead of trusting an unchanged mtime and size. Before, such an edit was always missed.
 - The watcher indexes a file created where another was just moved away (A→B, new A, B→C) instead of leaving it for the next full sync.
+- Removing a folder can no longer leave its documents indexed: an edit under the folder that was waiting for the service's index lane re-added the file after the purge. The watcher now gets the new folder list before the lane is released and re-checks that a path is still watched before indexing it.
 
 ## [0.2.0] - 2026-11-23
 

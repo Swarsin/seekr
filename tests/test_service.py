@@ -286,6 +286,75 @@ def test_added_root_is_watched_without_restart(env, request) -> None:
     assert _wait_for(lambda: _documents(svc) == 2)
 
 
+def test_removed_folder_is_not_reindexed_by_a_waiting_watcher_action(
+    env, request, monkeypatch
+) -> None:
+    from seekr import web_service
+
+    extra = env / "extra"
+    extra.mkdir()
+    note = extra / "c.md"
+    note.write_text("gamma notes about drums\n", encoding="utf-8")
+    config = env / "config.toml"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            f"roots = [{json.dumps(str(env / 'docs'))}]",
+            f"roots = [{json.dumps(str(env / 'docs'))}, {json.dumps(str(extra))}]",
+        ),
+        encoding="utf-8",
+    )
+    svc = _service(request)
+    svc.start()
+    assert _wait_for(lambda: _documents(svc) == 2)
+    _wait_idle(svc)
+    watcher = svc._watcher
+    real_remove = web_service.config_remove_root
+
+    def remove_while_an_edit_waits(*args, **kwargs):
+        # remove_root holds the engine lane here.  An edit under the folder
+        # being removed reaches the watcher and waits for the lane.
+        note.write_text("gamma notes about drums, edited\n", encoding="utf-8")
+        handler = FakeObserver.created[-1].schedules[0][0]
+        handler.dispatch(_Event("modified", str(note)))
+        assert _wait_for(lambda: not watcher._pending)
+        time.sleep(0.1)
+        return real_remove(*args, **kwargs)
+
+    monkeypatch.setattr(web_service, "config_remove_root", remove_while_an_edit_waits)
+    revision = svc.backend.roots().revision
+    svc.backend.remove_root(str(extra), revision)
+
+    _wait_idle(svc)
+    time.sleep(0.3)
+    _wait_idle(svc)
+    assert _documents(svc) == 1
+
+
+def test_roots_change_is_applied_before_the_lane_is_released(env, request) -> None:
+    svc = _service(request)
+    svc.start()
+    _wait_idle(svc)
+    extra = env / "extra"
+    extra.mkdir()
+    lanes: list[object] = []
+    real = svc._roots_changed
+
+    def record() -> None:
+        lanes.append(svc.backend.status().activity["lane"])
+        real()
+
+    svc.backend.add_root(str(extra), svc.backend.roots().revision)
+    svc.backend._on_roots_changed = record
+    svc.backend.remove_root(str(extra), svc.backend.roots().revision)
+
+    # The watcher gets the new roots (and the stale flag) while remove_root
+    # still holds the engine lane, so no waiting action can slip in between.
+    assert lanes == ["index"]
+    assert [entry[1] for entry in FakeObserver.created[-1].schedules] == [
+        str((env / "docs").resolve())
+    ]
+
+
 def test_watcher_indexing_runs_in_engine_lane(env, request) -> None:
     svc = _service(request)
     svc.start()

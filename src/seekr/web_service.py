@@ -1151,10 +1151,14 @@ class WebService:
                 if lock is not None:
                     with suppress(Exception):
                         lock.release()
+            # Still holding the lane: a watcher action waiting for it must see
+            # the new roots, or it could re-index a file under the removed
+            # folder.  The callback only swaps observers and never takes the
+            # lane, so this cannot deadlock.
+            self._notify_roots_changed()
         finally:
             self._end_lane()
 
-        self._notify_roots_changed()
         return RootsView(
             roots=snapshot.roots,
             config_path=str(snapshot.path),

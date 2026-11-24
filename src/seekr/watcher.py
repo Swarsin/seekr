@@ -557,6 +557,21 @@ class Watcher:
                     )
 
     def _execute(self, pending: _Pending) -> None:
+        # The roots may have changed while this action waited for the engine
+        # lane (a folder removed from the web UI purges its documents first).
+        # Never write a document for a path that is no longer watched: drop
+        # index and scan actions, and turn a move whose destination left the
+        # roots into a removal of the source.  Removals are always safe.
+        if pending.kind in ("index", "scan_dir") and self._inside_roots(pending.src) is None:
+            return
+        if pending.kind in ("move", "move_dir") and (
+            pending.dst is None or self._inside_roots(pending.dst) is None
+        ):
+            if pending.kind == "move":
+                self._indexer.remove_path(pending.src)
+            else:
+                self._remove_directory(pending.src)
+            return
         if pending.kind == "index":
             self._indexer.index_path(pending.src)
         elif pending.kind == "remove":

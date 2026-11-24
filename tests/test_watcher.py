@@ -598,6 +598,62 @@ class _RootChangeTests(unittest.TestCase):
         time.sleep(0.2)
         self.assertEqual(self.indexer.calls, [])
 
+    def _blocked_action(self, watcher_kwargs: dict[str, object] | None = None):
+        """Start a watcher whose actions wait at the lane until released."""
+        handed = threading.Event()
+        release = threading.Event()
+
+        def run_exclusive(action) -> None:
+            handed.set()
+            release.wait(5)
+            action()
+
+        watcher = self._watcher(run_exclusive=run_exclusive, **(watcher_kwargs or {}))
+        watcher.start()
+        return watcher, handed, release
+
+    def test_action_waiting_for_the_lane_is_dropped_when_its_root_is_removed(self) -> None:
+        watcher, handed, release = self._blocked_action()
+        path = self.first / "late.md"
+        path.write_text("late", encoding="utf-8")
+        self._dispatch(watcher, "created", path)
+        self.assertTrue(handed.wait(5))
+
+        # The folder is removed while the action waits for the engine lane.
+        watcher.set_roots([self.second])
+        release.set()
+
+        time.sleep(0.2)
+        self.assertEqual(self.indexer.calls, [])
+
+    def test_move_out_of_the_roots_after_removal_becomes_a_remove(self) -> None:
+        watcher, handed, release = self._blocked_action()
+        src = self.first / "a.md"
+        dst = self.first / "b.md"
+        dst.write_text("moved", encoding="utf-8")
+        assert watcher._handler is not None
+        watcher._handler.dispatch(_FakeEvent("moved", str(src), str(dst)))
+        self.assertTrue(handed.wait(5))
+
+        watcher.set_roots([self.second])
+        release.set()
+
+        self.assertTrue(_wait_for(lambda: bool(self.indexer.calls)))
+        time.sleep(0.1)
+        self.assertEqual(self.indexer.calls, [("remove", src.resolve())])
+
+    def test_remove_outside_the_roots_still_runs(self) -> None:
+        watcher, handed, release = self._blocked_action()
+        gone = self.first / "gone.md"
+        self._dispatch(watcher, "deleted", gone)
+        self.assertTrue(handed.wait(5))
+
+        watcher.set_roots([self.second])
+        release.set()
+
+        self.assertTrue(_wait_for(lambda: bool(self.indexer.calls)))
+        self.assertEqual(self.indexer.calls, [("remove", gone.resolve())])
+
     def test_set_roots_before_start_only_changes_roots(self) -> None:
         watcher = self._watcher()
         watcher.set_roots([self.second])
