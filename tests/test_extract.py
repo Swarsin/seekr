@@ -31,7 +31,7 @@ class _TemporaryDirectoryTestCase(unittest.TestCase):
 
     def write_text(self, name: str, text: str, encoding: str = "utf-8") -> Path:
         path = self.directory / name
-        path.write_text(text, encoding=encoding)
+        path.write_text(text, encoding=encoding, newline="")  # exact bytes, no CRLF
         return path
 
 
@@ -345,6 +345,10 @@ class PdfExtractionTests(_TemporaryDirectoryTestCase):
             extract(path, "pdf")
 
         self.assertIn("pdf", str(raised.exception).lower())
+        # A chained PyMuPDF error would pin the half-open document, keeping
+        # the file locked on Windows for as long as the error is held.
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
 
     def test_encrypted_pdf_raises(self) -> None:
         assert _fitz is not None

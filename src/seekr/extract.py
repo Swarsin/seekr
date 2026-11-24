@@ -259,16 +259,24 @@ def _load_pymupdf() -> ModuleType:
 
 def _extract_pdf(path: Path) -> ExtractionResult:
     pymupdf = _load_pymupdf()
+    # A failed open leaves PyMuPDF's half-built document (and its open file)
+    # reachable from the error's traceback; on Windows that locks the file
+    # for as long as the error lives.  Raise outside the handler, unchained.
+    failure: str | None = None
+    vanished = False
     try:
         document = pymupdf.open(os_open_path(path))
     except FileNotFoundError:
         raise
     except OSError as exc:
-        raise ExtractionError(f"cannot read PDF {path}: {exc}") from exc
+        failure = f"cannot read PDF {path}: {exc}"
     except _PDF_ERRORS as exc:
-        if not path.exists():
-            raise FileNotFoundError(path) from exc
-        raise ExtractionError(f"could not open corrupt or unreadable PDF {path}: {exc}") from exc
+        vanished = not path.exists()
+        failure = f"could not open corrupt or unreadable PDF {path}: {exc}"
+    if vanished:
+        raise FileNotFoundError(path)
+    if failure is not None:
+        raise ExtractionError(failure)
 
     units: list[ExtractedUnit] = []
     warnings: list[str] = []
