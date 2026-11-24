@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A corrupt PDF is no longer kept locked on Windows after indexing it fails.
 - The deprecated `seekr daemon` is now unavailable on macOS, where clients could never verify it and every search through it failed; searches run locally instead.
 - Model-path errors show Windows paths without doubled backslashes.
+- `seekr open C:\path\file:L10` works on Windows; a raw drive path was cut at the drive colon.
+- `seekr init --demo` prints its `SEEKR_CONFIG` hint in PowerShell syntax on Windows.
+- Service routes treat only drive and UNC paths as absolute on Windows, the same on every Python version (Python 3.13 already did; 3.11 and 3.12 accepted a drive-less `\x`).
+- An edit that keeps a file's size and lands within one filesystem timestamp tick of the last index is no longer missed: recently modified files are hashed instead of trusting an unchanged mtime and size.
+- Renaming a just-written file on macOS no longer re-embeds it.
 
 ## [0.2.0] - 2026-11-23
 
