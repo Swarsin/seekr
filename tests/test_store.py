@@ -22,6 +22,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+from _platform import use_posix_stored_paths
 from seekr.config import Config
 from seekr.models import ChunkSpec, text_sha
 from seekr.store import (
@@ -142,6 +143,7 @@ def _fake_vector_backend():
 
 class _FakeBackendTestCase(unittest.TestCase):
     def setUp(self) -> None:
+        use_posix_stored_paths(self)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.db_path = Path(self._tmp.name) / "index.db"
@@ -1015,6 +1017,7 @@ class StdlibStoreTests(_FakeBackendTestCase):
 )
 class RealSqliteVecTests(unittest.TestCase):
     def setUp(self) -> None:
+        use_posix_stored_paths(self)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.db_path = Path(self._tmp.name) / "index.db"
@@ -1337,6 +1340,7 @@ class ReadOnlyStoreTests(_FakeBackendTestCase):
 @unittest.skipUnless(_HAS_NUMPY and _HAS_FTS5, "numpy and FTS5 are required")
 class SchemaV3Tests(unittest.TestCase):
     def setUp(self) -> None:
+        use_posix_stored_paths(self)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.db_path = Path(self._tmp.name) / "index.db"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import pytest
 
@@ -27,3 +28,15 @@ def short_tempdir(prefix: str) -> tempfile.TemporaryDirectory[str]:
     if os.name == "posix" and os.path.isdir("/tmp"):
         return tempfile.TemporaryDirectory(dir="/tmp", prefix=prefix)
     return tempfile.TemporaryDirectory(prefix=prefix)
+
+
+def use_posix_stored_paths(test: unittest.TestCase) -> None:
+    """Apply Linux stored-path rules for *test*, which stores literal POSIX paths.
+
+    On Windows a store matches prefixes on ``\\`` boundaries, so paths such as
+    ``/notes/a.md`` would never sit "below" ``/notes``.  Tests of the Windows
+    and macOS rules patch ``seekr.pathnorm._PLATFORM`` themselves.
+    """
+    patcher = mock.patch("seekr.pathnorm._PLATFORM", "linux")
+    patcher.start()
+    test.addCleanup(patcher.stop)
