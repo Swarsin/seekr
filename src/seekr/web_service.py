@@ -252,6 +252,7 @@ class WebService:
         lock_wait_seconds: float = _LOCK_WAIT_SECONDS,
         read_busy_timeout: float = _READ_BUSY_TIMEOUT_SECONDS,
         on_shutdown: Callable[[], None] | None = None,
+        on_roots_changed: Callable[[], None] | None = None,
     ) -> None:
         configured = default_config_path() if config_path is None else Path(config_path)
         configured = configured.expanduser()
@@ -271,8 +272,11 @@ class WebService:
         self._read_busy_timeout = max(0.0, float(read_busy_timeout))
 
         self._on_shutdown = on_shutdown
+        self._on_roots_changed = on_roots_changed
         self._shutdown_requested = False
         self._state_lock = threading.RLock()
+        # Signalled whenever the lane is released or shutdown begins.
+        self._lane_free = threading.Condition(self._state_lock)
         self._config_write_lock = threading.Lock()
         self._lane_kind: str | None = None
         self._lane_job_id: str | None = None
@@ -295,6 +299,7 @@ class WebService:
         """Stop admitting new work without waiting for the active job."""
         with self._state_lock:
             self._shutting_down = True
+            self._lane_free.notify_all()
 
     def shutdown(self) -> None:
         """Stop accepting work and join the active background job."""
@@ -469,6 +474,23 @@ class WebService:
         with self._state_lock:
             self._lane_kind = None
             self._lane_job_id = None
+            self._lane_free.notify_all()
+
+    def run_in_lane(self, kind: str, fn: Callable[[], Any], *, wait: bool = True) -> Any:
+        """Run ``fn`` holding the engine lane, waiting for it when ``wait``.
+
+        Raises ``409 busy`` once shutdown has begun (also for waiters).
+        """
+        with self._state_lock:
+            while wait and not self._shutting_down and (
+                self._lane_kind is not None or self._root_writers
+            ):
+                self._lane_free.wait()
+            self._begin_lane(kind)
+        try:
+            return fn()
+        finally:
+            self._end_lane()
 
     def _activity(self) -> dict[str, object]:
         with self._state_lock:
@@ -557,6 +579,7 @@ class WebService:
                 self._active_job_thread = None
             self._lane_kind = None
             self._lane_job_id = None
+            self._lane_free.notify_all()
 
     def _job_view(self, record: _JobRecord, now: float) -> JobView:
         finished = record.finished_monotonic
@@ -989,7 +1012,9 @@ class WebService:
         finally:
             with self._state_lock:
                 self._root_writers = max(0, self._root_writers - 1)
+                self._lane_free.notify_all()
 
+        self._notify_roots_changed()
         return RootsView(
             roots=snapshot.roots,
             config_path=str(snapshot.path),
@@ -1062,11 +1087,21 @@ class WebService:
         finally:
             self._end_lane()
 
+        self._notify_roots_changed()
         return RootsView(
             roots=snapshot.roots,
             config_path=str(snapshot.path),
             revision=snapshot.revision,
         )
+
+    def _notify_roots_changed(self) -> None:
+        callback = self._on_roots_changed
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:  # noqa: BLE001 - the config change already succeeded
+            _LOGGER.warning("event=web_roots_changed_callback_failed")
 
     @staticmethod
     def _removed_root_prefixes(path: str, configured_roots: Sequence[Path]) -> list[str]:

@@ -1,4 +1,4 @@
-"""Incremental filesystem watching for the seekr daemon.
+"""Incremental filesystem watching for the seekr service and daemon.
 
 Events are debounced per path and executed by one worker thread, so indexing,
 deletes, directory scans and moves are serialized through a single writer.
@@ -19,6 +19,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +91,7 @@ class Watcher:
         poll_interval: float = 15.0,
         mounts: Sequence[Mount] | None = None,
         polling_observer_factory: Callable[[float], Any] | None = None,
+        run_exclusive: Callable[[Callable[[], None]], None] | None = None,
     ) -> None:
         try:
             debounce = float(debounce_s)
@@ -106,22 +108,9 @@ class Watcher:
             raise WatcherError("poll_interval must be a positive finite number")
 
         self._indexer = indexer
-        self._roots = tuple(Path(root).expanduser() for root in roots)
-        self._resolved_roots = tuple(self._resolve(root) for root in self._roots)
-        active_mounts = tuple(
-            platform_info.read_mounts() if mounts is None else mounts
-        )
-        native_roots: list[Path] = []
-        polled_roots: list[Path] = []
-        for root, resolved in zip(self._roots, self._resolved_roots, strict=True):
-            if platform_info.is_slow_path(resolved, active_mounts) or (
-                platform_info.is_slow_path(root, active_mounts)
-            ):
-                polled_roots.append(resolved)
-            else:
-                native_roots.append(resolved)
-        self._native_roots = tuple(native_roots)
-        self._polled_roots = tuple(polled_roots)
+        self._run_exclusive = run_exclusive
+        self._mounts = None if mounts is None else tuple(mounts)
+        self._configure_roots(roots)
         self._debounce_s = debounce
         self._poll_interval = poll_interval_s
         self._observer_factory = observer_factory
@@ -138,6 +127,8 @@ class Watcher:
         self._observer: Any | None = None
         self._polling_observer: Any | None = None
         self._handler: _EventDispatch | None = None
+        # Serialises observer replacement (set_roots) against start/stop.
+        self._observer_lock = threading.Lock()
 
         self._error_lock = threading.Lock()
         self._errors: list[tuple[str, str]] = []
@@ -166,34 +157,49 @@ class Watcher:
         self._worker = worker
         worker.start()
 
-        observer: Any | None = None
-        polling_observer: Any | None = None
-        started_observers: list[Any] = []
-        try:
-            handler = _EventDispatch(self)
-            if self._native_roots:
-                observer = self._build_observer()
-                self._schedule_watches(observer, handler, self._native_roots)
-            if self._polled_roots:
-                polling_observer = self._build_polling_observer()
-                self._schedule_watches(polling_observer, handler, self._polled_roots)
-            for candidate in (observer, polling_observer):
-                if candidate is not None:
-                    candidate.start()
-                    started_observers.append(candidate)
-        except Exception as exc:
-            self._abort_start(
-                worker,
-                [obs for obs in (observer, polling_observer) if obs is not None],
-                started_observers,
-            )
-            if isinstance(exc, WatcherError):
-                raise
-            raise WatcherError(f"cannot start file watcher: {exc}") from exc
+        handler = _EventDispatch(self)
+        with self._observer_lock:
+            try:
+                observer, polling_observer = self._launch_observers(handler)
+            except Exception as exc:
+                self._abort_start(worker)
+                if isinstance(exc, WatcherError):
+                    raise
+                raise WatcherError(f"cannot start file watcher: {exc}") from exc
 
-        self._observer = observer
-        self._polling_observer = polling_observer
-        self._handler = handler
+            self._observer = observer
+            self._polling_observer = polling_observer
+            self._handler = handler
+
+    def set_roots(self, roots: Sequence[Path]) -> None:
+        """Replace the watched roots, rescheduling a running watcher at once.
+
+        Pending events that fall outside the new roots are dropped.  Both
+        observers are rebuilt because watchdog observers cannot be restarted
+        and the native/polled split may change with the new roots.
+        """
+        with self._observer_lock:
+            with self._condition:
+                self._configure_roots(roots)
+                for key, pending in list(self._pending.items()):
+                    if self._inside_roots(pending.src) is None and (
+                        pending.dst is None or self._inside_roots(pending.dst) is None
+                    ):
+                        del self._pending[key]
+                running = self._started and not self._stopping
+            handler = self._handler
+            if not running or handler is None:
+                return
+            old = (self._observer, self._polling_observer)
+            self._observer = None
+            self._polling_observer = None
+            try:
+                self._observer, self._polling_observer = self._launch_observers(
+                    handler
+                )
+            finally:
+                for observer in old:
+                    self._stop_observer(observer, timeout=5.0)
 
     def resume(self) -> None:
         """Allow a watcher started with ``paused=True`` to apply events."""
@@ -208,11 +214,12 @@ class Watcher:
             self._pending.clear()
             self._condition.notify_all()
 
-        observer = self._observer
-        polling_observer = self._polling_observer
-        self._observer = None
-        self._polling_observer = None
-        self._handler = None
+        with self._observer_lock:
+            observer = self._observer
+            polling_observer = self._polling_observer
+            self._observer = None
+            self._polling_observer = None
+            self._handler = None
         self._stop_observer(observer, timeout=timeout)
         self._stop_observer(polling_observer, timeout=timeout)
 
@@ -243,6 +250,52 @@ class Watcher:
             return list(self._errors)
 
     # -- observer setup ----------------------------------------------------
+
+    def _configure_roots(self, roots: Sequence[Path]) -> None:
+        self._roots = tuple(Path(root).expanduser() for root in roots)
+        self._resolved_roots = tuple(self._resolve(root) for root in self._roots)
+        active_mounts = (
+            tuple(platform_info.read_mounts()) if self._mounts is None else self._mounts
+        )
+        native_roots: list[Path] = []
+        polled_roots: list[Path] = []
+        for root, resolved in zip(self._roots, self._resolved_roots, strict=True):
+            if platform_info.is_slow_path(resolved, active_mounts) or (
+                platform_info.is_slow_path(root, active_mounts)
+            ):
+                polled_roots.append(resolved)
+            else:
+                native_roots.append(resolved)
+        self._native_roots = tuple(native_roots)
+        self._polled_roots = tuple(polled_roots)
+
+    def _launch_observers(self, handler: _EventDispatch) -> tuple[Any, Any]:
+        """Build, schedule and start the native and polling observers."""
+        observer: Any | None = None
+        polling_observer: Any | None = None
+        started_ids: set[int] = set()
+        try:
+            if self._native_roots:
+                observer = self._build_observer()
+                self._schedule_watches(observer, handler, self._native_roots)
+            if self._polled_roots:
+                polling_observer = self._build_polling_observer()
+                self._schedule_watches(polling_observer, handler, self._polled_roots)
+            for candidate in (observer, polling_observer):
+                if candidate is not None:
+                    candidate.start()
+                    started_ids.add(id(candidate))
+        except Exception:
+            for candidate in (observer, polling_observer):
+                if candidate is not None:
+                    self._stop_observer(
+                        candidate,
+                        timeout=5.0,
+                        join=id(candidate) in started_ids,
+                        context="cannot stop filesystem observer during startup",
+                    )
+            raise
+        return observer, polling_observer
 
     def _build_observer(self) -> Any:
         if self._observer_factory is not None:
@@ -317,24 +370,11 @@ class Watcher:
         except Exception as exc:  # noqa: BLE001 - third-party observer
             self._record_error("cannot join filesystem observer", exc)
 
-    def _abort_start(
-        self,
-        worker: threading.Thread,
-        observers: Sequence[Any],
-        started_observers: Sequence[Any],
-    ) -> None:
+    def _abort_start(self, worker: threading.Thread) -> None:
         with self._condition:
             self._stopping = True
             self._pending.clear()
             self._condition.notify_all()
-        started_ids = {id(obs) for obs in started_observers}
-        for observer in observers:
-            self._stop_observer(
-                observer,
-                timeout=5.0,
-                join=id(observer) in started_ids,
-                context="cannot stop filesystem observer during startup",
-            )
         worker.join(timeout=5.0)
         with self._condition:
             self._started = False
@@ -491,7 +531,10 @@ class Watcher:
                     if self._stopping:
                         return
                 try:
-                    self._execute(pending)
+                    if self._run_exclusive is None:
+                        self._execute(pending)
+                    else:
+                        self._run_exclusive(partial(self._execute, pending))
                 except Exception as exc:  # noqa: BLE001 - isolate every event
                     self._record_error(
                         f"cannot apply {pending.kind} for {pending.src}", exc

@@ -12,6 +12,7 @@ import importlib.util
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from collections.abc import Iterable
@@ -454,6 +455,114 @@ class _FakeObserverTests(unittest.TestCase):
 
         with self.assertRaises(WatcherError):
             self.watcher.start()
+
+
+class _RootChangeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.first = self.tmp / "first"
+        self.first.mkdir()
+        self.second = self.tmp / "second"
+        self.second.mkdir()
+        self.indexer = _RecordingIndexer()
+        self.observers: list[_FakeObserver] = []
+
+    def _factory(self) -> _FakeObserver:
+        observer = _FakeObserver()
+        self.observers.append(observer)
+        return observer
+
+    def _watcher(self, **kwargs: object) -> Watcher:
+        watcher = Watcher(
+            self.indexer,
+            [self.first],
+            debounce_s=0.05,
+            observer_factory=self._factory,
+            mounts=(),
+            **kwargs,
+        )
+        self.addCleanup(watcher.stop)
+        return watcher
+
+    def _dispatch(self, watcher: Watcher, event_type: str, src: Path) -> None:
+        assert watcher._handler is not None
+        watcher._handler.dispatch(_FakeEvent(event_type, str(src)))
+
+    def test_run_exclusive_wraps_every_indexing_action(self) -> None:
+        inside = threading.local()
+        seen: list[bool] = []
+        wrapped: list[int] = []
+
+        def run_exclusive(action) -> None:
+            inside.active = True
+            try:
+                action()
+            finally:
+                inside.active = False
+            wrapped.append(1)
+
+        original = self.indexer.index_path
+
+        def index_path(path: Path) -> str:
+            seen.append(getattr(inside, "active", False))
+            return original(path)
+
+        self.indexer.index_path = index_path  # type: ignore[method-assign]
+        watcher = self._watcher(run_exclusive=run_exclusive)
+        watcher.start()
+        path = self.first / "a.md"
+        path.write_text("alpha", encoding="utf-8")
+
+        self._dispatch(watcher, "created", path)
+
+        self.assertTrue(_wait_for(lambda: bool(wrapped)))
+        self.assertEqual(seen, [True])
+
+    def test_set_roots_reschedules_running_watcher(self) -> None:
+        watcher = self._watcher()
+        watcher.start()
+        self.assertEqual(len(self.observers), 1)
+
+        watcher.set_roots([self.second])
+
+        self.assertTrue(self.observers[0].stopped)
+        newest = self.observers[-1]
+        self.assertTrue(newest.started)
+        self.assertEqual(
+            [entry[1] for entry in newest.schedules], [str(self.second.resolve())]
+        )
+        moved_in = self.second / "b.md"
+        moved_in.write_text("beta", encoding="utf-8")
+        self._dispatch(watcher, "created", self.first / "ignored.md")
+        self._dispatch(watcher, "created", moved_in)
+        self.assertTrue(_wait_for(lambda: bool(self.indexer.calls)))
+        time.sleep(0.1)
+        self.assertEqual(self.indexer.calls, [("index", moved_in.resolve())])
+
+    def test_set_roots_drops_pending_events_outside_new_roots(self) -> None:
+        watcher = self._watcher()
+        watcher.start(paused=True)
+        self._dispatch(watcher, "created", self.first / "pending.md")
+
+        watcher.set_roots([self.second])
+        watcher.resume()
+
+        time.sleep(0.2)
+        self.assertEqual(self.indexer.calls, [])
+
+    def test_set_roots_before_start_only_changes_roots(self) -> None:
+        watcher = self._watcher()
+        watcher.set_roots([self.second])
+        self.assertEqual(self.observers, [])
+
+        watcher.start()
+
+        self.assertEqual(
+            [entry[1] for entry in self.observers[0].schedules],
+            [str(self.second.resolve())],
+        )
 
 
 class _RealIndexerRenameTests(unittest.TestCase):

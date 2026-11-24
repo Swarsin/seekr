@@ -25,6 +25,7 @@ COMMAND_MODULES = (
     "cli_models",
     "cli_open",
     "cli_search",
+    "cli_service",
     "cli_web",
 )
 MODULE_COMMANDS = (
