@@ -14,6 +14,7 @@ import hashlib
 import logging
 import os
 import stat as stat_module
+import sys
 import time
 import warnings
 from collections.abc import Callable, Iterable, Sequence
@@ -22,6 +23,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
 from . import extract as _extract_module
+from . import pathnorm
 from .chunking import ChunkingWarning, MissingGrammarWarning, chunk
 from .config import Config
 from .course import CourseLabel, compile_week_pattern, label_for, labels_signature
@@ -145,6 +147,17 @@ def kind_for(path: Path) -> str | None:
 
 def language_for(path: Path) -> str | None:
     return _extract_module.language_for(path)
+
+
+# The platform whose path rules apply; a module attribute so tests can patch it.
+_PLATFORM = sys.platform
+
+
+def _canonical_walked(path: Path) -> Path:
+    """Return a walked file path in canonical (NFC on macOS) form."""
+    if _PLATFORM != "darwin":
+        return path
+    return Path(pathnorm.normalize_unicode(str(path), platform=_PLATFORM))
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -427,7 +440,7 @@ class Indexer:
                     name for name in dirnames if not os.path.islink(os.path.join(dirpath, name))
                 ]
                 for name in filenames:
-                    files.append(Path(dirpath) / name)
+                    files.append(_canonical_walked(Path(dirpath) / name))
         except OSError as exc:
             walk_ok = False
             report.errors.append((str(root), f"cannot walk root: {_error_text(exc)}"))
@@ -1444,7 +1457,8 @@ class Indexer:
         except (OSError, RuntimeError) as exc:
             return None, f"cannot expand path: {_error_text(exc)}"
         try:
-            return expanded.resolve(strict=False), None
+            # On Linux this is exactly Path.resolve(); macOS also applies NFC.
+            return Path(pathnorm.canonical_path(expanded, platform=_PLATFORM)), None
         except (OSError, RuntimeError) as exc:
             return None, f"cannot resolve path: {_error_text(exc)}"
 

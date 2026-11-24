@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 
+from . import pathnorm
 from .models import ExtractedUnit
 
 _KIND_BY_SUFFIX = {
@@ -115,9 +116,14 @@ def extract(path: Path, kind: str) -> ExtractionResult:
     raise ExtractionError(f"unsupported file kind {kind!r} for {source}")
 
 
+def os_open_path(path: Path) -> Path:
+    """Return *path* in the form the OS opens (long-path prefix on Windows)."""
+    return Path(pathnorm.os_path(str(path)))
+
+
 def _read_bytes(path: Path) -> bytes:
     try:
-        return path.read_bytes()
+        return os_open_path(path).read_bytes()
     except FileNotFoundError:
         raise
     except OSError as exc:
@@ -254,7 +260,7 @@ def _load_pymupdf() -> ModuleType:
 def _extract_pdf(path: Path) -> ExtractionResult:
     pymupdf = _load_pymupdf()
     try:
-        document = pymupdf.open(path)
+        document = pymupdf.open(os_open_path(path))
     except FileNotFoundError:
         raise
     except OSError as exc:

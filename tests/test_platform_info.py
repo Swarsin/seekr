@@ -11,9 +11,11 @@ from unittest import mock
 from seekr.platform_info import (
     SLOW_FSTYPES,
     Mount,
+    is_polled_root,
     is_slow_path,
     is_wsl,
     mount_for,
+    parse_macos_mount,
     parse_mounts,
     read_mounts,
     split_roots,
@@ -256,3 +258,89 @@ class SplitRootsTests(unittest.TestCase):
 
         self.assertEqual(polled, [Path("/mnt/c/Users/b")])
         self.assertEqual(native, [Path("/home/a/notes"), Path("/srv/x")])
+
+
+MACOS_MOUNT = (
+    "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n"
+    "//me@nas/course on /Volumes/course (smbfs, nodev, nosuid, mounted by me)\n"
+    "nas:/export on /Volumes/nfs share (nfs, nodev)\n"
+    "afp_x@srv/Docs on /Volumes/Docs (afpfs, nodev)\n"
+    "https://dav.example/ on /Volumes/dav (webdav, nodev)\n"
+    "/dev/disk4s1 on /Volumes/USB (msdos, local, nodev)\n"
+)
+
+
+class CrossPlatformSlowPathTests(unittest.TestCase):
+    def test_unc_and_macos_network_mounts_are_slow(self) -> None:
+        self.assertTrue(is_slow_path(Path(r"\\server\share\notes"), platform="win32"))
+        mounts = parse_macos_mount(
+            "//me@nas/course on /Volumes/course (smbfs, nodev, nosuid)\n"
+        )
+        self.assertTrue(is_slow_path(Path("/Volumes/course/ml"), mounts, platform="darwin"))
+
+    def test_parse_macos_mount(self) -> None:
+        mounts = parse_macos_mount(MACOS_MOUNT)
+        self.assertIn(
+            Mount(source="//me@nas/course", mount_point="/Volumes/course", fstype="smbfs"),
+            mounts,
+        )
+        self.assertIn(
+            Mount(source="nas:/export", mount_point="/Volumes/nfs share", fstype="nfs"),
+            mounts,
+        )
+        self.assertEqual(len(mounts), 6)
+        self.assertEqual(parse_macos_mount("garbage line\n\n"), [])
+
+    def test_macos_network_fstypes_are_slow_and_local_are_not(self) -> None:
+        mounts = parse_macos_mount(MACOS_MOUNT)
+        for path in ("/Volumes/course/a", "/Volumes/nfs share/a", "/Volumes/Docs",
+                     "/Volumes/dav/x"):
+            with self.subTest(path=path):
+                self.assertTrue(is_slow_path(Path(path), mounts, platform="darwin"))
+        self.assertFalse(is_slow_path(Path("/Volumes/USB/a"), mounts, platform="darwin"))
+        self.assertFalse(is_slow_path(Path("/Users/me/a"), mounts, platform="darwin"))
+
+    def test_windows_remote_drive_type_is_slow(self) -> None:
+        with mock.patch(
+            "seekr.platform_info._windows_drive_type",
+            side_effect=lambda root: 4 if root.upper() == "Z:\\" else 3,
+        ) as drive_type:
+            self.assertTrue(is_slow_path(Path(r"Z:\notes\a.md"), platform="win32"))
+            self.assertFalse(is_slow_path(Path(r"C:\notes\a.md"), platform="win32"))
+        drive_type.assert_any_call("Z:\\")
+        self.assertFalse(is_slow_path(Path("relative"), platform="win32"))
+
+    def test_read_mounts_is_platform_aware(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(argv: list[str], **_kwargs: object):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout=MACOS_MOUNT)
+
+        self.assertEqual(
+            read_mounts(platform="darwin", run=fake_run), parse_macos_mount(MACOS_MOUNT)
+        )
+        self.assertEqual(calls, [["mount"]])
+        self.assertEqual(read_mounts(platform="win32", run=fake_run), [])
+
+        def failing(argv: list[str], **_kwargs: object):
+            raise OSError("no mount")
+
+        self.assertEqual(read_mounts(platform="darwin", run=failing), [])
+
+    def test_default_mounts_are_read_when_omitted(self) -> None:
+        mounts = parse_mounts(MOUNTS)
+        with mock.patch("seekr.platform_info.read_mounts", return_value=mounts) as read:
+            self.assertTrue(is_slow_path(Path("/mnt/c/x"), platform="linux"))
+        read.assert_called_once_with(platform="linux")
+
+    def test_polled_root_uses_platform_rules(self) -> None:
+        mounts = parse_macos_mount(MACOS_MOUNT)
+        self.assertTrue(
+            is_polled_root("/Volumes/course/ml", mounts, platform="darwin")
+        )
+        native, polled = split_roots(
+            ["/Volumes/course/ml", "/Users/me/notes"], mounts, platform="darwin"
+        )
+        self.assertEqual(polled, [Path("/Volumes/course/ml")])
+        self.assertEqual(native, [Path("/Users/me/notes")])

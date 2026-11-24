@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ntpath
 import os
 import posixpath
 import re
 import subprocess
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +19,7 @@ __all__ = [
     "is_slow_path",
     "is_wsl",
     "mount_for",
+    "parse_macos_mount",
     "parse_mounts",
     "read_mounts",
     "windows_path",
@@ -27,9 +30,25 @@ _OSRELEASE_PATH = Path("/proc/sys/kernel/osrelease")
 _MOUNTS_PATH = Path("/proc/mounts")
 _WINDOWS_DRIVE_RE = re.compile(r"([A-Za-z]):\\?")
 
+# Linux (``/proc/mounts``) and macOS (``mount``) names of network filesystems.
 SLOW_FSTYPES = frozenset(
-    {"9p", "drvfs", "cifs", "smb3", "nfs", "nfs4", "fuse.sshfs"}
+    {
+        "9p",
+        "drvfs",
+        "cifs",
+        "smb3",
+        "nfs",
+        "nfs4",
+        "fuse.sshfs",
+        "smbfs",
+        "afpfs",
+        "webdav",
+    }
 )
+# GetDriveTypeW result for a network drive.
+_DRIVE_REMOTE = 4
+# ``//me@nas/share on /Volumes/share (smbfs, nodev, nosuid)``
+_MACOS_MOUNT_RE = re.compile(r"^(?P<source>.+?) on (?P<point>/.*?) \((?P<opts>[^()]*)\)$")
 
 _MOUNT_ESCAPES = {
     r"\040": " ",
@@ -85,8 +104,48 @@ def parse_mounts(text: str) -> list[Mount]:
     return mounts
 
 
-def read_mounts() -> list[Mount]:
-    """Read and parse ``/proc/mounts``, returning ``[]`` when unreadable."""
+def parse_macos_mount(text: str) -> list[Mount]:
+    """Parse macOS ``mount`` output (``SRC on /point (fstype, opts...)``)."""
+    mounts: list[Mount] = []
+    for raw_line in text.splitlines():
+        match = _MACOS_MOUNT_RE.match(raw_line.strip())
+        if match is None:
+            continue
+        fstype = match.group("opts").split(",", 1)[0].strip()
+        if not fstype:
+            continue
+        mounts.append(
+            Mount(
+                source=match.group("source"),
+                mount_point=match.group("point"),
+                fstype=fstype,
+            )
+        )
+    return mounts
+
+
+def read_mounts(
+    *,
+    platform: str = sys.platform,
+    run: Callable[..., Any] = subprocess.run,
+) -> list[Mount]:
+    """Return the mount table for *platform*, or ``[]`` when unavailable.
+
+    Linux reads ``/proc/mounts`` and macOS parses ``mount`` output.  Windows
+    needs no table: :func:`is_slow_path` asks for the drive type instead.
+    """
+    if platform == "win32":
+        return []
+    if platform == "darwin":
+        try:
+            result = run(
+                ["mount"], capture_output=True, text=True, timeout=2, check=False
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        if getattr(result, "returncode", 1) != 0:
+            return []
+        return parse_macos_mount(getattr(result, "stdout", "") or "")
     try:
         text = _MOUNTS_PATH.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -126,8 +185,43 @@ def mount_for(path: Path, mounts: Sequence[Mount]) -> Mount | None:
     return best
 
 
-def is_slow_path(path: Path, mounts: Sequence[Mount]) -> bool:
-    """Return ``True`` if *path* resides on a filesystem requiring polling."""
+def _windows_drive_type(root: str) -> int:
+    """Return ``GetDriveTypeW(root)``; only called on Windows."""
+    import ctypes
+
+    windll = getattr(ctypes, "windll")  # noqa: B009 - absent off Windows
+    return int(windll.kernel32.GetDriveTypeW(root))
+
+
+def _is_slow_windows_path(path: Path | str) -> bool:
+    raw = os.fspath(path).replace("/", "\\")
+    drive, _rest = ntpath.splitdrive(raw)
+    if drive.startswith("\\\\"):
+        return True  # UNC share (\\server\share)
+    if len(drive) != 2 or drive[1] != ":":
+        return False
+    try:
+        return _windows_drive_type(drive + "\\") == _DRIVE_REMOTE
+    except (OSError, AttributeError, ValueError):
+        return False
+
+
+def is_slow_path(
+    path: Path,
+    mounts: Sequence[Mount] | None = None,
+    *,
+    platform: str = sys.platform,
+) -> bool:
+    """Return ``True`` if *path* resides on a filesystem requiring polling.
+
+    Windows: a UNC path or a ``DRIVE_REMOTE`` drive letter.  Linux and macOS:
+    the longest matching mount (read with :func:`read_mounts` when *mounts*
+    is omitted) has a network filesystem type.
+    """
+    if platform == "win32":
+        return _is_slow_windows_path(path)
+    if mounts is None:
+        mounts = read_mounts(platform=platform)
     mount = mount_for(path, mounts)
     return mount is not None and mount.fstype in SLOW_FSTYPES
 
@@ -141,22 +235,28 @@ def resolve_root(path: Path | str) -> Path:
         return expanded
 
 
-def is_polled_root(root: Path | str, mounts: Sequence[Mount]) -> bool:
-    """Return ``True`` if the watcher polls *root* instead of using inotify."""
+def is_polled_root(
+    root: Path | str, mounts: Sequence[Mount], *, platform: str = sys.platform
+) -> bool:
+    """Return ``True`` if the watcher polls *root* instead of native events."""
     expanded = Path(root).expanduser()
-    return is_slow_path(resolve_root(expanded), mounts) or is_slow_path(
-        expanded, mounts
+    return is_slow_path(resolve_root(expanded), mounts, platform=platform) or (
+        is_slow_path(expanded, mounts, platform=platform)
     )
 
 
 def split_roots(
-    roots: Sequence[Path | str], mounts: Sequence[Mount]
+    roots: Sequence[Path | str],
+    mounts: Sequence[Mount],
+    *,
+    platform: str = sys.platform,
 ) -> tuple[list[Path], list[Path]]:
     """Return resolved ``(native, polled)`` watch roots, in configured order."""
     native: list[Path] = []
     polled: list[Path] = []
     for root in roots:
-        (polled if is_polled_root(root, mounts) else native).append(resolve_root(root))
+        target = polled if is_polled_root(root, mounts, platform=platform) else native
+        target.append(resolve_root(root))
     return native, polled
 
 

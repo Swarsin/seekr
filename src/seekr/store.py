@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import sqlite3
+import string
 import threading
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
@@ -12,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import pathnorm
 from .logging_config import log_event
 from .models import ChunkSpec
 
@@ -247,20 +249,50 @@ def _deserialize_vector_int8(payload: bytes | memoryview, dim: int) -> np.ndarra
     return np.frombuffer(payload, dtype=np.int8).astype(np.float32) / scale
 
 
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+_LIKE_ESCAPE = "!"
+
+
+def _like_escape(value: str) -> str:
+    return (
+        value.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+        .replace("%", _LIKE_ESCAPE + "%")
+        .replace("_", _LIKE_ESCAPE + "_")
+    )
+
+
 def _path_prefix_clause(
     prefix: str | None,
     *,
     column: str = "path",
+    case_insensitive: bool = False,
+    separator: str = "/",
 ) -> tuple[str, tuple[object, ...]]:
-    """Return a component-aware path-prefix SQL predicate and its parameters."""
+    """Return a component-aware path-prefix SQL predicate and its parameters.
+
+    The prefix matches itself or anything below it on a *separator* boundary,
+    so ``C:\\notes`` never matches ``C:\\notes2``.  With ``\\`` as the
+    separator a ``/`` in the prefix is read as ``\\``.  ``case_insensitive``
+    compares ``lower(column)`` with a lowered, LIKE-escaped prefix; like
+    SQLite's ``lower()`` it folds ASCII letters only.
+    """
     if prefix is None:
         return "", ()
-    value = str(prefix).rstrip("/")
+    value = str(prefix)
+    if separator != "/":
+        value = value.replace("/", separator)
+    value = value.rstrip(separator)
     if not value:
         return "", ()
+    if not case_insensitive:
+        return (
+            f"({column} = ? OR substr({column}, 1, ?) = ?)",
+            (value, len(value) + 1, value + separator),
+        )
+    folded = value.translate(_ASCII_LOWER)
     return (
-        f"({column} = ? OR substr({column}, 1, ?) = ?)",
-        (value, len(value) + 1, value + "/"),
+        f"(lower({column}) = ? OR lower({column}) LIKE ? ESCAPE '{_LIKE_ESCAPE}')",
+        (folded, _like_escape(folded + separator) + "%"),
     )
 
 
@@ -273,11 +305,18 @@ def _document_filter_clause(
     module: str | None = None,
     week_range: tuple[int, int] | None = None,
     alias: str = "d",
+    case_insensitive: bool = False,
+    separator: str = "/",
 ) -> tuple[str, tuple[object, ...]]:
     """Combine document-level path, kind, mtime, label and exclusion SQL predicates."""
     clauses: list[str] = []
     params: list[object] = []
-    prefix_sql, prefix_params = _path_prefix_clause(path_prefix, column=f"{alias}.path")
+    prefix_sql, prefix_params = _path_prefix_clause(
+        path_prefix,
+        column=f"{alias}.path",
+        case_insensitive=case_insensitive,
+        separator=separator,
+    )
     if prefix_sql:
         clauses.append(prefix_sql)
         params.extend(prefix_params)
@@ -336,7 +375,13 @@ class Store:
         vector_quant: str | None = None,
         read_only: bool = False,
         embed_backend: str | None = None,
+        case_insensitive_paths: bool | None = None,
     ) -> None:
+        """Open (or create) the index.
+
+        ``case_insensitive_paths`` makes path-prefix filters fold case; it
+        defaults to :func:`seekr.pathnorm.case_insensitive` for this OS.
+        """
         if not isinstance(embed_model, str) or not embed_model.strip():
             raise ValueError("embed_model must be a non-empty string")
         if not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0:
@@ -359,6 +404,12 @@ class Store:
         self._embed_backend = embed_backend
         self._dim = dim
         self._read_only = bool(read_only)
+        self._case_insensitive_paths = (
+            pathnorm.case_insensitive()
+            if case_insensitive_paths is None
+            else bool(case_insensitive_paths)
+        )
+        self._path_separator = pathnorm.path_separator()
         self._stubbed_backend = (
             _load_vector_extension is not _DEFAULT_LOAD_VECTOR_EXTENSION
             or _create_vector_table is not _DEFAULT_CREATE_VECTOR_TABLE
@@ -386,6 +437,20 @@ class Store:
             schema_version=self._schema_version,
             read_only=self._read_only,
         )
+
+    @property
+    def case_insensitive_paths(self) -> bool:
+        """Whether path-prefix filters ignore (ASCII) letter case."""
+        return self._case_insensitive_paths
+
+    def _path_options(self) -> dict[str, Any]:
+        return {
+            "case_insensitive": self._case_insensitive_paths,
+            "separator": self._path_separator,
+        }
+
+    def _prefix_clause(self, prefix: str | None) -> tuple[str, tuple[object, ...]]:
+        return _path_prefix_clause(prefix, **self._path_options())
 
     def _open_writable(self, dim: int) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -820,7 +885,7 @@ class Store:
 
     def get_documents_metadata(self, prefix: str | None = None) -> dict[str, DocRow]:
         """Return indexed document rows keyed by path, optionally under *prefix*."""
-        clause, params = _path_prefix_clause(prefix)
+        clause, params = self._prefix_clause(prefix)
         sql = "SELECT id, path, mtime_ns, size, sha256, kind, module, week FROM documents"
         if clause:
             sql += f" WHERE {clause}"
@@ -932,7 +997,7 @@ class Store:
     def delete_documents_under(self, prefix: str) -> int:
         """Delete documents under *prefix* along with their chunks, FTS and vectors."""
         self._reject_write()
-        clause, params = _path_prefix_clause(prefix)
+        clause, params = self._prefix_clause(prefix)
         if not clause:
             with self._lock:
                 self._connection()
@@ -984,7 +1049,7 @@ class Store:
         """Return paths in stable order, optionally below a path component prefix."""
         with self._lock:
             conn = self._connection()
-            clause, params = _path_prefix_clause(prefix)
+            clause, params = self._prefix_clause(prefix)
             sql = "SELECT path FROM documents"
             if clause:
                 sql += f" WHERE {clause}"
@@ -1101,6 +1166,7 @@ class Store:
             module=module,
             week_range=week_range,
             alias="d",
+            **self._path_options(),
         )
         with self._lock:
             conn = self._connection()
@@ -1144,8 +1210,8 @@ class Store:
                 raise
         return [(int(row[0]), float(row[1])) for row in rows]
 
-    @staticmethod
     def _vector_scalar_search(
+        self,
         conn: sqlite3.Connection,
         blob: bytes,
         limit: int,
@@ -1167,6 +1233,7 @@ class Store:
             module=module,
             week_range=week_range,
             alias="d",
+            **self._path_options(),
         )
         if clause:
             return conn.execute(

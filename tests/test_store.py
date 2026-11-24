@@ -588,6 +588,38 @@ class StorePathTests(_FakeBackendTestCase):
         self.assertEqual(store.list_paths(""), sorted(paths))
         self.assertEqual(store.list_paths("/"), sorted(paths))
 
+    def test_case_insensitive_prefix_filters_fold_case_on_boundaries(self) -> None:
+        store = Store(self.db_path, "test/model", 8, case_insensitive_paths=True)
+        self._stores.append(store)
+        for path in ("/Users/Me/Notes/a.md", "/users/me/notes2/b.md", "/users/me/n_tes/c.md"):
+            _add_document(store, path)
+
+        self.assertEqual(store.list_paths("/users/me/notes"), ["/Users/Me/Notes/a.md"])
+        self.assertEqual(store.list_paths("/USERS/ME/NOTES/"), ["/Users/Me/Notes/a.md"])
+        self.assertEqual(
+            list(store.get_documents_metadata("/users/ME/notes")), ["/Users/Me/Notes/a.md"]
+        )
+        # LIKE wildcards in the prefix are literal.
+        self.assertEqual(store.list_paths("/users/me/n_tes"), ["/users/me/n_tes/c.md"])
+        self.assertEqual(store.list_paths("/users/me/n%"), [])
+        self.assertEqual(store.delete_documents_under("/USERS/me/notes"), 1)
+        self.assertEqual(
+            store.list_paths(), ["/users/me/n_tes/c.md", "/users/me/notes2/b.md"]
+        )
+
+    def test_case_sensitive_store_keeps_exact_prefixes(self) -> None:
+        store = Store(self.db_path, "test/model", 8, case_insensitive_paths=False)
+        self._stores.append(store)
+        _add_document(store, "/Users/Me/Notes/a.md")
+        self.assertEqual(store.list_paths("/users/me/notes"), [])
+        self.assertEqual(store.list_paths("/Users/Me/Notes"), ["/Users/Me/Notes/a.md"])
+
+    def test_case_insensitive_default_follows_platform(self) -> None:
+        from seekr import pathnorm
+
+        store = self.open_store()
+        self.assertEqual(store.case_insensitive_paths, pathnorm.case_insensitive())
+
     def test_get_documents_metadata_has_chunks_and_batch_sha_lookup(self) -> None:
         import numpy as np
 
@@ -1702,3 +1734,61 @@ class MissingVectorBackendTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PathPrefixClauseTests(unittest.TestCase):
+    """The SQL prefix predicate, evaluated directly for Windows-style paths."""
+
+    PATHS = (
+        r"C:\Notes\a.md",
+        r"C:\notes2\b.md",
+        r"c:\notes\sub\c.md",
+        r"C:\Notes",
+        r"D:\x_y\d.md",
+        r"D:\xzy\e.md",
+    )
+
+    def _matching(self, prefix: str, **kwargs: object) -> list[str]:
+        from seekr.store import _document_filter_clause, _path_prefix_clause
+
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute("CREATE TABLE documents(path TEXT)")
+        conn.executemany("INSERT INTO documents VALUES (?)", [(p,) for p in self.PATHS])
+        clause, params = _path_prefix_clause(prefix, **kwargs)
+        doc_clause, doc_params = _document_filter_clause(
+            path_prefix=prefix, alias="documents", **kwargs
+        )
+        self.assertEqual((clause.replace("path", "documents.path"), params),
+                         (doc_clause, doc_params))
+        rows = conn.execute(
+            f"SELECT path FROM documents WHERE {clause} ORDER BY path", params
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def test_windows_prefix_is_case_insensitive_on_backslash_boundaries(self) -> None:
+        kwargs = {"case_insensitive": True, "separator": "\\"}
+        self.assertEqual(
+            self._matching(r"c:\notes", **kwargs),
+            [r"C:\Notes", r"C:\Notes\a.md", r"c:\notes\sub\c.md"],
+        )
+        self.assertEqual(
+            self._matching("C:\\NOTES\\", **kwargs),
+            [r"C:\Notes", r"C:\Notes\a.md", r"c:\notes\sub\c.md"],
+        )
+        self.assertEqual(self._matching(r"d:\x_y", **kwargs), [r"D:\x_y\d.md"])
+        self.assertEqual(len(self._matching("C:\\", **kwargs)), 4)
+
+    def test_windows_prefix_accepts_forward_slashes(self) -> None:
+        kwargs = {"case_insensitive": True, "separator": "\\"}
+        self.assertEqual(
+            self._matching("c:/notes/sub", **kwargs), [r"c:\notes\sub\c.md"]
+        )
+
+    def test_default_clause_is_unchanged_for_posix(self) -> None:
+        from seekr.store import _path_prefix_clause
+
+        self.assertEqual(
+            _path_prefix_clause("/notes/"),
+            ("(path = ? OR substr(path, 1, ?) = ?)", ("/notes", 7, "/notes/")),
+        )

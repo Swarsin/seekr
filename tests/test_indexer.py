@@ -1569,3 +1569,33 @@ class OfficeAndNotebookIndexTests(_IndexerTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CanonicalPathTests(_IndexerTestCase):
+    NFD = "Módulo"
+    NFC = "Módulo"
+
+    def test_linux_stored_paths_are_unchanged_resolve_output(self) -> None:
+        nfd_file = self.write(f"{self.NFD}/a.txt", "alpha beta gamma")
+        link = self.tmp / "link-root"
+        link.symlink_to(self.root, target_is_directory=True)
+
+        self.indexer.sync([link])
+        self.indexer.index_path(nfd_file)
+
+        # Byte-for-byte what Path.resolve() gives: no Unicode normalisation.
+        self.assertEqual(sorted(self.store.documents), [str(nfd_file.resolve())])
+        self.assertIn(self.NFD, next(iter(self.store.documents)))
+
+    def test_darwin_resolves_and_walks_to_nfc_paths(self) -> None:
+        # The NFC spelling opens the same file on APFS/HFS+; on this test host
+        # only the recorded strings are checked.
+        self.write(f"{self.NFD}/a.txt", "alpha beta gamma")
+        expected = self.root.resolve() / self.NFC / "a.txt"
+        with mock.patch.object(indexer_module, "_PLATFORM", "darwin"):
+            resolved, issue = Indexer._resolve(self.root / self.NFD / "a.txt")
+            files, ok = self.indexer._walk_root(self.root.resolve(), indexer_module.SyncReport())
+        self.assertIsNone(issue)
+        self.assertEqual(str(resolved), str(expected))
+        self.assertTrue(ok)
+        self.assertEqual([str(item) for item in files], [str(expected)])
