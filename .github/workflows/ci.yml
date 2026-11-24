@@ -37,10 +37,11 @@ jobs:
           echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
       - shell: bash
         run: python -c "import sqlite3, sys; print(sys.version); sqlite3.connect(':memory:').enable_load_extension(False)"
-      - run: pip install -e ".[dev]"
       # PyTorch is large and slow to install; the default backend is ONNX. The
       # torch-dependent tests skip themselves when sentence-transformers is
       # absent, so only Linux installs it.
+      - if: runner.os != 'Linux'
+        run: pip install -e ".[dev]"
       - if: runner.os == 'Linux'
         run: pip install -e ".[dev,torch]"
       - if: runner.os == 'Linux' && matrix.python-version == '3.12'
@@ -128,7 +129,7 @@ jobs:
       - run: |
           python -m venv "$VENV"
           "$VENV/$BIN/python" -m pip install dist/*.whl
-          expected="seekr $(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          expected="seekr $(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])' | tr -d '\r')"
           version="$("$VENV/$BIN/seekr" --version | tr -d '\r')"
           echo "$version"
           test "$version" = "$expected"
@@ -162,7 +163,8 @@ jobs:
           echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
       - shell: bash
         run: python -c "import sqlite3, sys; print(sys.version); sqlite3.connect(':memory:').enable_load_extension(False)"
-      - run: pip install -e ".[dev]"
+      - if: runner.os != 'Linux'
+        run: pip install -e ".[dev]"
       - if: runner.os == 'Linux'
         run: pip install -e ".[dev,torch]"
       - id: hf-cache
