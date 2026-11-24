@@ -71,6 +71,23 @@ def _run_popup(rofi_body: str, seekr_body: str) -> subprocess.CompletedProcess[s
 
 
 class PickLineTests(unittest.TestCase):
+    def test_raw_windows_drive_path_is_taken_as_typed(self) -> None:
+        win = {"platform": "win32"}
+        self.assertEqual(
+            parse_pick_line(r"C:\Users\me\a.py:L10-12", **win), (r"C:\Users\me\a.py", "L10-12")
+        )
+        self.assertEqual(
+            parse_pick_line("C:/x/talk.vtt:00:01:02\tsnippet", **win), ("C:/x/talk.vtt", "00:01:02")
+        )
+        self.assertEqual(parse_pick_line(r"D:\notes\a.md", **win), (r"D:\notes\a.md", ""))
+        # Escaped pick lines still round-trip on Windows.
+        hit = _hit(r"C:\Users\me\a.md", "§Methods: Results")
+        self.assertEqual(
+            parse_pick_line(format_pick_line(hit), **win), (r"C:\Users\me\a.md", "§Methods: Results")
+        )
+        # Elsewhere a backslash is an escape and the first colon ends the path.
+        self.assertEqual(parse_pick_line(r"C:\\x:L1", platform="linux"), ("C", r"\x:L1"))
+
     def test_pick_line_roundtrip_with_colons_in_path(self) -> None:
         path = "/a/b:c/d.md"
         locator = "§Intro"

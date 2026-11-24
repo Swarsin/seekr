@@ -40,6 +40,8 @@ OPEN_SUCCESS_CODES: dict[str, frozenset[int]] = {"explorer.exe": frozenset({0, 1
 _MAX_SNIPPET_CHARS = 240
 _LINE_LOCATOR_RE = re.compile(r"L(\d+)(?:-\d+)?\Z")
 _PAGE_LOCATOR_RE = re.compile(r"p\.(\d+)\Z")
+# A raw (unescaped) Windows drive path: ``C:\notes\a.md`` or ``C:/notes/a.md``.
+_RAW_DRIVE_PATH_RE = re.compile(r"[A-Za-z]:[\\/]")
 
 _ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
 _SETEXT_UNDERLINE = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
@@ -174,14 +176,24 @@ def format_pick_line(hit: Hit) -> str:
     return f"{path}:{locator}\t{_display_snippet(hit.snippet)}"
 
 
-def parse_pick_line(line: str) -> tuple[str, str]:
+def parse_pick_line(line: str, *, platform: str = sys.platform) -> tuple[str, str]:
     """Return ``(path, locator)`` from a pick line or raw ``path:locator``.
 
     The first tab separates the optional snippet.  The path ends at the first
     colon that is not escaped, so raw unambiguous ``path:locator`` inputs and
     the escaped output of :func:`format_pick_line` both round-trip.
+
+    On Windows a raw ``C:\\dir\\file:locator`` is taken as typed: its
+    backslashes are separators, not escapes, and the drive colon does not end
+    the path.  (:func:`format_pick_line` escapes that colon, so its output
+    never looks like this.)
     """
     left = line.split("\t", 1)[0]
+    if platform == "win32" and _RAW_DRIVE_PATH_RE.match(left):
+        end = left.find(":", 2)
+        if end == -1:
+            return left, ""
+        return left[:end], left[end + 1 :]
     encoded_path, encoded_locator = _split_encoded_colon(left)
     return _unescape_value(encoded_path), _unescape_value(encoded_locator)
 
