@@ -1516,7 +1516,6 @@ def test_hit_dto_highlights(tmp_path: Path) -> None:
         assert hit.to_dict()["highlights"] == [[10, 17], [26, 34]]
 
 
-@legacy_daemon_only
 def test_search_with_spread_returns_groups(tmp_path: Path) -> None:
     docs = _root(tmp_path)
     _write_docs(
@@ -1582,56 +1581,56 @@ def test_search_with_spread_returns_groups(tmp_path: Path) -> None:
         assert no_hits.spread == ()
         assert no_hits.to_dict()["spread"] == []
 
-    daemon_calls: list[dict[str, object]] = []
-    daemon_main_hit = Hit(
-        chunk_id=101,
-        path="/course/ml/week4/a.md",
-        locator="L1",
-        loc_start=1.0,
-        snippet="entropy",
-        score=0.9,
-        kind="markdown",
-        module="ml",
-        week=4,
-    )
-    daemon_spread_hits = [
-        daemon_main_hit,
-        Hit(
-            chunk_id=102,
-            path="/course/ml/week2/b.md",
+    if LEGACY_DAEMON:  # the daemon half only exists on Linux
+        daemon_calls: list[dict[str, object]] = []
+        daemon_main_hit = Hit(
+            chunk_id=101,
+            path="/course/ml/week4/a.md",
             locator="L1",
             loc_start=1.0,
             snippet="entropy",
-            score=0.8,
+            score=0.9,
             kind="markdown",
             module="ml",
-            week=2,
-        ),
-    ]
-
-    def daemon_search(*args, **kwargs):
-        daemon_calls.append({"query": args[0], **kwargs})
-        return [daemon_main_hit] if len(daemon_calls) == 1 else daemon_spread_hits
-
-    with _service(
-        config_path,
-        tmp_path,
-        daemon_probe=lambda _path: True,
-        daemon_search=daemon_search,
-    ) as service:
-        res = service.search(
-            SearchRequest("entropy", mode="hybrid", k=1, per_file=1, spread=True)
+            week=4,
         )
-        assert len(daemon_calls) == 2
-        assert daemon_calls[1]["k"] == 30
-        assert daemon_calls[1]["per_file"] == 2
-        assert res.spread == (
-            {"module": "ml", "week": 2, "first": True, "chunk_ids": [102]},
-            {"module": "ml", "week": 4, "first": False, "chunk_ids": [101]},
-        )
+        daemon_spread_hits = [
+            daemon_main_hit,
+            Hit(
+                chunk_id=102,
+                path="/course/ml/week2/b.md",
+                locator="L1",
+                loc_start=1.0,
+                snippet="entropy",
+                score=0.8,
+                kind="markdown",
+                module="ml",
+                week=2,
+            ),
+        ]
+
+        def daemon_search(*args, **kwargs):
+            daemon_calls.append({"query": args[0], **kwargs})
+            return [daemon_main_hit] if len(daemon_calls) == 1 else daemon_spread_hits
+
+        with _service(
+            config_path,
+            tmp_path,
+            daemon_probe=lambda _path: True,
+            daemon_search=daemon_search,
+        ) as service:
+            res = service.search(
+                SearchRequest("entropy", mode="hybrid", k=1, per_file=1, spread=True)
+            )
+            assert len(daemon_calls) == 2
+            assert daemon_calls[1]["k"] == 30
+            assert daemon_calls[1]["per_file"] == 2
+            assert res.spread == (
+                {"module": "ml", "week": 2, "first": True, "chunk_ids": [102]},
+                {"module": "ml", "week": 4, "first": False, "chunk_ids": [101]},
+            )
 
 
-@legacy_daemon_only
 def test_hit_dto_location_windows_on_wsl(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path)
     hits = [
@@ -1674,6 +1673,9 @@ def test_hit_dto_location_windows_on_wsl(tmp_path: Path) -> None:
         daemon_probe=lambda _path: True,
         daemon_search=lambda *_args, **_kwargs: hits,
     ) as service:
+        # The daemon hook only injects fixed WSL paths; the location mapping
+        # under test is pure string work, so report a daemon on every host.
+        service._daemon_status = lambda: (True, tmp_path / "seekr.sock")
         with (
             mock.patch("seekr.platform_info.is_wsl", return_value=True),
             mock.patch("seekr.platform_info.read_mounts", return_value=mounts),

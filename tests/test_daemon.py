@@ -1263,13 +1263,27 @@ class LegacyDaemonSupportTests(unittest.TestCase):
             self.assertTrue(daemon.legacy_daemon_supported())
 
 
+def _highlighted_hit() -> Hit:
+    return Hit(
+        chunk_id=42,
+        path="/course/machine-learning/week4/trees.md",
+        locator="§Trees",
+        loc_start=12.0,
+        snippet="decision trees",
+        score=0.8125,
+        kind="markdown",
+        module="machine-learning",
+        week=4,
+        highlights=((9, 14),),
+    )
+
+
 class ModuleWeekDaemonTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
 
-    @requires_legacy_daemon
     def test_search_arguments_accept_module_and_week_range(self) -> None:
         args = daemon._search_arguments(
             {
@@ -1282,6 +1296,8 @@ class ModuleWeekDaemonTests(unittest.TestCase):
         self.assertEqual(args["module"], "machine-learning")
         self.assertEqual(args["week_range"], (2, 3))
 
+    @requires_legacy_daemon
+    def test_daemon_search_forwards_module_and_week_range(self) -> None:
         class _LabelFilterSearcher(_FakeSearcher):
             def search(
                 self,
@@ -1382,20 +1398,8 @@ class ModuleWeekDaemonTests(unittest.TestCase):
         unlabelled = _hit()
         self.assertEqual(client._hit_from_dict(daemon._hit_to_dict(unlabelled)), unlabelled)
 
-    @requires_legacy_daemon
     def test_daemon_hit_roundtrip_keeps_highlights(self) -> None:
-        hit = Hit(
-            chunk_id=42,
-            path="/course/machine-learning/week4/trees.md",
-            locator="§Trees",
-            loc_start=12.0,
-            snippet="decision trees",
-            score=0.8125,
-            kind="markdown",
-            module="machine-learning",
-            week=4,
-            highlights=((9, 14),),
-        )
+        hit = _highlighted_hit()
         wire = daemon._hit_to_dict(hit)
         self.assertEqual(wire["highlights"], [[9, 14]])
         self.assertEqual(client._hit_from_dict(wire), hit)
@@ -1416,6 +1420,10 @@ class ModuleWeekDaemonTests(unittest.TestCase):
                 self.assertRaises(client.DaemonError),
             ):
                 client._hit_from_dict(bad_wire)
+
+    @requires_legacy_daemon
+    def test_daemon_search_keeps_highlights_over_the_socket(self) -> None:
+        hit = _highlighted_hit()
 
         class _HighlightSearcher(_FakeSearcher):
             def search(self, *args: Any, **kwargs: Any) -> list[Hit]:
