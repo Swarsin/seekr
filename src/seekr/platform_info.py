@@ -10,7 +10,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 from . import pathnorm
@@ -155,8 +155,10 @@ def read_mounts(
     return parse_mounts(text)
 
 
-def _normalize_posix_path(value: Path | str) -> str:
-    raw = os.fspath(value)
+def _normalize_posix_path(value: PurePath | str) -> str:
+    # Mount tables hold POSIX paths; ``as_posix`` keeps a ``Path`` built on
+    # another host (``WindowsPath("/mnt/c")``) in that form.
+    raw = value.as_posix() if isinstance(value, PurePath) else os.fspath(value)
     if not raw:
         return ""
     normalized = posixpath.normpath(raw)
@@ -165,7 +167,7 @@ def _normalize_posix_path(value: Path | str) -> str:
     return normalized
 
 
-def mount_for(path: Path, mounts: Sequence[Mount]) -> Mount | None:
+def mount_for(path: PurePath | str, mounts: Sequence[Mount]) -> Mount | None:
     """Return the mount entry with the longest matching prefix for *path*."""
     target = _normalize_posix_path(path)
     if not target.startswith("/"):
@@ -270,14 +272,14 @@ def split_roots(
 
 def windows_path(path: str, mounts: Sequence[Mount]) -> str | None:
     """Convert a POSIX *path* on a Windows drive mount to ``X:\\...`` form."""
-    mount = mount_for(Path(path), mounts)
+    mount = mount_for(path, mounts)
     if mount is None:
         return None
     match = _WINDOWS_DRIVE_RE.fullmatch(mount.source)
     if match is None:
         return None
     drive = match.group(1)
-    target = _normalize_posix_path(Path(path))
+    target = _normalize_posix_path(path)
     mount_point = _normalize_posix_path(mount.mount_point)
     if target == mount_point:
         return f"{drive}:\\"

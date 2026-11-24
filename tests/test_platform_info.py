@@ -80,19 +80,21 @@ class PlatformInfoTests(unittest.TestCase):
         )
 
     def test_read_mounts_returns_empty_on_unreadable_file(self) -> None:
+        # /proc/mounts is the Linux source; name the platform so macOS (which
+        # runs ``mount``) and Windows (no table) hosts test the same branch.
         with mock.patch.object(Path, "read_text", side_effect=OSError("denied")):
-            self.assertEqual(read_mounts(), [])
+            self.assertEqual(read_mounts(platform="linux"), [])
 
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "missing-mounts"
             with mock.patch("seekr.platform_info._MOUNTS_PATH", missing):
-                self.assertEqual(read_mounts(), [])
+                self.assertEqual(read_mounts(platform="linux"), [])
 
             mounts_file = Path(tmp) / "mounts"
             mounts_file.write_text(MOUNTS, encoding="utf-8")
             with mock.patch("seekr.platform_info._MOUNTS_PATH", mounts_file):
                 self.assertEqual(
-                    read_mounts(),
+                    read_mounts(platform="linux"),
                     [
                         Mount(source="C:\\", mount_point="/mnt/c", fstype="9p"),
                         Mount(source="/dev/sdc", mount_point="/", fstype="ext4"),
@@ -146,11 +148,12 @@ class PlatformInfoTests(unittest.TestCase):
 
     def test_is_slow_path(self) -> None:
         mounts = parse_mounts(MOUNTS)
-        self.assertTrue(is_slow_path(Path("/mnt/c/Users/alice/notes.md"), mounts))
-        self.assertTrue(is_slow_path(Path("/mnt/c"), mounts))
-        self.assertFalse(is_slow_path(Path("/mnt/cd/notes.md"), mounts))
-        self.assertFalse(is_slow_path(Path("/home/alice/notes.md"), mounts))
-        self.assertFalse(is_slow_path(Path("relative/notes.md"), mounts))
+        linux = {"platform": "linux"}
+        self.assertTrue(is_slow_path(Path("/mnt/c/Users/alice/notes.md"), mounts, **linux))
+        self.assertTrue(is_slow_path(Path("/mnt/c"), mounts, **linux))
+        self.assertFalse(is_slow_path(Path("/mnt/cd/notes.md"), mounts, **linux))
+        self.assertFalse(is_slow_path(Path("/home/alice/notes.md"), mounts, **linux))
+        self.assertFalse(is_slow_path(Path("relative/notes.md"), mounts, **linux))
 
         for fstype in sorted(SLOW_FSTYPES):
             with self.subTest(fstype=fstype):
@@ -158,7 +161,9 @@ class PlatformInfoTests(unittest.TestCase):
                     Mount(source="/dev/sda1", mount_point="/", fstype="ext4"),
                     Mount(source="remote", mount_point="/mnt/remote", fstype=fstype),
                 ]
-                self.assertTrue(is_slow_path(Path("/mnt/remote/file.md"), slow_mounts))
+                self.assertTrue(
+                    is_slow_path(Path("/mnt/remote/file.md"), slow_mounts, **linux)
+                )
 
     def test_windows_path_pure(self) -> None:
         mounts = [
@@ -254,11 +259,15 @@ class SplitRootsTests(unittest.TestCase):
         mounts = parse_mounts(MOUNTS)
 
         native, polled = split_roots(
-            [Path("/home/a/notes"), Path("/mnt/c/Users/b"), Path("/srv/x")], mounts
+            [Path("/home/a/notes"), Path("/mnt/c/Users/b"), Path("/srv/x")],
+            mounts,
+            platform="linux",
         )
 
-        self.assertEqual(polled, [Path("/mnt/c/Users/b")])
-        self.assertEqual(native, [Path("/home/a/notes"), Path("/srv/x")])
+        # Roots come back resolved on the host (``/home`` is under
+        # ``/System/Volumes/Data`` on macOS).
+        self.assertEqual(polled, [resolve_root("/mnt/c/Users/b")])
+        self.assertEqual(native, [resolve_root("/home/a/notes"), resolve_root("/srv/x")])
 
 
 MACOS_MOUNT = (
@@ -343,14 +352,16 @@ class CrossPlatformSlowPathTests(unittest.TestCase):
         native, polled = split_roots(
             ["/Volumes/course/ml", "/Users/me/notes"], mounts, platform="darwin"
         )
-        self.assertEqual(polled, [Path("/Volumes/course/ml")])
-        self.assertEqual(native, [Path("/Users/me/notes")])
+        self.assertEqual(polled, [resolve_root("/Volumes/course/ml")])
+        self.assertEqual(native, [resolve_root("/Users/me/notes")])
 
 
 class ResolveRootTests(unittest.TestCase):
     def test_darwin_roots_are_nfc_and_linux_roots_unchanged(self) -> None:
         nfd = Path("/vol") / "Mo\u0301dulo"
+        nfc = Path("/vol") / "M\u00f3dulo"
+        # Compare with the host's own resolution (a drive letter on Windows).
         with mock.patch("seekr.pathnorm._PLATFORM", "darwin"):
-            self.assertEqual(str(resolve_root(nfd)), "/vol/M\u00f3dulo")
+            self.assertEqual(str(resolve_root(nfd)), str(nfc.resolve()))
         with mock.patch("seekr.pathnorm._PLATFORM", "linux"):
-            self.assertEqual(str(resolve_root(nfd)), str(nfd))
+            self.assertEqual(str(resolve_root(nfd)), str(nfd.resolve()))

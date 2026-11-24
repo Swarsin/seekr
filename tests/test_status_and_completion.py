@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import os
@@ -11,11 +12,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from _platform import requires_legacy_daemon
+from seekr import platform_info
 from seekr.cli import app
 from seekr.config import Config
 from seekr.embed import FakeEmbedder
 from seekr.indexer import Indexer
-from seekr.platform_info import Mount
+from seekr.platform_info import Mount, resolve_root
 from seekr.service_discovery import ServiceInfo
 from seekr.store import SCHEMA_VERSION, Store
 
@@ -34,6 +37,14 @@ def _has_fts5() -> bool:
 
 
 _NEEDS_REAL_STORE = _HAS_NUMPY and _HAS_SQLITE_VEC and _HAS_TYPER and _has_fts5()
+
+
+def _linux_mount_rules():
+    """Judge polled roots by the (mocked) Linux mount table on any host."""
+    return mock.patch(
+        "seekr.platform_info.split_roots",
+        functools.partial(platform_info.split_roots, platform="linux"),
+    )
 
 
 @unittest.skipUnless(_HAS_TYPER, "typer is not installed")
@@ -335,6 +346,7 @@ class PolishedStatusTests(unittest.TestCase):
                 ),
                 mock.patch("seekr.cli_index._service_status", return_value=service),
                 mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
+                _linux_mount_rules(),
             ):
                 running = CliRunner().invoke(app, ["status"])
             with (
@@ -348,15 +360,17 @@ class PolishedStatusTests(unittest.TestCase):
                     return_value={"running": False},
                 ),
                 mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
+                _linux_mount_rules(),
             ):
                 stopped = CliRunner().invoke(app, ["status"])
 
         self.assertEqual(running.exit_code, 0, running.output)
         self.assertIn("service: running at 127.0.0.1:8000", running.output)
-        self.assertIn(f"watch: {slow_root} (polling every 25s)", running.output)
+        self.assertIn(f"watch: {resolve_root(slow_root)} (polling every 25s)", running.output)
         self.assertNotIn(f"watch: {fast_root}", running.output)
         self.assertNotIn("watch:", stopped.output)
 
+    @requires_legacy_daemon
     def test_status_prints_polled_roots_when_daemon_running(self) -> None:
         from typer.testing import CliRunner
 
@@ -426,6 +440,7 @@ class PolishedStatusTests(unittest.TestCase):
             self.assertEqual(res_stopped.exit_code, 0, res_stopped.output)
             self.assertNotIn("polling every", res_stopped.output)
 
+    @requires_legacy_daemon
     def test_status_uses_live_daemon_polling_metadata(self) -> None:
         import threading
         import time
@@ -474,6 +489,7 @@ class PolishedStatusTests(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_TYPER, "typer is not installed")
 class MissingDbWatchStatusTests(unittest.TestCase):
+    @requires_legacy_daemon
     def test_status_without_db_prints_polled_roots_when_daemon_running(self) -> None:
         from typer.testing import CliRunner
 
