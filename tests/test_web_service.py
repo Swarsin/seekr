@@ -2410,6 +2410,8 @@ def test_similar_calls_shared_similarity_with_filters(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, roots=[_root(tmp_path)])
     _add_indexed_document(tmp_path / "index.db")
     seen: list[tuple[object, dict[str, object]]] = []
+    notes = str(tmp_path / "notes")  # absolute on every host
+    target_path = str(tmp_path / "notes" / "a.txt")
     hit = Hit(
         chunk_id=7,
         path="/notes/b.txt",
@@ -2428,10 +2430,10 @@ def test_similar_calls_shared_similarity_with_filters(tmp_path: Path) -> None:
         with mock.patch("seekr.cli_search.get_similar_hits", fake_similar):
             result = service.similar(
                 SimilarRequest(
-                    path="/notes/a.txt",
+                    path=target_path,
                     k=3,
                     per_file=2,
-                    path_prefix="/notes",
+                    path_prefix=notes,
                     kind="text",
                     since="7d",
                     module="ml",
@@ -2441,10 +2443,10 @@ def test_similar_calls_shared_similarity_with_filters(tmp_path: Path) -> None:
         assert [h.chunk_id for h in result.hits] == [7]
         assert result.took_ms >= 0.0
         target, kwargs = seen[0]
-        assert str(target) == "/notes/a.txt"
+        assert str(target) == target_path
         assert kwargs["k"] == 3
         assert kwargs["per_file"] == 2
-        assert kwargs["path_prefix"] == "/notes"
+        assert kwargs["path_prefix"] == notes
         assert kwargs["kind"] == "text"
         assert kwargs["since"] == "7d"
         assert kwargs["module"] == "ml"
@@ -2459,11 +2461,11 @@ def test_similar_validation_and_error_mapping(tmp_path: Path) -> None:
     with _service(config_path, tmp_path) as service:
         for bad in (
             SimilarRequest(path=""),
-            SimilarRequest(path="/a", k=0),
-            SimilarRequest(path="/a", k=51),
-            SimilarRequest(path="/a", per_file=11),
-            SimilarRequest(path="/a", kind="nonsense-kind"),
-            SimilarRequest(path="/a", since="not-a-date"),
+            SimilarRequest(path=str(tmp_path / "a"), k=0),
+            SimilarRequest(path=str(tmp_path / "a"), k=51),
+            SimilarRequest(path=str(tmp_path / "a"), per_file=11),
+            SimilarRequest(path=str(tmp_path / "a"), kind="nonsense-kind"),
+            SimilarRequest(path=str(tmp_path / "a"), since="not-a-date"),
         ):
             with pytest.raises(ApiError) as raised:
                 service.similar(bad)
@@ -2476,12 +2478,12 @@ def test_similar_validation_and_error_mapping(tmp_path: Path) -> None:
             mock.patch("seekr.cli_search.get_similar_hits", failing),
             pytest.raises(ApiError) as raised,
         ):
-            service.similar(SimilarRequest(path="/missing"))
+            service.similar(SimilarRequest(path=str(tmp_path / "missing")))
         assert _error_code(raised.value) == "index_unavailable"
 
         service.begin_shutdown()
         with pytest.raises(ApiError):
-            service.similar(SimilarRequest(path="/a"))
+            service.similar(SimilarRequest(path=str(tmp_path / "a")))
 
 
 def test_similar_runs_during_index_but_not_during_download(tmp_path: Path) -> None:
@@ -2492,13 +2494,13 @@ def test_similar_runs_during_index_but_not_during_download(tmp_path: Path) -> No
     ):
         service._begin_lane("index")
         try:
-            assert service.similar(SimilarRequest(path="/a")).hits == ()
+            assert service.similar(SimilarRequest(path=str(tmp_path / "a"))).hits == ()
         finally:
             service._end_lane()
         service._begin_lane("download")
         try:
             with pytest.raises(ApiError) as raised:
-                service.similar(SimilarRequest(path="/a"))
+                service.similar(SimilarRequest(path=str(tmp_path / "a")))
             assert _error_code(raised.value) == "busy"
         finally:
             service._end_lane()

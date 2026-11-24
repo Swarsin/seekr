@@ -16,6 +16,8 @@ existing indexes keep identical stored paths.
 
 from __future__ import annotations
 
+import ntpath
+import posixpath
 import sys
 import unicodedata
 from pathlib import Path
@@ -24,6 +26,7 @@ __all__ = [
     "canonical_path",
     "case_insensitive",
     "has_prefix",
+    "is_absolute",
     "normalize_unicode",
     "os_path",
     "path_separator",
@@ -78,6 +81,18 @@ def _comparable(value: str, platform: str | None) -> str:
     if case_insensitive(platform):
         value = value.casefold()
     return value
+
+
+def is_absolute(path: str, *, platform: str | None = None) -> bool:
+    """Return whether *path* names one location regardless of the current directory.
+
+    On Windows that needs a drive (``C:\\x``) or a UNC share
+    (``\\\\server\\share\\x``): a rooted ``\\x`` depends on the current drive.
+    Python 3.13 already reads ``os.path.isabs`` this way; older versions do not.
+    """
+    if _platform(platform) == "win32":
+        return ntpath.isabs(path) and bool(ntpath.splitdrive(path)[0])
+    return posixpath.isabs(path)
 
 
 def same_path(a: Path | str, b: Path | str, *, platform: str | None = None) -> bool:

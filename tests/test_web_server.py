@@ -224,6 +224,16 @@ def drip_until_closed(
         return None, bytes(received)
 
 
+
+# An absolute directory in the host's own form (drive-qualified on Windows,
+# where a rooted "/tmp" is not absolute); the fake backend never opens it.
+_TMP = os.path.abspath(os.path.join(os.sep, "tmp"))
+
+
+def _abs(*parts: str) -> str:
+    return os.path.join(_TMP, *parts)
+
+
 @contextmanager
 def running_server(
     backend: FakeWebBackend | None = None,
@@ -2604,7 +2614,7 @@ def test_new_service_routes_require_token_and_post(path: str, body: bytes) -> No
 
 def test_token_only_request_without_origin_is_allowed_for_service_routes() -> None:
     with running_server() as (server, backend):
-        response = _post(server, "/api/similar", {"path": "/tmp/a.md"})
+        response = _post(server, "/api/similar", {"path": _abs("a.md")})
         assert response.status == 200
         assert backend.calls[-1][0] == "similar"
 
@@ -2651,20 +2661,20 @@ def test_run_web_injected_token_is_returned_by_session() -> None:
 
 def test_similar_happy_path_maps_request_and_response() -> None:
     with running_server() as (server, backend):
-        default = _post(server, "/api/similar", {"path": "/tmp/opencode/a.md"})
+        default = _post(server, "/api/similar", {"path": _abs("opencode", "a.md")})
         assert default.status == 200
         assert default.json() == SEARCH_RESULT.to_dict()
         sent = backend.calls[-1][1]["request"]
-        assert sent == SimilarRequest(path="/tmp/opencode/a.md")
+        assert sent == SimilarRequest(path=_abs("opencode", "a.md"))
 
         full = _post(
             server,
             "/api/similar",
             {
-                "path": "/tmp/opencode/a.md",
+                "path": _abs("opencode", "a.md"),
                 "k": 4,
                 "per_file": 3,
-                "path_prefix": "/tmp/opencode",
+                "path_prefix": _abs("opencode"),
                 "kind": "markdown",
                 "since": "7d",
                 "module": "ml",
@@ -2673,10 +2683,10 @@ def test_similar_happy_path_maps_request_and_response() -> None:
         )
         assert full.status == 200
         assert backend.calls[-1][1]["request"] == SimilarRequest(
-            path="/tmp/opencode/a.md",
+            path=_abs("opencode", "a.md"),
             k=4,
             per_file=3,
-            path_prefix="/tmp/opencode",
+            path_prefix=_abs("opencode"),
             kind="markdown",
             since="7d",
             module="ml",
@@ -2714,7 +2724,7 @@ def test_similar_validation_errors(payload: dict[str, Any]) -> None:
 def test_similar_backend_error_is_enveloped() -> None:
     backend = FakeWebBackend(errors={"similar": ApiError(409, "busy", "busy now")})
     with running_server(backend) as (server, _):
-        response = _post(server, "/api/similar", {"path": "/tmp/a"})
+        response = _post(server, "/api/similar", {"path": _abs("a")})
         assert response.status == 409
         assert response.json()["error"]["code"] == "busy"
 
@@ -2733,10 +2743,10 @@ def test_shutdown_route_calls_backend_and_returns_202() -> None:
 
 def test_index_paths_route_maps_request_and_returns_job() -> None:
     with running_server() as (server, backend):
-        response = _post(server, "/api/index/paths", {"paths": ["/tmp/a", "/tmp/b.md"]})
+        response = _post(server, "/api/index/paths", {"paths": [_abs("a"), _abs("b.md")]})
         assert response.status == 202
         assert response.json() == {"job_id": "job-index-paths-fixture"}
-        assert backend.calls[-1] == ("start_index_paths", {"paths": ["/tmp/a", "/tmp/b.md"]})
+        assert backend.calls[-1] == ("start_index_paths", {"paths": [_abs("a"), _abs("b.md")]})
 
 
 @pytest.mark.parametrize(

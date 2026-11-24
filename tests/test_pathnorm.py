@@ -10,6 +10,7 @@ from seekr.pathnorm import (
     canonical_path,
     case_insensitive,
     has_prefix,
+    is_absolute,
     normalize_unicode,
     os_path,
     path_separator,
@@ -110,3 +111,23 @@ class OsPathTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IsAbsoluteTests(unittest.TestCase):
+    def test_windows_needs_a_drive_or_unc_share(self) -> None:
+        win = {"platform": "win32"}
+        for path in (r"C:\x", "C:/x", r"\\srv\share\x", "//srv/share/x", r"\\?\C:\x"):
+            with self.subTest(path=path):
+                self.assertTrue(is_absolute(path, **win))
+        # Rooted but drive-less, drive-relative and relative paths depend on
+        # the current drive or directory.
+        for path in (r"\x", "/tmp/a", "C:x", "x", ""):
+            with self.subTest(path=path):
+                self.assertFalse(is_absolute(path, **win))
+
+    def test_posix_is_a_leading_slash(self) -> None:
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform):
+                self.assertTrue(is_absolute("/tmp/a", platform=platform))
+                self.assertFalse(is_absolute("tmp/a", platform=platform))
+                self.assertFalse(is_absolute(r"C:\x", platform=platform))

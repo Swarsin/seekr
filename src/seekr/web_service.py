@@ -1866,7 +1866,7 @@ class WebService:
     def similar(self, request: SimilarRequest) -> SearchResult:
         self._reject_if_shutting_down()
         started = time.monotonic()
-        if type(request.path) is not str or not os.path.isabs(request.path):
+        if type(request.path) is not str or not pathnorm.is_absolute(request.path):
             raise ApiError(
                 400, "invalid_request", "path must be an absolute path",
                 {"path": "path must be an absolute path"},
@@ -2032,7 +2032,7 @@ class WebService:
             if type(raw) is not str or not raw.strip():
                 message = "each path must be a non-empty string"
                 raise ApiError(400, "invalid_request", message, {"paths": message})
-            if not os.path.isabs(raw):
+            if not pathnorm.is_absolute(raw):
                 message = "each path must be an absolute path"
                 raise ApiError(400, "invalid_request", message, {"paths": message})
             target = Path(raw)

@@ -15,7 +15,6 @@ import hmac
 import importlib.resources
 import json
 import logging
-import os
 import re
 import secrets
 import signal
@@ -29,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlsplit
 
+from . import pathnorm
 from .web_contract import (
     ASSET_ALLOWLIST,
     ASSET_MIME_TYPES,
@@ -340,7 +340,7 @@ def _validate_similar(body: dict[str, Any]) -> SimilarRequest:
         {"path", "k", "per_file", "path_prefix", "kind", "since", "module", "week"},
     )
     path = _require_string(body, "path")
-    if not os.path.isabs(path):
+    if not pathnorm.is_absolute(path):
         raise _invalid("path must be an absolute path", field="path")
     k = _optional_int(body, "k", 10, LIMITS["k_min"], LIMITS["k_max"])
     per_file = _optional_int(
@@ -376,7 +376,7 @@ def _validate_index_paths(body: dict[str, Any]) -> list[str]:
                 f"each path must be at most {LIMITS['root_path_bytes']} bytes",
                 field="paths",
             )
-        if not os.path.isabs(item):
+        if not pathnorm.is_absolute(item):
             raise _invalid("each path must be an absolute path", field="paths")
         paths.append(item)
     return paths
