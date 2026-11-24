@@ -164,6 +164,15 @@ def _is_within(path: Path, root: Path) -> bool:
     return True
 
 
+# Meta key holding the wall-clock time (ns) of the latest document write.  A
+# file whose mtime is not clearly older than that write is "racily clean": an
+# equal-size edit within the filesystem's timestamp granularity (a 15.6 ms
+# tick on Windows, 2 s on FAT/SMB, a few ms on Linux) keeps (mtime, size)
+# unchanged, so such files are hashed instead of trusting the signature.
+_LAST_WRITE_META = "last_document_write_ns"
+_RACY_WINDOW_NS = 2_000_000_000
+
+
 def _signature(stat_result: os.stat_result) -> tuple[int, int]:
     return int(stat_result.st_mtime_ns), int(stat_result.st_size)
 
@@ -240,6 +249,8 @@ class Indexer:
         self.cfg = cfg
         self._last_report: SyncReport | None = None
         self._last_outcome: _Outcome | None = None
+        # Set for the duration of sync(); None means "read it when needed".
+        self._racy_cutoff_ns: int | None = None
         self._ignore_cache_key: tuple[str, ...] | None = None
         self._ignore_exact_parts: frozenset[str] = frozenset()
         self._ignore_glob_patterns: tuple[str, ...] = ()
@@ -328,6 +339,7 @@ class Indexer:
         report = SyncReport()
         seen: set[str] = set()
         healthy_roots: list[Path] = []
+        self._racy_cutoff_ns = self._load_racy_cutoff()
 
         try:
             try:
@@ -373,6 +385,7 @@ class Indexer:
             for root in self._unique_roots(healthy_roots):
                 self._prune_root(root, seen, report)
         finally:
+            self._racy_cutoff_ns = None
             if report.missing_grammars:
                 report.missing_grammars = dict(sorted(report.missing_grammars.items()))
                 first_root = (
@@ -510,6 +523,7 @@ class Indexer:
                         doc is not None
                         and (doc.mtime_ns, doc.size) == _signature(before_opt)
                         and doc.kind == kind
+                        and self._signature_trusted(doc)
                     ):
                         report.unchanged += 1
                         continue
@@ -800,6 +814,7 @@ class Indexer:
                 and doc is not None
                 and (doc.mtime_ns, doc.size) == signature
                 and doc.kind == kind
+                and self._signature_trusted(doc)
             ):
                 outcome.result = "unchanged"
                 return None, outcome
@@ -1022,7 +1037,41 @@ class Indexer:
         ]
         return self._write_prepared_single(prepared, stored, docs_cache=docs_cache)
 
+    def _load_racy_cutoff(self) -> int:
+        """Return the mtime at or above which a stored signature is not trusted."""
+        try:
+            raw = self.store.get_meta_value(_LAST_WRITE_META)
+        except Exception:  # an unreadable marker: hash rather than guess
+            return -(2**63)
+        if raw is None:
+            # An index from before the marker existed: trust signatures, as
+            # earlier versions did, until the next write records one.
+            return 2**63
+        try:
+            return int(raw) - _RACY_WINDOW_NS
+        except (TypeError, ValueError):
+            return -(2**63)
+
+    def _signature_trusted(self, doc: DocRow) -> bool:
+        cutoff = self._racy_cutoff_ns
+        if cutoff is None:
+            cutoff = self._load_racy_cutoff()
+        return doc.mtime_ns < cutoff
+
     def _upsert_document(
+        self,
+        path: str,
+        mtime_ns: int,
+        size: int,
+        sha256: str,
+        kind: str,
+        label: CourseLabel,
+    ) -> int:
+        doc_id = self._upsert_document_row(path, mtime_ns, size, sha256, kind, label)
+        self.store.set_meta_value(_LAST_WRITE_META, str(time.time_ns()))
+        return doc_id
+
+    def _upsert_document_row(
         self,
         path: str,
         mtime_ns: int,

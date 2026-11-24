@@ -14,6 +14,7 @@ import importlib.util
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -387,6 +388,38 @@ class SyncTests(_IndexerTestCase):
         doc = self.stored(path)
         assert doc is not None
         self.assertEqual(doc.mtime_ns, new_mtime)
+
+    def test_equal_size_edit_within_one_timestamp_tick_is_reindexed(self) -> None:
+        # Windows (15.6 ms ticks), FAT/SMB (2 s) and coarse Linux clocks can
+        # leave mtime unchanged by a quick rewrite; with the same size the
+        # (mtime, size) signature cannot see the edit, so a file modified
+        # around the last index write must be hashed.
+        path = self.write("notes.txt", "alpha bravo charlie")
+        self.indexer.sync([self.root])
+        before = path.stat()
+        path.write_text("alpha delta charlie", encoding="utf-8")
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))  # same tick
+        self.assertEqual(path.stat().st_size, before.st_size)
+
+        report = self.indexer.sync([self.root])
+
+        self.assertEqual((report.added, report.updated, report.unchanged), (0, 1, 0))
+        doc = self.stored(path)
+        assert doc is not None
+        self.assertEqual(doc.sha256, indexer_module.Indexer._sha256_file(path))
+
+    def test_settled_unchanged_files_skip_hashing(self) -> None:
+        path = self.write("old.txt", "alpha bravo charlie")
+        hour_ago = time.time_ns() - 3600 * 1_000_000_000
+        os.utime(path, ns=(hour_ago, hour_ago))
+        self.indexer.sync([self.root])
+
+        with mock.patch.object(
+            indexer_module.Indexer, "_sha256_file", side_effect=AssertionError("hashed")
+        ):
+            report = self.indexer.sync([self.root])
+
+        self.assertEqual(report.unchanged, 1)
 
     def test_edit_one_paragraph_embeds_only_changed_chunks(self) -> None:
         first = _short_paragraph("alpha")
