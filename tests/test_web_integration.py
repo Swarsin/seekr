@@ -180,7 +180,8 @@ def _write_config(
         lines.append(
             "roots = [" + ", ".join(json.dumps(str(root)) for root in roots) + "]\n"
         )
-    path.write_text("".join(lines) + raw, encoding="utf-8")
+    # newline="": the bytes on disk are exactly the LF text above (no CRLF on Windows).
+    path.write_text("".join(lines) + raw, encoding="utf-8", newline="")
     return path
 
 
