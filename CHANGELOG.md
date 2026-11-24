@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `seekr open C:\path\file:L10` works on Windows; a raw drive path was cut at the drive colon.
 - `seekr init --demo` prints its `SEEKR_CONFIG` hint in PowerShell syntax on Windows.
 - Service routes treat only drive and UNC paths as absolute on Windows, the same on every Python version (Python 3.13 already did; 3.11 and 3.12 accepted a drive-less `\x`).
-- An edit that keeps a file's size and lands within one filesystem timestamp tick of the last index is no longer missed: recently modified files are hashed instead of trusting an unchanged mtime and size.
+- An edit that keeps a file's size and lands within one filesystem timestamp tick of indexing it is now caught when the file is checked again soon after, before the index records other writes more than 2 s later (for example, a quick re-save picked up by the next sync or watcher event). Files modified within 2 s of the latest index write are hashed instead of trusting an unchanged mtime and size. Before, such an edit was always missed.
 - Renaming a just-written file on macOS no longer re-embeds it.
 
 ## [0.2.0] - 2026-11-23

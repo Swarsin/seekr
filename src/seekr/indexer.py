@@ -164,11 +164,15 @@ def _is_within(path: Path, root: Path) -> bool:
     return True
 
 
-# Meta key holding the wall-clock time (ns) of the latest document write.  A
-# file whose mtime is not clearly older than that write is "racily clean": an
-# equal-size edit within the filesystem's timestamp granularity (a 15.6 ms
-# tick on Windows, 2 s on FAT/SMB, a few ms on Linux) keeps (mtime, size)
-# unchanged, so such files are hashed instead of trusting the signature.
+# Meta key holding the wall-clock time (ns) of the latest write of any
+# document.  An equal-size edit within the filesystem's timestamp granularity
+# (a 15.6 ms tick on Windows, 2 s on FAT/SMB, a few ms on Linux) keeps
+# (mtime, size) unchanged.  So a file whose mtime is within _RACY_WINDOW_NS of
+# that marker is hashed instead of trusted.  The marker is store-wide, not per
+# document: the edit is caught only if the file is checked again before later
+# writes move the marker more than the window past its mtime (for example, a
+# quick re-save picked up by the next sync or watcher event).  During a long
+# sync that keeps writing other documents, an earlier file's window can expire.
 _LAST_WRITE_META = "last_document_write_ns"
 _RACY_WINDOW_NS = 2_000_000_000
 
