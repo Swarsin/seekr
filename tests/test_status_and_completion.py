@@ -16,6 +16,7 @@ from seekr.config import Config
 from seekr.embed import FakeEmbedder
 from seekr.indexer import Indexer
 from seekr.platform_info import Mount
+from seekr.service_discovery import ServiceInfo
 from seekr.store import SCHEMA_VERSION, Store
 
 _HAS_TYPER = importlib.util.find_spec("typer") is not None
@@ -84,6 +85,16 @@ class PolishedStatusTests(unittest.TestCase):
             with (
                 mock.patch("seekr.cli_index._load_config", return_value=cfg),
                 mock.patch("seekr.cli_index._daemon_status", return_value=(True, sock)),
+                mock.patch(
+                    "seekr.service.find_running_service",
+                    return_value=ServiceInfo(
+                        pid=4242,
+                        port=8123,
+                        token="t",
+                        version="9.9.9",
+                        started_at="2026-01-01T00:00:00+00:00",
+                    ),
+                ),
             ):
                 runner = CliRunner()
                 text_res = runner.invoke(app, ["status"])
@@ -100,7 +111,10 @@ class PolishedStatusTests(unittest.TestCase):
                 text_res.output,
             )
             self.assertIn("by kind: code=1, markdown=1", text_res.output)
-            self.assertIn(f"daemon: running ({sock})", text_res.output)
+            self.assertIn(
+                "service: running at 127.0.0.1:8123 (pid 4242, version 9.9.9)",
+                text_res.output,
+            )
 
             self.assertEqual(json_res.exit_code, 0, json_res.output)
             parsed = json.loads(json_res.stdout)
@@ -115,6 +129,10 @@ class PolishedStatusTests(unittest.TestCase):
             self.assertEqual(parsed["schema_version"], SCHEMA_VERSION)
             self.assertEqual(parsed["embed_backend"], cfg.embed_backend)
             self.assertEqual(parsed["daemon"], {"running": True, "socket": str(sock)})
+            self.assertEqual(
+                parsed["service"],
+                {"running": True, "port": 8123, "pid": 4242, "version": "9.9.9"},
+            )
             self.assertGreater(parsed["size_bytes"], 0)
 
     def test_status_json_on_missing_database(self) -> None:
@@ -179,9 +197,8 @@ class PolishedStatusTests(unittest.TestCase):
                 json_result = runner.invoke(app, ["status", "--json"])
 
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("daemon: stopped", result.output)
-        self.assertIn("socket path too long", result.output)
-        self.assertIn(str(runtime_dir / "seekr.sock"), result.output)
+        self.assertIn("service: not running", result.output)
+        self.assertNotIn("daemon:", result.output)
 
         self.assertEqual(json_result.exit_code, 0, json_result.output)
         parsed = json.loads(json_result.stdout)
@@ -217,9 +234,8 @@ class PolishedStatusTests(unittest.TestCase):
                 result = CliRunner().invoke(app, ["status"])
 
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("daemon: stopped", result.output)
-        self.assertIn("socket path too long", result.output)
-        self.assertIn(str(runtime_dir / "seekr.sock"), result.output)
+        self.assertIn("service: not running", result.output)
+        self.assertNotIn("daemon:", result.output)
 
     def _create_course_index(self, base: Path) -> Config:
         root = base / "course"

@@ -2,7 +2,7 @@
 
 Seekr’s local web interface lets you add or remove folders, download the local search model, update the index, search your files with course filters and cross-course spread summaries, preview matching passages and PDF pages, and open source files directly from results. It is a single-user tool started by one local command (`seekr web`) and uses the same settings and index as the `seekr` CLI and MCP server; there is no separate web-only index. The [web API contract](web-api.md) documents the HTTP API.
 
-**Words used here.** The **index** is Seekr’s local SQLite database of extracted text, passages, and vectors. The **embedding model** is a local model that turns text into vectors for meaning search; the default is `BAAI/bge-small-en-v1.5`. **Hybrid** search combines exact-word and meaning-based matches. The optional **daemon** (`seekr daemon`) is a background process that keeps the model warm and maintains the index.
+**Words used here.** The **index** is Seekr’s local SQLite database of extracted text, passages, and vectors. The **embedding model** is a local model that turns text into vectors for meaning search; the default is `BAAI/bge-small-en-v1.5`. **Hybrid** search combines exact-word and meaning-based matches. The **service** (`seekr service start`) is a background process that serves this web interface, keeps the model warm, and keeps the index current. `seekr web` starts it for you.
 
 ## Start and stop
 
@@ -12,12 +12,13 @@ From a terminal where Seekr is installed, run:
 seekr web
 ```
 
-By default it serves on port 8000 and prints the exact address to open:
+`seekr web` starts the background service if it is not already running, prints the address to open, and returns to your prompt:
 
 ```text
-Seekr web interface: http://127.0.0.1:8000
-Press Ctrl+C to stop.
+seekr is running at http://127.0.0.1:8000/
 ```
+
+The service keeps running after the command exits. If one is already running, `seekr web` reuses it and prints its actual address (which can differ from `--port`). If the service does not come up within 10 seconds the command fails; run `seekr service start` to see the error. Stop the service with `seekr service stop`, and check it with `seekr service status` or `seekr status`. To serve in the terminal instead, with the older Ctrl+C behaviour, use `seekr web --foreground`.
 
 Open the printed `http://127.0.0.1:<port>` address. Use it exactly: the server is loopback-only and rejects `http://localhost:<port>`, other host names, and other machines. There is no option to expose it on your LAN or the public internet.
 
@@ -32,7 +33,7 @@ seekr web --port 0
 seekr web --open-browser
 ```
 
-`--open-browser` is a convenience. On a headless machine, or if no browser can be launched, Seekr prints why and keeps the server running; open the printed address yourself. To stop, press Ctrl+C in the terminal running `seekr web`. If an index update is active, Seekr waits for it to finish before exiting, so a large scan can delay shutdown. A second Ctrl+C warns but does not cancel the work. Closing the browser tab neither stops the server nor cancels an index job.
+`--open-browser` is a convenience. On a headless machine, or if no browser can be launched, Seekr prints why and keeps the service running; open the printed address yourself. With `--foreground`, press Ctrl+C in the terminal running `seekr web` to stop. If an index update is active, Seekr waits for it to finish before exiting, so a large scan can delay shutdown. A second Ctrl+C warns but does not cancel the work. Closing the browser tab neither stops the server nor cancels an index job.
 
 ## First run: choose folders
 
@@ -145,7 +146,7 @@ If nothing is indexed, a search returns no hits; **Index status** explains wheth
 
 ## If a background daemon is running
 
-`seekr daemon` is optional. It watches configured folders, maintains the index, and keeps a model warm. The page only probes whether the daemon socket is live; it never starts, stops, or reconfigures the daemon. When the daemon is present, **Background service** shows **Running** and **Update index** is disabled with an explanation. The page never claims to detect live daemon indexing activity; socket presence is the only signal.
+`seekr daemon` is deprecated and now runs `seekr service start` in the foreground. This section describes the older standalone daemon that a foreground `seekr web --foreground` page may coexist with. `seekr daemon` is optional. It watches configured folders, maintains the index, and keeps a model warm. The page only probes whether the daemon socket is live; it never starts, stops, or reconfigures the daemon. When the daemon is present, **Background service** shows **Running** and **Update index** is disabled with an explanation. The page never claims to detect live daemon indexing activity; socket presence is the only signal.
 
 To update from the page or remove a folder, stop the daemon first: press Ctrl+C in its terminal, or run `systemctl --user stop seekr.service` if you installed the [`contrib/seekr.service`](../contrib/seekr.service) systemd user unit. Then choose **Refresh**; **Update index** and **Remove** become available. Adding a folder while the daemon runs succeeds but warns that the daemon needs a restart; restart `seekr daemon` (or the systemd unit) so it sees the new folder for daemon-backed searches. The page never restarts it. If the daemon is reachable but fails a search, the page shows an error and suggests restarting it or stopping it so the page searches the local index directly. See [What it does](../README.md#what-it-does).
 

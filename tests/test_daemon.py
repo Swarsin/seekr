@@ -1021,13 +1021,13 @@ class DaemonRunnerTests(unittest.TestCase):
 
 
 class ServiceUnitTests(unittest.TestCase):
-    def test_service_unit_runs_seekr_daemon_as_a_user_unit(self) -> None:
+    def test_service_unit_runs_seekr_service_as_a_user_unit(self) -> None:
         service = (
             Path(__file__).resolve().parents[1] / "contrib" / "seekr.service"
         ).read_text(encoding="utf-8")
 
         self.assertIn("ExecStart=", service)
-        self.assertIn("seekr daemon", service)
+        self.assertIn("seekr service start", service)
         self.assertIn("WantedBy=default.target", service)
 
 

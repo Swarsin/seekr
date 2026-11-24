@@ -302,14 +302,31 @@ def _daemon_status() -> tuple[bool, Path]:
         return False, sock
 
 
-def _format_daemon_status(daemon_running: bool, sock: Path) -> str:
-    if daemon_running:
-        return f"daemon: running ({sock})"
-    from .daemon import socket_path_problem
+def _service_status() -> dict[str, Any]:
+    """Report the unified service (liveness-probed) for ``seekr status``."""
+    try:
+        from .service import find_running_service
 
-    if socket_path_problem(sock) is not None:
-        return f"daemon: stopped (socket path too long: {sock})"
-    return f"daemon: stopped ({sock})"
+        info = find_running_service()
+    except Exception:  # noqa: BLE001 - status must never fail on discovery
+        info = None
+    if info is None:
+        return {"running": False, "port": None, "pid": None, "version": None}
+    return {
+        "running": True,
+        "port": info.port,
+        "pid": info.pid,
+        "version": info.version,
+    }
+
+
+def _format_service_status(service: dict[str, Any]) -> str:
+    if service.get("running"):
+        return (
+            f"service: running at 127.0.0.1:{service['port']} "
+            f"(pid {service['pid']}, version {service['version']})"
+        )
+    return "service: not running"
 
 
 def _resolve_root(root: Path) -> Path:
@@ -360,8 +377,10 @@ def _polled_watch_info(
     return polled, cfg.poll_interval_seconds
 
 
-def _echo_daemon_status(daemon_running: bool, sock: Path, cfg: Config) -> None:
-    typer.echo(_format_daemon_status(daemon_running, sock))
+def _echo_daemon_status(
+    daemon_running: bool, sock: Path, cfg: Config, service: dict[str, Any]
+) -> None:
+    typer.echo(_format_service_status(service))
     polled_roots, poll_interval = _polled_watch_info(daemon_running, sock, cfg)
     for root in polled_roots:
         typer.echo(f"watch: {root} (polling every {poll_interval}s)")
@@ -406,10 +425,10 @@ def status(
     as_json: bool = typer.Option(
         False,
         "--json",
-        help="Emit index and daemon status as JSON.",
+        help="Emit index and service status as JSON.",
     ),
 ) -> None:
-    """Print index counts, model metadata, disk size and daemon status."""
+    """Print index counts, model metadata, disk size and service status."""
     json_flag = as_json if isinstance(as_json, bool) else False
     try:
         cfg = _load_config()
@@ -419,6 +438,7 @@ def status(
             if dim is None:
                 if not db_path.exists():
                     daemon_running, sock = _daemon_status()
+                    service = _service_status()
                     if json_flag:
                         typer.echo(
                             json.dumps(
@@ -440,6 +460,7 @@ def status(
                                         "running": daemon_running,
                                         "socket": str(sock),
                                     },
+                                    "service": service,
                                 },
                                 ensure_ascii=False,
                                 indent=2,
@@ -454,7 +475,7 @@ def status(
                         f"model: {cfg.embed_model} "
                         f"(quant={cfg.vector_quant}, backend={cfg.embed_backend})"
                     )
-                    _echo_daemon_status(daemon_running, sock, cfg)
+                    _echo_daemon_status(daemon_running, sock, cfg, service)
                     return
                 dim = _build_embedder(cfg).dim
 
@@ -477,6 +498,7 @@ def status(
 
     size_bytes = _db_size_bytes(db_path)
     daemon_running, sock = _daemon_status()
+    service = _service_status()
     if json_flag:
         typer.echo(
             json.dumps(
@@ -502,6 +524,7 @@ def status(
                         "running": daemon_running,
                         "socket": str(sock),
                     },
+                    "service": service,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -525,7 +548,7 @@ def status(
         typer.echo(f"by kind: {summary}")
     for line in _format_course_lines(course_rows):
         typer.echo(line)
-    _echo_daemon_status(daemon_running, sock, cfg)
+    _echo_daemon_status(daemon_running, sock, cfg, service)
 
 
 def register(app: typer.Typer) -> None:

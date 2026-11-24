@@ -9,6 +9,7 @@ import sys
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from _cli_output import strip_ansi
 
@@ -185,3 +186,38 @@ class CliRegistrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(_HAS_TYPER, "typer is not installed")
+class DaemonAliasTests(unittest.TestCase):
+    def test_daemon_warns_ignores_options_and_runs_service(self) -> None:
+        from typer.testing import CliRunner
+
+        from seekr.cli import app
+
+        calls: list[dict[str, object]] = []
+
+        class FakeService:
+            def __init__(self, **kwargs: object) -> None:
+                calls.append(kwargs)
+
+            def start(self) -> int:
+                return 4321
+
+            def serve_forever(self) -> None:
+                return None
+
+        with mock.patch("seekr.cli_service._create_service", FakeService):
+            result = CliRunner().invoke(
+                app, ["daemon", "--socket", "/tmp/x.sock", "--debounce", "2"]
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn(
+            'warning: "seekr daemon" is deprecated and will be removed in 0.4.0; '
+            'use "seekr service start"',
+            result.output,
+        )
+        self.assertIn("--socket and --debounce are ignored", result.output)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["port"], 0)

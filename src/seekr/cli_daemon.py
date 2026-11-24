@@ -36,6 +36,12 @@ if TYPE_CHECKING:
 __all__ = ["register", "run_daemon"]
 
 
+_DEPRECATION_WARNING = (
+    'warning: "seekr daemon" is deprecated and will be removed in 0.4.0; '
+    'use "seekr service start"'
+)
+
+
 def _noop() -> None:
     return None
 
@@ -192,23 +198,26 @@ def run_daemon(
 def _build_daemon_command(typer_module: Any) -> Any:
     def daemon(
         socket_file: str | None = typer_module.Option(
-            None, "--socket", help="Unix socket path to serve on."
+            None, "--socket", help="Ignored; kept for compatibility."
         ),
-        debounce_s: float = typer_module.Option(
-            1.0, "--debounce", min=0.0, help="Per-path debounce in seconds."
+        debounce_s: float | None = typer_module.Option(
+            None, "--debounce", min=0.0, help="Ignored; kept for compatibility."
         ),
     ) -> None:
-        """Watch configured roots and serve warm searches until interrupted."""
-        target = Path(socket_file).expanduser() if socket_file else None
-        try:
-            run_daemon(sock_path=target, debounce_s=debounce_s)
-        except KeyboardInterrupt:
-            return
-        except Exception as exc:
-            typer_module.echo(f"seekr daemon: {exc}", err=True)
-            raise typer_module.Exit(code=1) from exc
+        """Deprecated alias for `seekr service start`."""
+        from .cli_service import _build_start
 
-    daemon.__doc__ = "Watch configured roots and serve warm searches until interrupted."
+        typer_module.echo(_DEPRECATION_WARNING, err=True)
+        if socket_file is not None or debounce_s is not None:
+            typer_module.echo(
+                "note: --socket and --debounce are ignored by the service",
+                err=True,
+            )
+        _build_start(typer_module)(
+            port=0, model_dir=None, handshake_stdout=False, watch_stdin=False
+        )
+
+    daemon.__doc__ = "Deprecated alias for `seekr service start`."
     return daemon
 
 

@@ -9,7 +9,10 @@ loaded until the command actually runs.
 from __future__ import annotations
 
 import errno
+import subprocess
+import sys
 import threading
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -48,6 +51,91 @@ def _run_server(
     )
 
 
+_START_WAIT_SECONDS = 10.0
+_POLL_SECONDS = 0.1
+
+
+def _find_service() -> Any:
+    """Return the live service's discovery record, or None (patchable)."""
+    from .service import find_running_service
+
+    return find_running_service()
+
+
+def _spawn_kwargs(platform: str | None = None) -> dict[str, Any]:
+    """Popen options that detach the service from this terminal."""
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if (platform if platform is not None else sys.platform) == "win32":
+        kwargs["creationflags"] = getattr(
+            subprocess, "DETACHED_PROCESS", 0x00000008
+        ) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    else:
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def _spawn_service(port: int, platform: str | None = None) -> Any:
+    """Start ``seekr service start`` detached from this process."""
+    argv = [sys.executable, "-m", "seekr", "service", "start", "--port", str(port)]
+    return subprocess.Popen(argv, **_spawn_kwargs(platform))
+
+
+def _wait_for_service(proc: Any, timeout: float = _START_WAIT_SECONDS) -> Any:
+    """Poll until the spawned service answers, it exits, or *timeout* passes."""
+    deadline = time.monotonic() + timeout
+    while True:
+        info = _find_service()
+        if info is not None:
+            return info
+        exited = getattr(proc, "poll", lambda: None)() is not None
+        if exited or time.monotonic() >= deadline:
+            return _find_service()
+        time.sleep(_POLL_SECONDS)
+
+
+def _open_url(url: str) -> bool:
+    import webbrowser
+
+    return bool(webbrowser.open(url))
+
+
+def _run_background(typer_module: Any, port: int, open_browser: bool) -> None:
+    info = _find_service()
+    if info is None:
+        try:
+            proc = _spawn_service(port)
+        except OSError as exc:
+            typer_module.echo(
+                f"seekr web: could not start the background service: {exc}",
+                err=True,
+            )
+            raise typer_module.Exit(code=1) from None
+        info = _wait_for_service(proc)
+        if info is None:
+            typer_module.echo(
+                "seekr web: the background service did not start within "
+                f"{int(_START_WAIT_SECONDS)} s; run `seekr service start` "
+                "to see the error.",
+                err=True,
+            )
+            raise typer_module.Exit(code=1)
+    elif port not in (0, info.port):
+        typer_module.echo(
+            f"seekr web: the service is already running on port {info.port}; "
+            f"ignoring --port {port}.",
+            err=True,
+        )
+    url = f"http://127.0.0.1:{info.port}/"
+    typer_module.echo(f"seekr is running at {url}")
+    if open_browser and not _open_url(url):
+        typer_module.echo("seekr web: could not open a browser", err=True)
+
+
 def _build_web_command(typer_module: Any) -> Any:
     def web(
         port: int = typer_module.Option(
@@ -61,8 +149,13 @@ def _build_web_command(typer_module: Any) -> Any:
             "--open-browser",
             help="Open the local web interface in the default browser.",
         ),
+        foreground: bool = typer_module.Option(
+            False,
+            "--foreground",
+            help="Serve in this terminal instead of the background service.",
+        ),
     ) -> None:
-        """Serve the local browser interface over loopback."""
+        """Open the local browser interface (starts the background service)."""
         import typer
 
         if not 0 <= port <= 65535:
@@ -71,6 +164,10 @@ def _build_web_command(typer_module: Any) -> Any:
                 err=True,
             )
             raise typer.Exit(code=2)
+
+        if not foreground:
+            _run_background(typer, port, open_browser)
+            return
 
         stop_event = threading.Event()
 
