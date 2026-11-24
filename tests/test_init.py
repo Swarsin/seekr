@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sqlite3
 import subprocess
@@ -345,7 +346,7 @@ class InitCliTests(unittest.TestCase):
             (
                 "# Keep this comment\n"
                 "poll_interval_seconds = 30\n"
-                f'roots = ["{old_notes}"]  # trailing comment\n'
+                f"roots = [{json.dumps(str(old_notes))}]  # trailing comment\n"
             ),
             encoding="utf-8",
         )
