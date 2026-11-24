@@ -2604,3 +2604,45 @@ def test_removed_root_prefixes_match_case_and_unicode_variants_on_darwin() -> No
     with mock.patch("seekr.pathnorm._PLATFORM", "linux"):
         prefixes = WebService._removed_root_prefixes("/vol/m\u00f3dulo", configured)
     assert prefixes == list(dict.fromkeys(expected[:2]))
+
+
+def test_rerank_searches_share_one_warm_reranker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from seekr import rerank
+    from seekr.rerank import FakeReranker
+
+    built: list[str] = []
+    gate = threading.Event()
+
+    def build(cfg: Config) -> FakeReranker:
+        built.append(cfg.rerank_model)
+        gate.wait(0.2)  # widen the window for a racing first construction
+        return FakeReranker({"alpha": 1.0})
+
+    monkeypatch.setattr(rerank, "build_reranker", build)
+    root = _root(tmp_path, "rerank-docs")
+    _write_docs(root, {"a.md": "alpha words here\n", "b.md": "beta alpha words\n"})
+    config_path = _write_config(tmp_path, roots=[root], db_path=tmp_path / "rerank.db")
+
+    with _service(config_path, tmp_path) as service:
+        assert _wait_job(service, service.start_index()).state == "succeeded"
+        results: list[object] = []
+        threads = [
+            threading.Thread(
+                target=lambda: results.append(
+                    service.search(SearchRequest("alpha", mode="hybrid", rerank=True))
+                )
+            )
+            for _ in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        service.search(SearchRequest("alpha", mode="vector", rerank=True))
+
+    assert len(results) == 2 and all(result.hits for result in results)
+    assert len(built) == 1

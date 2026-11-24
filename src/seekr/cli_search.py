@@ -222,12 +222,14 @@ def _build_searcher(
     rerank: bool,
     *,
     embedder: Embedder | None = None,
+    reranker: Reranker | None = None,
 ) -> Searcher | None:
     """Open exactly the backends this query needs.
 
     ``embedder`` is an optional injection point for a caller that already owns
     a warm model.  It must belong to the active ``cfg.embed_model``; the
-    keyword path never reads ``.dim`` from it.
+    keyword path never reads ``.dim`` from it.  ``reranker`` likewise reuses a
+    warm cross-encoder for ``cfg.rerank_model`` instead of building one.
     """
     if embedder is not None and embedder.model_name != cfg.embed_model:
         raise SearchError(
@@ -250,7 +252,10 @@ def _build_searcher(
                 "run `seekr reindex` to rebuild it"
             )
 
-    reranker = _build_reranker(cfg) if rerank else None
+    if not rerank:
+        reranker = None
+    elif reranker is None:
+        reranker = _build_reranker(cfg)
     store = Store(db_path, cfg.embed_model, stored_dim, vector_quant=stored_quant)
     return Searcher(store, active_embedder, reranker)
 
@@ -464,6 +469,7 @@ def get_hits(
     cfg: Config | None = None,
     searcher: Searcher | None = None,
     embedder: Embedder | None = None,
+    reranker: Reranker | None = None,
     use_daemon: bool = True,
     use_service: bool = True,
 ) -> list[Hit]:
@@ -474,7 +480,8 @@ def get_hits(
     search.  ``cfg``, ``searcher`` and ``embedder`` are injection hooks for
     tests and for a caller that already owns a live search stack (the service
     itself); any of them, ``use_service=False`` or ``use_daemon=False`` skips
-    the service.  ``searcher`` wins over ``embedder``; ordinary CLI calls leave
+    the service.  ``reranker`` is a warm cross-encoder for a local
+    ``rerank=True`` search.  ``searcher`` wins over ``embedder``; ordinary CLI calls leave
     all of them unset.  ``use_daemon=False`` forces the local configured index
     even when a service or daemon is listening.
     """
@@ -510,7 +517,13 @@ def get_hits(
         )
 
     selected_cfg = cfg if cfg is not None else load_config()
-    if use_service and use_daemon and cfg is None and embedder is None:
+    if (
+        use_service
+        and use_daemon
+        and cfg is None
+        and embedder is None
+        and reranker is None
+    ):
         wire = _wire_search_request(
             query,
             k,
@@ -558,11 +571,12 @@ def get_hits(
         mode=mode,
     )
     with lifecycle_lock(selected_cfg.db_path, shared=True):
-        selected = (
-            _build_searcher(selected_cfg, mode, rerank)
-            if embedder is None
-            else _build_searcher(selected_cfg, mode, rerank, embedder=embedder)
-        )
+        injected: dict[str, Any] = {}
+        if embedder is not None:
+            injected["embedder"] = embedder
+        if reranker is not None:
+            injected["reranker"] = reranker
+        selected = _build_searcher(selected_cfg, mode, rerank, **injected)
         if selected is None:
             return []
         try:

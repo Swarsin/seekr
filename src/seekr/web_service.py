@@ -308,6 +308,9 @@ class WebService:
         self._config_write_lock = threading.Lock()
         # Serialises model construction; searches never wait on the lane.
         self._model_load_lock = threading.Lock()
+        # One warm cross-encoder per (model, backend), built at most once.
+        self._reranker_lock = threading.Lock()
+        self._rerankers: dict[tuple[str, str], Any] = {}
         self._lane_kind: str | None = None
         self._lane_job_id: str | None = None
         self._root_writers = 0
@@ -1596,6 +1599,18 @@ class WebService:
             **extra,
         )
 
+    def _reranker_for(self, cfg: Config) -> Any:
+        """Return the warm reranker for ``cfg``, building it once under a lock."""
+        key = (cfg.rerank_model, cfg.embed_backend)
+        with self._reranker_lock:
+            reranker = self._rerankers.get(key)
+            if reranker is None:
+                from .cli_search import _build_reranker
+
+                reranker = _build_reranker(cfg)
+                self._rerankers[key] = reranker
+            return reranker
+
     def _call_local_search(
         self, cfg: Config, request: SearchRequest, embedder: Embedder
     ) -> list[object]:
@@ -1613,6 +1628,8 @@ class WebService:
             "use_daemon": False,
             **self._optional_filter_kwargs(request),
         }
+        if request.rerank and self._local_search is None:
+            kwargs["reranker"] = self._reranker_for(cfg)
         if self._local_search is not None:
             return self._local_search(request.query, **kwargs)
         from .cli_search import get_hits
