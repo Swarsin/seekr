@@ -21,6 +21,7 @@ import hashlib
 import http.client
 import importlib.resources
 import json
+import os
 import socket
 import stat
 import threading
@@ -31,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from _platform import LEGACY_DAEMON
 from seekr.cli_search import get_hits
 from seekr.config import load_config
 from seekr.embed import FakeEmbedder
@@ -39,9 +41,12 @@ from seekr.lifecycle import LifecycleLock
 from seekr.locations import format_location
 from seekr.models import ChunkSpec, text_sha
 from seekr.store import Store, StoredChunk
+from seekr.web_config import toml_string
 from seekr.web_contract import LIMITS, HitDTO
 from seekr.web_server import SeekrHTTPServer, create_server
 from seekr.web_service import WebService
+
+_POSIX_MODES = os.name == "posix"  # Windows has no POSIX permission bits
 
 try:  # The offline audit hook lives next to the tests, not in a package.
     from tests import _cached_pipeline_netaudit as _netaudit
@@ -437,7 +442,8 @@ def test_novice_flow_over_http_with_real_service(tmp_path: Path) -> None:
         }
         assert snapshot["daemon"] == {
             "present": False,
-            "socket": str(tmp_path / "seekr.sock"),
+            # Off Linux there is no legacy daemon, so no socket to report.
+            "socket": str(tmp_path / "seekr.sock") if LEGACY_DAEMON else None,
         }
         assert snapshot["config"]["state"] == "ok"
         assert snapshot["activity"] == {"lane": "idle", "job_id": None}
@@ -827,33 +833,34 @@ def test_status_config_model_and_daemon_states_over_http(tmp_path: Path) -> None
         assert [hit["path"] for hit in response.json()["hits"]] == ["/docs/kw.txt"]
         assert builds == ["fake"], builds
 
-    # -- a live daemon socket is reported; absence is not
-    config_path = _write_config(tmp_path, roots=[_root(tmp_path, "daemon-root")])
-    with _running(
-        _make_service(tmp_path, config_path, daemon_probe=lambda path: True)
-    ) as server:
-        token = _bootstrap(server)
-        response = _request(server, "GET", "/api/status", headers=_token(token))
-        snapshot = response.json()
-        assert snapshot["daemon"]["present"] is True
-        assert snapshot["daemon"]["socket"] == str(tmp_path / "seekr.sock")
-        response = _empty_index(server, token)
-        assert response.status == 409
-        assert response.error_code() == "daemon_active"
-        assert "seekr daemon" in response.json()["error"]["message"]
-        revision = _request(
-            server, "GET", "/api/roots", headers=_token(token)
-        ).json()["revision"]
-        extra = _root(tmp_path, "daemon-extra")
-        headers, raw = _json_post(token, {"path": str(extra), "revision": revision})
-        response = _request(server, "POST", "/api/roots", headers=headers, body=raw)
-        assert response.status == 200, response.text
-        view = response.json()
-        assert view["daemon_restart_required"] is False
-        assert view["warning"] is None
-        assert len(view["roots"]) == 2
-        assert Path(view["roots"][0]).resolve() == (tmp_path / "daemon-root").resolve()
-        assert Path(view["roots"][1]).resolve() == extra.resolve()
+    if LEGACY_DAEMON:  # the daemon only exists on Linux
+        # -- a live daemon socket is reported; absence is not
+        config_path = _write_config(tmp_path, roots=[_root(tmp_path, "daemon-root")])
+        with _running(
+            _make_service(tmp_path, config_path, daemon_probe=lambda path: True)
+        ) as server:
+            token = _bootstrap(server)
+            response = _request(server, "GET", "/api/status", headers=_token(token))
+            snapshot = response.json()
+            assert snapshot["daemon"]["present"] is True
+            assert snapshot["daemon"]["socket"] == str(tmp_path / "seekr.sock")
+            response = _empty_index(server, token)
+            assert response.status == 409
+            assert response.error_code() == "daemon_active"
+            assert "seekr daemon" in response.json()["error"]["message"]
+            revision = _request(
+                server, "GET", "/api/roots", headers=_token(token)
+            ).json()["revision"]
+            extra = _root(tmp_path, "daemon-extra")
+            headers, raw = _json_post(token, {"path": str(extra), "revision": revision})
+            response = _request(server, "POST", "/api/roots", headers=headers, body=raw)
+            assert response.status == 200, response.text
+            view = response.json()
+            assert view["daemon_restart_required"] is False
+            assert view["warning"] is None
+            assert len(view["roots"]) == 2
+            assert Path(view["roots"][0]).resolve() == (tmp_path / "daemon-root").resolve()
+            assert Path(view["roots"][1]).resolve() == extra.resolve()
 
 
 def test_status_skips_the_lifecycle_lock_and_keyword_maps_busy_over_http(
@@ -1107,30 +1114,31 @@ def test_search_error_mapping_over_http(tmp_path: Path) -> None:
         assert response.json()["hits"]
     assert attempts == ["fake"], "hybrid/vector with an unavailable model must not retry"
 
-    # -- daemon_failure for a reachable broken daemon
-    from seekr.client import DaemonError
+    if LEGACY_DAEMON:  # the daemon only exists on Linux
+        # -- daemon_failure for a reachable broken daemon
+        from seekr.client import DaemonError
 
-    def broken_daemon(*args: Any, **kwargs: Any):
-        del args, kwargs
-        raise DaemonError("daemon protocol failed")
+        def broken_daemon(*args: Any, **kwargs: Any):
+            del args, kwargs
+            raise DaemonError("daemon protocol failed")
 
-    config_path = _write_config(tmp_path, roots=[_root(tmp_path, "daemon-docs")])
-    with _running(
-        _make_service(
-            tmp_path,
-            config_path,
-            daemon_probe=lambda path: True,
-            daemon_search=broken_daemon,
-        )
-    ) as server:
-        token = _bootstrap(server)
-        for mode in ("keyword", "hybrid", "vector"):
-            response = _search(server, token, query="xylophone", mode=mode)
-            assert response.status == 503, (mode, response.text)
+        config_path = _write_config(tmp_path, roots=[_root(tmp_path, "daemon-docs")])
+        with _running(
+            _make_service(
+                tmp_path,
+                config_path,
+                daemon_probe=lambda path: True,
+                daemon_search=broken_daemon,
+            )
+        ) as server:
+            token = _bootstrap(server)
+            for mode in ("keyword", "hybrid", "vector"):
+                response = _search(server, token, query="xylophone", mode=mode)
+                assert response.status == 503, (mode, response.text)
+                assert response.error_code() == "daemon_failure"
+            response = _search(server, token, query="xylophone")
+            assert response.status == 503, response.text
             assert response.error_code() == "daemon_failure"
-        response = _search(server, token, query="xylophone")
-        assert response.status == 503, response.text
-        assert response.error_code() == "daemon_failure"
 
     # -- config_invalid for every mode, always naming the config path
     invalid = tmp_path / "invalid" / "config.toml"
@@ -1364,7 +1372,8 @@ def test_toml_root_flows_over_http(tmp_path: Path) -> None:
         tmp_path, raw=text, db_path=tmp_path / "a" / "index.db"
     )
     original_bytes = config_path.read_bytes()
-    assert config_path.stat().st_mode & 0o777 == 0o644  # existing modes are preserved
+    if _POSIX_MODES:
+        assert config_path.stat().st_mode & 0o777 == 0o644  # existing modes are preserved
     docs = _root(tmp_path, "first-root")
     _write_docs(docs, NOVICE_DOCS)
     with _running(_make_service(tmp_path, config_path, embedder_factory=explode)) as server:
@@ -1384,7 +1393,7 @@ def test_toml_root_flows_over_http(tmp_path: Path) -> None:
 
         # every byte outside the appended span is preserved, including the
         # key spelling, assignment whitespace, trailing comment and line ending
-        expected = original_bytes + f'roots = ["{canonical}"]\n'.encode()
+        expected = original_bytes + f"roots = [{toml_string(canonical)}]\n".encode()
         assert config_path.read_bytes() == expected
 
         # a tomllib + load_config round-trip equality
@@ -1428,7 +1437,7 @@ def test_toml_root_flows_over_http(tmp_path: Path) -> None:
         start = text.index('["/tmp/opencode/a-original"]')
         end = text.index("]", start) + 1
         expected = (
-            text[:start] + f'["/tmp/opencode/a-original", "{canonical}"]' + text[end:]
+            text[:start] + f'["/tmp/opencode/a-original", {toml_string(canonical)}]' + text[end:]
         ).encode()
         assert config_path.read_bytes() == expected
         assert view["roots"] == ["/tmp/opencode/a-original", canonical]
@@ -1560,9 +1569,10 @@ def test_toml_root_flows_over_http(tmp_path: Path) -> None:
         view = response.json()
         assert view["config_path"] == str(created)
     assert created.is_file()
-    assert stat.S_IMODE(parent.stat().st_mode) == 0o700
-    assert stat.S_IMODE(created.stat().st_mode) == 0o600
-    assert created.read_text() == f'roots = ["{fresh.resolve()}"]\n'
+    if _POSIX_MODES:
+        assert stat.S_IMODE(parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(created.stat().st_mode) == 0o600
+    assert created.read_text() == f"roots = [{toml_string(str(fresh.resolve()))}]\n"
     assert tomllib.loads(created.read_text())["roots"] == [str(fresh.resolve())]
     assert load_config(created).roots == (fresh.resolve(),)
 

@@ -17,6 +17,7 @@ from unittest import mock
 
 import pytest
 
+from _platform import LEGACY_DAEMON, legacy_daemon_only
 from seekr.cli_search import get_hits
 from seekr.config import Config, load_config
 from seekr.embed import FakeEmbedder
@@ -876,6 +877,7 @@ def test_keyword_lifecycle_lock_busy_maps_to_409(tmp_path: Path) -> None:
         lock.release()
 
 
+@legacy_daemon_only
 def test_daemon_first_bypasses_lane_and_local_fallback_uses_use_daemon_false(
     tmp_path: Path,
 ) -> None:
@@ -940,6 +942,7 @@ def test_daemon_first_bypasses_lane_and_local_fallback_uses_use_daemon_false(
         assert local_calls == []
 
 
+@legacy_daemon_only
 def test_daemon_failure_and_live_index_refusal_and_root_warning(tmp_path: Path) -> None:
     root = _root(tmp_path)
     config_path = _write_config(tmp_path, roots=[root])
@@ -967,6 +970,7 @@ def test_daemon_failure_and_live_index_refusal_and_root_warning(tmp_path: Path) 
         assert added.warning is None
 
 
+@legacy_daemon_only
 def test_daemon_socket_liveness_is_a_real_unix_probe(tmp_path: Path) -> None:
     root = _root(tmp_path)
     config_path = _write_config(tmp_path, roots=[root])
@@ -1236,14 +1240,15 @@ def test_index_preflight_order(tmp_path: Path) -> None:
             service.start_index()
         assert _error_code(raised.value) == "no_roots"
 
-    daemon_root = _root(tmp_path, "daemon-root")
-    daemon_config = _write_config(tmp_path, roots=[daemon_root])
-    with _service(
-        daemon_config, tmp_path, daemon_probe=lambda path: True
-    ) as service:
-        with pytest.raises(ApiError) as raised:
-            service.start_index()
-        assert _error_code(raised.value) == "daemon_active"
+    if LEGACY_DAEMON:  # the daemon only exists on Linux
+        daemon_root = _root(tmp_path, "daemon-root")
+        daemon_config = _write_config(tmp_path, roots=[daemon_root])
+        with _service(
+            daemon_config, tmp_path, daemon_probe=lambda path: True
+        ) as service:
+            with pytest.raises(ApiError) as raised:
+                service.start_index()
+            assert _error_code(raised.value) == "daemon_active"
 
     mismatch_root = _root(tmp_path, "mismatch-root")
     (mismatch_root / "a.txt").write_text("alpha\n", encoding="utf-8")
@@ -2078,11 +2083,12 @@ def test_remove_root_purges_config_and_db_respects_prefix_lane_and_daemon(
     db_path = tmp_path / "remove.db"
     config_path = _write_config(tmp_path, roots=[root, root2], db_path=db_path)
 
-    with _service(config_path, tmp_path, daemon_probe=lambda _p: True) as daemon_service:
-        rev = daemon_service.roots().revision
-        with pytest.raises(ApiError) as raised:
-            daemon_service.remove_root(str(root), rev)
-        assert _error_code(raised.value) == "daemon_active"
+    if LEGACY_DAEMON:  # the daemon only exists on Linux
+        with _service(config_path, tmp_path, daemon_probe=lambda _p: True) as daemon_service:
+            rev = daemon_service.roots().revision
+            with pytest.raises(ApiError) as raised:
+                daemon_service.remove_root(str(root), rev)
+            assert _error_code(raised.value) == "daemon_active"
 
     paused = _PausingIndexer()
     with _service(
@@ -2357,6 +2363,7 @@ def test_search_passes_rerank_and_explain_and_maps_explain(tmp_path: Path) -> No
         json.dumps(payload, allow_nan=False)
 
 
+@legacy_daemon_only
 def test_daemon_search_passes_rerank_and_explain(tmp_path: Path) -> None:
     root = _root(tmp_path)
     config_path = _write_config(tmp_path, roots=[root])
@@ -2546,10 +2553,11 @@ def test_start_index_paths_validation_and_daemon_refusal(tmp_path: Path) -> None
             with pytest.raises(ApiError) as raised:
                 service.start_index_paths(bad)
             assert _error_code(raised.value) == "invalid_request", bad
-    with _service(config_path, tmp_path, daemon_probe=lambda path: True) as service:
-        with pytest.raises(ApiError) as raised:
-            service.start_index_paths([str(root)])
-        assert _error_code(raised.value) == "daemon_active"
+    if LEGACY_DAEMON:  # the daemon only exists on Linux
+        with _service(config_path, tmp_path, daemon_probe=lambda path: True) as service:
+            with pytest.raises(ApiError) as raised:
+                service.start_index_paths([str(root)])
+            assert _error_code(raised.value) == "daemon_active"
 
 
 def test_keyword_rerank_and_relative_paths_are_invalid_requests(tmp_path: Path) -> None:

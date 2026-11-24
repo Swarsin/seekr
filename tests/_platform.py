@@ -6,6 +6,8 @@ import os
 import tempfile
 import unittest
 
+import pytest
+
 from seekr import daemon
 
 LEGACY_DAEMON = daemon.legacy_daemon_supported()
@@ -13,6 +15,7 @@ LEGACY_DAEMON_REASON = (
     "the legacy Unix-socket daemon needs SO_PEERCRED peer checks, which only Linux has"
 )
 requires_legacy_daemon = unittest.skipUnless(LEGACY_DAEMON, LEGACY_DAEMON_REASON)
+legacy_daemon_only = pytest.mark.skipif(not LEGACY_DAEMON, reason=LEGACY_DAEMON_REASON)
 
 
 def short_tempdir(prefix: str) -> tempfile.TemporaryDirectory[str]:
