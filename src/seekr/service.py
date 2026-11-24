@@ -288,6 +288,7 @@ class SeekrService:
             self._config_path,
             embedder_factory=self._embedder_for,
             daemon_probe=lambda _path: False,
+            service_identity={"pid": os.getpid(), "version": __version__},
             on_roots_changed=self._roots_changed,
             reindex_runner=self._run_paused,
         )

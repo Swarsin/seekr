@@ -538,6 +538,8 @@ def test_status_missing_empty_ready_incompatible_and_error(tmp_path: Path) -> No
         assert missing.model["state"] == "unchecked"
         assert missing.config["state"] == "ok"
         assert missing.daemon["present"] is False
+        assert missing.service == {"running": False, "pid": None, "version": None}
+        assert missing.to_dict()["service"] == missing.service
         assert missing.activity == {"lane": "idle", "job_id": None}
         assert not missing_db.exists()
         assert built == []

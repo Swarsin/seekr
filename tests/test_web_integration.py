@@ -431,7 +431,8 @@ def test_novice_flow_over_http_with_real_service(tmp_path: Path) -> None:
         response = _request(server, "GET", "/api/status", headers=_token(token))
         assert response.status == 200, response.text
         snapshot = response.json()
-        assert set(snapshot) == {"index", "model", "daemon", "config", "activity"}
+        assert set(snapshot) == {"index", "model", "daemon", "config", "activity", "service"}
+        assert snapshot["service"] == {"running": False, "pid": None, "version": None}
         assert snapshot["index"]["state"] == "missing"
         assert snapshot["index"]["documents"] == 0
         assert snapshot["index"]["chunks"] == 0

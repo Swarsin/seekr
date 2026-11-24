@@ -151,6 +151,7 @@ def test_start_writes_discovery_and_answers_status(env, request) -> None:
     status, body = _request(port, "GET", "/api/status", token=info.token)
     assert status == 200
     assert body["daemon"]["present"] is False
+    assert body["service"] == {"running": True, "pid": os.getpid(), "version": __version__}
 
     svc.stop()
     assert read_service_info(paths.service_file()) is None

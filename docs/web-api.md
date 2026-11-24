@@ -205,7 +205,8 @@ Do not add undocumented keys to `limits`; the frontend may rely on these names.
     "roots": 0,
     "message": null
   },
-  "activity": {"lane": "idle | search | model_check | index | download", "job_id": null}
+  "activity": {"lane": "idle | search | model_check | index | download", "job_id": null},
+  "service": {"running": true, "pid": 12345, "version": "0.3.0"}
 }
 ```
 
@@ -214,8 +215,14 @@ is the configured database path, or `null` when the config is invalid. Clients
 compare `config.path` and `index.db_path` with their own resolved config file
 and database, and work locally when either differs, so a command run with
 another `SEEKR_CONFIG` never searches or writes the service's index. `size_bytes` is
-the main database plus `-wal`/`-shm` files when present. `daemon.present` is
-only a socket-liveness probe; no activity or indexing claim is attached.
+the main database plus `-wal`/`-shm` files when present. `service.running` is
+`true`, with the service's `pid` and `version`, when the background `seekr
+service` serves the API; for `seekr web --foreground` it is
+`{"running": false, "pid": null, "version": null}`. `daemon` describes only the
+legacy Unix-socket `seekr daemon` of an older seekr version: `daemon.present` is
+a socket-liveness probe with no activity or indexing claim attached, and
+`daemon.socket` is `null` where the legacy daemon is not supported (Windows and
+macOS). The service itself always reports `daemon.present: false`.
 `config.state` is `ok` when the config is absent (defaults) or valid, and
 `invalid` when `load_config` raises `ConfigError`; status still returns `200`
 with `invalid`. `config.revision` is the SHA-256 of the raw config bytes

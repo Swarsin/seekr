@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -43,6 +43,7 @@ from .web_config import inspect_config, read_roots
 from .web_config import remove_root as config_remove_root
 from .web_contract import (
     LIMITS,
+    NO_SERVICE,
     ApiError,
     CourseModuleDTO,
     CourseView,
@@ -259,8 +260,13 @@ class WebService:
         on_shutdown: Callable[[], None] | None = None,
         on_roots_changed: Callable[[], None] | None = None,
         reindex_runner: Callable[[Callable[[], Any]], Any] | None = None,
+        service_identity: Mapping[str, object] | None = None,
     ) -> None:
         """Configure the backend; heavy modules load only when used.
+
+        ``service_identity`` (``{"pid", "version"}``) is set by the background
+        service so status reports ``service.running``; a plain ``seekr web
+        --foreground`` backend leaves it unset.
 
         ``reindex_runner`` wraps the rebuild of a reindex job (the job thread
         already holds the engine lane); the service uses it to pause the
@@ -286,6 +292,15 @@ class WebService:
         self._on_shutdown = on_shutdown
         self._on_roots_changed = on_roots_changed
         self._reindex_runner = reindex_runner
+        self._service_status: dict[str, object] = (
+            dict(NO_SERVICE)
+            if service_identity is None
+            else {
+                "running": True,
+                "pid": service_identity.get("pid"),
+                "version": service_identity.get("version"),
+            }
+        )
         self._shutdown_requested = False
         self._state_lock = threading.RLock()
         # Signalled whenever the lane is released or shutdown begins.
@@ -760,6 +775,7 @@ class WebService:
                 "message": inspection.message,
             },
             activity=self._activity(),
+            service=dict(self._service_status),
         )
 
     # -- index inspection --------------------------------------------------

@@ -8,7 +8,7 @@ executable shape.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 __all__ = [
@@ -21,6 +21,7 @@ __all__ = [
     "LANES",
     "LIMITS",
     "MODEL_STATES",
+    "NO_SERVICE",
     "ApiError",
     "CourseModuleDTO",
     "CourseView",
@@ -344,6 +345,10 @@ class PreviewView:
         }
 
 
+#: The status ``service`` object of an API not served by ``seekr service``.
+NO_SERVICE: dict[str, object] = {"running": False, "pid": None, "version": None}
+
+
 @dataclass(frozen=True)
 class StatusView:
     """A model-free, read-only status snapshot."""
@@ -353,6 +358,10 @@ class StatusView:
     daemon: dict[str, object]
     config: dict[str, object]
     activity: dict[str, object]
+    #: ``{"running": true, "pid", "version"}`` when the background ``seekr
+    #: service`` serves this API; ``running`` is false (and ``pid``/``version``
+    #: null) for ``seekr web --foreground``.
+    service: dict[str, object] = field(default_factory=lambda: dict(NO_SERVICE))
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -361,6 +370,7 @@ class StatusView:
             "daemon": dict(self.daemon),
             "config": dict(self.config),
             "activity": dict(self.activity),
+            "service": dict(self.service),
         }
 
 
