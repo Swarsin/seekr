@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest import mock
 
 from seekr import indexer as indexer_module
+from seekr import pathnorm
 from seekr.config import Config
 from seekr.course import CourseLabel
 from seekr.extract import ExtractionError
@@ -209,10 +210,10 @@ class FakeStore:
         paths = sorted(self.documents)
         if prefix is None:
             return paths
-        base = str(prefix).rstrip("/")
-        if not base:
+        # Component-aware, with the host's separator and case rules, like Store.
+        if not str(prefix).rstrip(pathnorm.path_separator()):
             return paths
-        return [path for path in paths if path == base or path.startswith(base + "/")]
+        return [path for path in paths if pathnorm.has_prefix(path, str(prefix))]
 
     def find_vector_by_text_sha(self, sha: str) -> object | None:
         for chunk in self.chunks.values():
@@ -873,7 +874,7 @@ class MovePathTests(_IndexerTestCase):
         old_size = dst_doc.size
         calls = len(self.embedder.calls)
 
-        src.rename(dst)
+        src.replace(dst)  # overwrite, as rename(2) does (Windows rename refuses)
         os.utime(dst, ns=(old_mtime, old_mtime))
         self.assertEqual(dst.stat().st_size, old_size)
 
@@ -1247,19 +1248,21 @@ class RealStoreIndexerTests(unittest.TestCase):
         self.assertEqual(len(self.embedder.calls), calls)
         hits = self.store.keyword_search('"alpha"', 10)
         self.assertEqual(hits[0][0], old_chunk_id)
-        self.assertEqual(self.store.fetch_chunks([old_chunk_id])[old_chunk_id].path, str(dst))
+        self.assertEqual(
+            self.store.fetch_chunks([old_chunk_id])[old_chunk_id].path, str(dst.resolve())
+        )
 
     def test_real_failure_preserves_last_good_document(self) -> None:
         path = self.write("notes.txt", "keepword alpha beta")
         self.indexer.sync([self.root])
-        old_doc = self.store.get_document(str(path))
+        old_doc = self.store.get_document(str(path.resolve()))
         assert old_doc is not None
 
         path.write_bytes(b"\x00\x01binary")
         report = self.indexer.sync([self.root])
 
         self.assertEqual(len(report.errors), 1)
-        current = self.store.get_document(str(path))
+        current = self.store.get_document(str(path.resolve()))
         assert current is not None
         self.assertEqual(current.sha256, old_doc.sha256)
         self.assertEqual(len(self.store.keyword_search("keepword", 10)), 1)
@@ -1377,7 +1380,7 @@ class CourseLabelIndexTests(_IndexerTestCase):
         self.assertEqual(self.doc_label("ds/week4/a.md"), ("ds", 4))
 
         # Moving over an already-indexed identical destination keeps destination label.
-        other_src.rename(existing_dst)
+        other_src.replace(existing_dst)  # overwrite (Windows rename refuses)
         self.assertEqual(indexer.move_path(other_src, existing_dst), "removed")
         self.assertEqual(len(self.embedder.calls), calls)
         self.assertEqual(self.doc_label("ds/week5/dup.md"), ("ds", 5))
@@ -1580,8 +1583,9 @@ class CanonicalPathTests(_IndexerTestCase):
         link = self.tmp / "link-root"
         link.symlink_to(self.root, target_is_directory=True)
 
-        self.indexer.sync([link])
-        self.indexer.index_path(nfd_file)
+        with mock.patch("seekr.pathnorm._PLATFORM", "linux"):
+            self.indexer.sync([link])
+            self.indexer.index_path(nfd_file)
 
         # Byte-for-byte what Path.resolve() gives: no Unicode normalisation.
         self.assertEqual(sorted(self.store.documents), [str(nfd_file.resolve())])
