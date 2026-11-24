@@ -42,11 +42,11 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      VENV: ${{ runner.temp }}/m
-      BIN: ${{ runner.os == 'Windows' && 'Scripts' || 'bin' }}
     steps:
       - uses: actions/checkout@v4
+      - run: |
+          echo "VENV=$RUNNER_TEMP/m" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = Windows ]; then echo "BIN=Scripts" >> "$GITHUB_ENV"; else echo "BIN=bin" >> "$GITHUB_ENV"; fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -67,11 +67,11 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      VENV: ${{ runner.temp }}/v
-      BIN: ${{ runner.os == 'Windows' && 'Scripts' || 'bin' }}
     steps:
       - uses: actions/checkout@v4
+      - run: |
+          echo "VENV=$RUNNER_TEMP/v" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = Windows ]; then echo "BIN=Scripts" >> "$GITHUB_ENV"; else echo "BIN=bin" >> "$GITHUB_ENV"; fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
