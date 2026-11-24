@@ -52,6 +52,11 @@ _INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _ESCAPE_WIDTHS = {"x": 2, "u": 4, "U": 8}
 _TEXT_KINDS = frozenset({"code", "markdown", "text"})
+# Kinds that Windows and macOS hand to their default application.  Everything
+# else (code, text, Markdown, notebooks, transcripts and unknown files) opens in
+# an editor there, because the default verb can *run* a script: Windows Script
+# Host executes ``.js`` and the py launcher executes ``.py``.
+_DOCUMENT_KINDS = frozenset({"pdf", "word", "slides"})
 
 
 def _is_invisible(character: str) -> bool:
@@ -224,12 +229,27 @@ def _page_number(locator: str) -> int | None:
     return page if page > 0 else None
 
 
+def _split_command(raw: str, *, platform: str = "linux") -> list[str]:
+    """Split a command from the environment without a shell.
+
+    Windows paths keep their backslashes: there the split is non-POSIX and
+    only the surrounding double quotes of a token are removed.
+    """
+    try:
+        if platform == "win32":
+            parts = shlex.split(raw, posix=False)
+            return [
+                part[1:-1] if len(part) >= 2 and part[0] == part[-1] == '"' else part
+                for part in parts
+            ]
+        return shlex.split(raw)
+    except ValueError:
+        return []
+
+
 def _editor_argv(env: Mapping[str, str]) -> list[str]:
     raw = env.get("EDITOR", "")
-    try:
-        argv = shlex.split(raw) if raw else []
-    except ValueError:
-        argv = []
+    argv = _split_command(raw) if raw else []
     return argv or ["nvim"]
 
 
@@ -398,16 +418,37 @@ def open_target(
 ) -> OpenAction:
     """Choose how to open *path* on the current platform.
 
-    Windows and macOS use the native opener and ignore *locator* and *kind*;
-    Linux and WSL keep the :func:`open_command` behaviour.
+    ``$SEEKR_OPENER`` (split without a shell, the path appended) wins on every
+    platform and for every kind.  Otherwise Linux and WSL keep the
+    :func:`open_command` behaviour.  On Windows and macOS documents (PDF, Word,
+    PowerPoint) open in their default application; every other kind opens in
+    ``$EDITOR`` (at the line when the locator has one) or, without it, in
+    Notepad or the macOS default text editor -- never through the default
+    verb, which can execute a script.
     """
+    safe_path = _safe_argv_path(path)
+    opener_argv = _split_command(env.get("SEEKR_OPENER", ""), platform=platform)
+    if opener_argv:
+        return Argv([*opener_argv, safe_path])
+
+    if platform not in ("win32", "darwin"):
+        return Argv(
+            open_command(path, locator, kind, env, which, wsl=wsl, to_windows=to_windows)
+        )
+
+    if kind in _DOCUMENT_KINDS:
+        return StartFile(path) if platform == "win32" else Argv(["open", safe_path])
+
+    editor = _split_command(env.get("EDITOR", ""), platform=platform)
+    if editor:
+        line = _line_number(locator)
+        if line is None and kind == "markdown" and locator.startswith("\u00a7"):
+            line = _markdown_heading_line(path, locator)
+        located = [f"+{line}"] if line is not None else []
+        return Argv([*editor, *located, safe_path])
     if platform == "win32":
-        return StartFile(path)
-    if platform == "darwin":
-        return Argv(["open", _safe_argv_path(path)])
-    return Argv(
-        open_command(path, locator, kind, env, which, wsl=wsl, to_windows=to_windows)
-    )
+        return Argv(["notepad.exe", safe_path])
+    return Argv(["open", "-t", safe_path])
 
 
 def run_open(action: OpenAction) -> None:

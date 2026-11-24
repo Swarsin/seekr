@@ -129,7 +129,7 @@ Each result card shows a header (`Module · Week N · file · location`, omittin
 Click any result card (or its **Preview** button) to open the **Preview** panel:
 
 - Shows the full passage text and, for PDF files on disk, renders the matching page image directly in the panel.
-- **Open file** launches the source file at its page, line, or slide in your local desktop application (including WSL-to-Windows path translation when running under WSL).
+- **Open file** launches the source file at its page, line, or slide in your local desktop application (including WSL-to-Windows path translation when running under WSL). On Windows and macOS, PDFs and Office files use their default application, and code and text files open in `$EDITOR`, Notepad or the macOS text editor, so a script is never executed. `$SEEKR_OPENER`, read by the service when it starts, overrides the opener on every platform.
 - **Copy location** copies the formatted location (for example `/path/to/report.pdf (page 3)` or a Windows path on WSL). Turn on **POSIX path** to switch both the displayed location and **Copy location** output to the POSIX path. If the browser cannot access the clipboard, Seekr shows a selected read-only field; press Ctrl+C (or ⌘C) to copy.
 
 ### Keyboard shortcuts

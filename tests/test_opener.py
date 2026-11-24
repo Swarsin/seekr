@@ -477,6 +477,27 @@ class CliTests(unittest.TestCase):
         run.assert_called_once_with(["nano", "+10", str(py_file)], check=False)
         self.assertNotIn("shell", run.call_args.kwargs)
 
+    def test_open_never_runs_a_script_hit_on_windows_or_macos(self) -> None:
+        app, _ = self._registered()
+        completed = types.SimpleNamespace(returncode=0)
+        expected = {"win32": ["notepad.exe"], "darwin": ["open", "-t"]}
+        for platform, prefix in expected.items():
+            for name in ("hit.py", "hit.js"):
+                with self.subTest(platform=platform, name=name):
+                    script = str(Path(tempfile.gettempdir()) / name)
+                    rules = functools.partial(opener_module.open_target, platform=platform)
+                    env = {k: v for k, v in os.environ.items() if k not in ("EDITOR", "SEEKR_OPENER")}
+                    with (
+                        mock.patch.object(cli_open, "open_target", rules),
+                        mock.patch("seekr.platform_info.is_wsl", return_value=False),
+                        mock.patch.dict(os.environ, env, clear=True),
+                        mock.patch.object(os, "startfile", create=True) as startfile,
+                        mock.patch.object(opener_module.subprocess, "run", return_value=completed) as run,
+                    ):
+                        app.commands["open"](target=f"{script}:L3")
+                    startfile.assert_not_called()
+                    run.assert_called_once_with([*prefix, script], check=False)
+
     def test_open_accepts_a_pick_line_and_never_fakes_transcript_media(self) -> None:
         app, _ = self._registered()
         vtt_file = Path(tempfile.gettempdir()) / "seekr-open-test.vtt"
@@ -606,11 +627,82 @@ class OpenTargetTests(unittest.TestCase):
         )
         self.assertEqual(action, StartFile("C:\\a.pdf"))
 
-    def test_macos_uses_open(self) -> None:
-        action = open_target(
-            "/a.py", "L3", "code", env={"EDITOR": "nano"}, which=lambda _n: None, platform="darwin"
+    def test_windows_documents_use_the_default_application(self) -> None:
+        for path, kind in (("C:\\a.docx", "word"), ("C:\\a.pptx", "slides")):
+            action = open_target(path, "", kind, env={}, which=lambda _n: None, platform="win32")
+            self.assertEqual(action, StartFile(path))
+
+    def test_windows_scripts_open_in_notepad_never_the_default_verb(self) -> None:
+        for path in ("C:\\x\\a.py", "C:\\x\\a.js"):
+            action = open_target(
+                path, "L3", "code", env={}, which=lambda _n: None, platform="win32"
+            )
+            self.assertEqual(action, Argv(["notepad.exe", path]))
+
+    def test_windows_text_like_kinds_open_in_notepad(self) -> None:
+        for kind in ("text", "markdown", "notebook", "transcript", ""):
+            action = open_target("C:\\a.x", "", kind, env={}, which=lambda _n: None, platform="win32")
+            self.assertEqual(action, Argv(["notepad.exe", "C:\\a.x"]))
+
+    def test_macos_documents_use_open(self) -> None:
+        action = open_target("/a.pdf", "p.2", "pdf", env={}, which=lambda _n: None, platform="darwin")
+        self.assertEqual(action, Argv(["open", "/a.pdf"]))
+
+    def test_macos_scripts_open_in_the_text_editor(self) -> None:
+        for path in ("/x/a.py", "/x/a.js"):
+            action = open_target(path, "L3", "code", env={}, which=lambda _n: None, platform="darwin")
+            self.assertEqual(action, Argv(["open", "-t", path]))
+
+    def test_macos_text_editor_path_cannot_become_an_option(self) -> None:
+        action = open_target("-a.py", "", "code", env={}, which=lambda _n: None, platform="darwin")
+        self.assertEqual(action, Argv(["open", "-t", "./-a.py"]))
+
+    def test_editor_is_honoured_on_windows_and_macos(self) -> None:
+        for platform, path in (("win32", "C:\\a.py"), ("darwin", "/a.js")):
+            with self.subTest(platform=platform):
+                env = {"EDITOR": "nano"}
+                located = open_target(path, "L7", "code", env=env, which=lambda _n: None, platform=platform)
+                self.assertEqual(located, Argv(["nano", "+7", path]))
+                unlocated = open_target(path, "", "code", env=env, which=lambda _n: None, platform=platform)
+                self.assertEqual(unlocated, Argv(["nano", path]))
+
+    def test_windows_editor_keeps_backslashes_and_quoted_spaces(self) -> None:
+        env = {"EDITOR": '"C:\\Program Files\\Notepad++\\notepad++.exe" -multiInst'}
+        action = open_target("C:\\a.py", "", "code", env=env, which=lambda _n: None, platform="win32")
+        self.assertEqual(
+            action,
+            Argv(["C:\\Program Files\\Notepad++\\notepad++.exe", "-multiInst", "C:\\a.py"]),
         )
-        self.assertEqual(action, Argv(["open", "/a.py"]))
+
+    def test_editor_does_not_replace_the_document_application(self) -> None:
+        env = {"EDITOR": "nano"}
+        self.assertEqual(
+            open_target("C:\\a.pdf", "p.1", "pdf", env=env, which=lambda _n: None, platform="win32"),
+            StartFile("C:\\a.pdf"),
+        )
+        self.assertEqual(
+            open_target("/a.pdf", "p.1", "pdf", env=env, which=lambda _n: None, platform="darwin"),
+            Argv(["open", "/a.pdf"]),
+        )
+
+    def test_seekr_opener_wins_on_every_platform_and_kind(self) -> None:
+        env = {"SEEKR_OPENER": "my-opener --flag", "EDITOR": "nano"}
+        for platform in ("win32", "darwin", "linux"):
+            for kind in ("pdf", "code"):
+                with self.subTest(platform=platform, kind=kind):
+                    action = open_target("/a.x", "L2", kind, env=env, which=lambda _n: "/x", platform=platform)
+                    self.assertEqual(action, Argv(["my-opener", "--flag", "/a.x"]))
+
+    def test_seekr_opener_wins_on_wsl(self) -> None:
+        action = open_target(
+            "/mnt/c/a.py", "L1", "code", env={"SEEKR_OPENER": "code"}, which=lambda _n: "/x",
+            platform="linux", wsl=True, to_windows=lambda _p: "C:\\a.py",
+        )
+        self.assertEqual(action, Argv(["code", "/mnt/c/a.py"]))
+
+    def test_blank_seekr_opener_is_ignored(self) -> None:
+        action = open_target("/a.py", "", "code", env={"SEEKR_OPENER": "  "}, which=lambda _n: None, platform="darwin")
+        self.assertEqual(action, Argv(["open", "-t", "/a.py"]))
 
     def test_linux_matches_open_command(self) -> None:
         env = {"EDITOR": "nano"}

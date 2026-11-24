@@ -109,6 +109,6 @@ Stop the service with `seekr service stop`. To remove the agent so it no longer 
 ## Limits on Windows and macOS
 
 - The old Unix-socket `seekr daemon` fast path is Linux-only and disabled on Windows and macOS. `seekr daemon` is a deprecated alias for `seekr service start` and will be removed in 0.4.0; use `seekr service start` instead.
-- `seekr open` launches files with the system default application.
+- `seekr open` and the web UI **Open file** button open PDFs, Word and PowerPoint files in their default application. Code, text, Markdown, notebooks and transcripts open in `$EDITOR` when it is set (at the line, as `$EDITOR +N file`), otherwise in Notepad on Windows or the default text editor on macOS (`open -t`). They never go through the default "open" action, which can run a `.py` or `.js` file instead of showing it. Set `$SEEKR_OPENER` to a command (for example `code`) to open every result with it; the file path is appended. For the background service, set these variables in the environment that starts the service.
 
 See also the [web interface guide](web.md) and the [README](../README.md).
