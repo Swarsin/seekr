@@ -810,3 +810,25 @@ def test_reindex_with_open_reader_succeeds_via_service_pause(env, request) -> No
     assert job["state"] == "succeeded", job
     assert _documents(svc) == 1
     assert svc.backend.search(SearchRequest("xylophones", mode="keyword")).hits
+
+
+def test_watcher_roots_failure_is_logged_with_the_error(
+    env, request, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    svc = _service(request)
+    svc.start()
+    _wait_idle(svc)
+    extra = env / "extra"
+    extra.mkdir()
+
+    def broken(_roots) -> None:
+        raise OSError("inotify watch limit reached")
+
+    svc._watcher.set_roots = broken
+    with caplog.at_level(logging.WARNING, logger="seekr"):
+        svc.backend.add_root(str(extra), svc.backend.roots().revision)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("inotify watch limit reached" in r.getMessage() for r in warnings)

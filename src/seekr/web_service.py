@@ -1171,8 +1171,10 @@ class WebService:
             return
         try:
             callback()
-        except Exception:  # noqa: BLE001 - the config change already succeeded
-            _LOGGER.warning("event=web_roots_changed_callback_failed")
+        except Exception as exc:  # noqa: BLE001 - the config change already succeeded
+            _LOGGER.warning(
+                "event=web_roots_changed_callback_failed error=%r", _safe_message(exc)
+            )
 
     @staticmethod
     def _removed_root_prefixes(path: str, configured_roots: Sequence[Path]) -> list[str]:

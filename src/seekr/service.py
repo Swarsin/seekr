@@ -400,7 +400,12 @@ class SeekrService:
             self._watch_stale = True
         watcher = self._watcher
         if watcher is not None:
-            watcher.set_roots(list(cfg.roots) if cfg is not None else [])
+            try:
+                watcher.set_roots(list(cfg.roots) if cfg is not None else [])
+            except Exception as exc:  # noqa: BLE001 - the config change stands
+                log_event(
+                    _LOGGER, logging.WARNING, "service.watch_roots_failed", error=str(exc)
+                )
 
     # -- pausing for a rebuild ---------------------------------------------
 
