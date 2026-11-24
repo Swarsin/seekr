@@ -29,10 +29,22 @@ class NeedsUtf8Tests(unittest.TestCase):
     def test_reconfigures_only_streams_that_need_it(self) -> None:
         pipe = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
         utf8 = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
-        configure_redirected_streams("win32", (pipe, utf8, io.StringIO()))
+        configure_redirected_streams(
+            "win32", ((pipe, "strict"), (utf8, "strict"), (io.StringIO(), "strict"))
+        )
         self.assertEqual(pipe.encoding, "utf-8")
-        pipe.write("ﬀ")
-        configure_redirected_streams("linux", (io.TextIOWrapper(io.BytesIO(), encoding="cp1252"),))
+        pipe.write("\ufb00")
+        other = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+        configure_redirected_streams("linux", ((other, "strict"),))
+        self.assertEqual(other.encoding, "cp1252")
+
+    def test_stderr_escapes_unencodable_text(self) -> None:
+        raw = io.BytesIO()
+        err = io.TextIOWrapper(raw, encoding="cp1252")
+        configure_redirected_streams("win32", ((err, "backslashreplace"),))
+        err.write("a\udcffb")
+        err.flush()
+        self.assertEqual(raw.getvalue(), b"a\\udcffb")
 
 
 class RedirectedOutputTests(unittest.TestCase):

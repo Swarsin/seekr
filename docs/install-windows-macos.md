@@ -16,7 +16,8 @@ brew install python pipx
 pipx install seekr-search
 
 # or a uv-managed CPython
-uv tool install seekr-search
+uv python install 3.12
+uv tool install --python 3.12 --managed-python seekr-search
 # or, with pipx:
 pipx install --python "$(uv python find --managed-python 3.12)" seekr-search
 ```
@@ -84,9 +85,9 @@ If the client does not inherit your `PATH`, set `"command"` to the full path of 
 
 ## Start the service at login
 
-`seekr web` starts the service on demand, and searches work without it. To have it running after you log in, register one of the examples below. Each runs `seekr service start`, which keeps running in the foreground until stopped.
+`seekr web` starts the service on demand, and searches work without it. To have it running after you log in, register one of the examples below. Each runs `seekr service start --port 8000`, which keeps running in the foreground until stopped; `seekr web` and `seekr service status` print the address actually in use. Without `--port`, the service picks a random free port.
 
-**Windows (Task Scheduler).** [`contrib/seekr-task.ps1`](https://github.com/Swarsin/seekr/blob/main/contrib/seekr-task.ps1) registers a per-user task named `seekr service` that runs at logon:
+**Windows (Task Scheduler).** [`contrib/seekr-task.ps1`](https://github.com/Swarsin/seekr/blob/main/contrib/seekr-task.ps1) registers a per-user task named `seekr service` that runs at logon (it has no restart-on-failure setting, so `seekr service stop` stays stopped):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File contrib\seekr-task.ps1
@@ -94,14 +95,14 @@ powershell -ExecutionPolicy Bypass -File contrib\seekr-task.ps1
 
 It looks for `seekr` on your `PATH`; pass `-SeekrPath C:\path\to\seekr.exe` if it is elsewhere. Remove it with `Unregister-ScheduledTask -TaskName "seekr service" -Confirm:$false`.
 
-**macOS (launchd).** [`contrib/com.seekr.service.plist`](https://github.com/Swarsin/seekr/blob/main/contrib/com.seekr.service.plist) is a launch agent that starts the service at login and restarts it if it exits. Edit the path to `seekr` in `ProgramArguments` (the example assumes `~/.local/bin/seekr`, where `pipx` and `uv tool` install it; launchd does not expand `~`, so write the full path), then:
+**macOS (launchd).** [`contrib/com.seekr.service.plist`](https://github.com/Swarsin/seekr/blob/main/contrib/com.seekr.service.plist) is a launch agent that starts the service at login. It does not restart it, so `seekr service stop` stays stopped. Edit the path to `seekr` in `ProgramArguments` (the example assumes `~/.local/bin/seekr`, where `pipx` and `uv tool` install it; launchd does not expand `~`, so write the full path), then:
 
 ```bash
 cp contrib/com.seekr.service.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.seekr.service.plist
 ```
 
-Unload it with `launchctl bootout gui/$(id -u)/com.seekr.service`.
+Stop the service with `seekr service stop`. To remove the agent so it no longer starts at login, run `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.seekr.service.plist` and delete the file.
 
 **Linux.** See [`contrib/seekr.service`](https://github.com/Swarsin/seekr/blob/main/contrib/seekr.service) for a systemd user unit.
 

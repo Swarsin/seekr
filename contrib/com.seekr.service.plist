@@ -11,10 +11,10 @@
     <string>/Users/YOU/.local/bin/seekr</string>
     <string>service</string>
     <string>start</string>
+    <string>--port</string>
+    <string>8000</string>
   </array>
   <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
   <true/>
   <key>StandardErrorPath</key>
   <string>/tmp/seekr-service.log</string>

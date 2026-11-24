@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - 2026-11-24
 
 ### Added
-- Native Windows and macOS support alongside Linux. See [`docs/install-windows-macos.md`](docs/install-windows-macos.md) for installing, registering the MCP server and starting the service at login (Task Scheduler script `contrib/seekr-task.ps1` and launchd agent `contrib/com.seekr.service.plist`; the systemd unit is unchanged).
+- Native Windows and macOS support alongside Linux, including Windows-safe folder management, UTF-8 output when redirected to a file or pipe, drive-path handling in `seekr open` and the web UI, PowerShell syntax in the `seekr init --demo` config hint, and no re-embedding of a renamed file on macOS. See [`docs/install-windows-macos.md`](docs/install-windows-macos.md) for installing, registering the MCP server and starting the service at login (Task Scheduler script `contrib/seekr-task.ps1` and launchd agent `contrib/com.seekr.service.plist`; the systemd unit is unchanged).
 - One background service, controlled with `seekr service start`, `seekr service stop` and `seekr service status`. It keeps the model warm, serves the web UI, watches the configured folders, and runs index updates and folder changes so they never race with the watcher.
 - `seekr web` starts the service (or reuses a running one), prints its address and returns; `--foreground` keeps the old serve-in-the-terminal behaviour.
 - CLI searches, `seekr similar`, indexing and `seekr mcp` route through the service when it is running and fall back to local work when it is not. The service API gained `/api/reindex`, `/api/similar`, `/api/shutdown`, path indexing and rerank/explain options, documented in `docs/web-api.md`.
@@ -25,17 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `seekr daemon` is a deprecated alias for `seekr service start` and will be removed in 0.4.0. The old Unix-socket query fast path remains Linux-only and is disabled on Windows and macOS.
 
 ### Fixed
-- On Windows, output redirected to a file or pipe (for example `seekr search --json > out.json`) is written as UTF-8, and redirected input is read as UTF-8, instead of failing on characters the ANSI code page lacks, such as the `ﬀ` ligature. Terminals and POSIX are unchanged; `seekr mcp` stdio is UTF-8 too.
-- Adding or removing folders from the web UI or service no longer fails on Windows with Python before 3.13 (`os.fchmod` is missing there).
-- `seekr web` reports a busy port as "already in use" on Windows instead of an access-permission error; the local server no longer sets `SO_REUSEADDR` there, where it lets a second socket bind a port in use.
-- A corrupt PDF is no longer kept locked on Windows after indexing it fails.
-- The deprecated `seekr daemon` is now unavailable on macOS, where clients could never verify it and every search through it failed; searches run locally instead.
-- Model-path errors show Windows paths without doubled backslashes.
-- `seekr open C:\path\file:L10` works on Windows; a raw drive path was cut at the drive colon.
-- `seekr init --demo` prints its `SEEKR_CONFIG` hint in PowerShell syntax on Windows.
-- Service routes treat only drive and UNC paths as absolute on Windows, the same on every Python version (Python 3.13 already did; 3.11 and 3.12 accepted a drive-less `\x`).
 - An edit that keeps a file's size and lands within one filesystem timestamp tick of indexing it is now caught when the file is checked again soon after, before the index records other writes more than 2 s later (for example, a quick re-save picked up by the next sync or watcher event). Files modified within 2 s of the latest index write are hashed instead of trusting an unchanged mtime and size. Before, such an edit was always missed.
-- Renaming a just-written file on macOS no longer re-embeds it.
 - The watcher indexes a file created where another was just moved away (A→B, new A, B→C) instead of leaving it for the next full sync.
 
 ## [0.2.0] - 2026-11-23

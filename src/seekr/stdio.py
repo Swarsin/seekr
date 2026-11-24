@@ -25,12 +25,21 @@ def needs_utf8(platform: str, encoding: str | None, isatty: bool) -> bool:
 
 def configure_redirected_streams(
     platform: str = sys.platform,
-    streams: tuple[TextIO | Any, ...] | None = None,
+    streams: tuple[tuple[TextIO | Any, str], ...] | None = None,
 ) -> None:
-    """Reconfigure redirected stdin, stdout and stderr to UTF-8 where needed."""
+    """Reconfigure redirected stdin, stdout and stderr to UTF-8 where needed.
+
+    ``streams`` pairs each stream with its error handler. Diagnostics must
+    never crash on an odd character, so stderr escapes what it cannot encode;
+    stdin and stdout stay strict.
+    """
     if streams is None:
-        streams = (sys.stdin, sys.stdout, sys.stderr)
-    for stream in streams:
+        streams = (
+            (sys.stdin, "strict"),
+            (sys.stdout, "strict"),
+            (sys.stderr, "backslashreplace"),
+        )
+    for stream, errors in streams:
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is None:
             continue
@@ -39,4 +48,4 @@ def configure_redirected_streams(
         except (ValueError, OSError):
             isatty = False
         if needs_utf8(platform, getattr(stream, "encoding", None), isatty):
-            reconfigure(encoding="utf-8")
+            reconfigure(encoding="utf-8", errors=errors)

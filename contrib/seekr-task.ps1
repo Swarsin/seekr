@@ -15,7 +15,7 @@ if (-not $SeekrPath) {
     throw "seekr was not found on PATH; pass -SeekrPath C:\path\to\seekr.exe"
 }
 
-$action = New-ScheduledTaskAction -Execute $SeekrPath -Argument "service start"
+$action = New-ScheduledTaskAction -Execute $SeekrPath -Argument "service start --port 8000"
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 # The service runs until stopped, so remove the default 72-hour time limit.
 $settings = New-ScheduledTaskSettingsSet `

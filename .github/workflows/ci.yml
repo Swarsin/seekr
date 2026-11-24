@@ -236,7 +236,7 @@ jobs:
       - name: Search returns results
         run: |
           "$VENV/$BIN/seekr" search "bias variance" --json > search.json
-          "$VENV/$BIN/python" -c "import json, sys; hits = json.load(open('search.json')); print(len(hits), 'results'); sys.exit(0 if hits else 1)"
+          "$VENV/$BIN/python" -c "import json, sys; hits = json.load(open('search.json', encoding='utf-8')); print(len(hits), 'results'); sys.exit(0 if hits else 1)"
       - name: seekr web starts the service
         run: |
           "$VENV/$BIN/seekr" web
