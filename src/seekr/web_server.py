@@ -522,6 +522,16 @@ class _DeadlineReader:
         self._buffer.clear()
 
 
+def reuses_address(platform: str = sys.platform) -> bool:
+    """Return whether the server sets ``SO_REUSEADDR`` on *platform*.
+
+    On POSIX it only lets a restart bind past ``TIME_WAIT``.  On Windows it
+    lets a second socket bind a port that is already in use, so a busy port
+    fails with "access forbidden" instead of "address in use" (or is shared).
+    """
+    return platform != "win32"
+
+
 class SeekrHTTPServer(ThreadingHTTPServer):
     """Loopback ``ThreadingHTTPServer`` with a bounded handler pool.
 
@@ -536,7 +546,7 @@ class SeekrHTTPServer(ThreadingHTTPServer):
     daemon_threads = False
     block_on_close = False
     request_queue_size = 16
-    allow_reuse_address = True
+    allow_reuse_address = reuses_address()
 
     def __init__(
         self,

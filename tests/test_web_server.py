@@ -212,7 +212,12 @@ def drip_until_closed(
             readable, _, _ = select.select([connection], [], [], 0)
             if not readable:
                 continue
-            chunk = connection.recv(65536)
+            try:
+                chunk = connection.recv(65536)
+            except OSError:
+                # Closing with our unread bytes queued resets the connection;
+                # macOS and Windows report that reset here.
+                return time.monotonic() - started, bytes(received)
             if not chunk:
                 return time.monotonic() - started, bytes(received)
             received.extend(chunk)
@@ -2143,17 +2148,27 @@ def test_signal_handlers_stay_installed_through_backend_shutdown() -> None:
             ready.set()
 
 
+        def interrupt():
+            # Aim SIGINT at the main thread, as a terminal Ctrl-C does:
+            # os.kill() lets macOS hand it to this thread instead, and on
+            # Windows it terminates the process.
+            if hasattr(signal, "pthread_kill"):
+                signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+            else:
+                signal.raise_signal(signal.SIGINT)
+
+
         def coordinator():
             try:
                 if not ready.wait(5):
                     return
-                os.kill(os.getpid(), signal.SIGINT)
+                interrupt()
                 if not backend.shutdown_entered.wait(5):
                     return
                 state["during_default"] = (
                     signal.getsignal(signal.SIGINT) is signal.default_int_handler
                 )
-                os.kill(os.getpid(), signal.SIGINT)
+                interrupt()
                 second_warning.wait(5)
             finally:
                 backend.release.set()
@@ -2798,3 +2813,12 @@ def test_relative_paths_and_keyword_rerank_are_rejected() -> None:
         assert backend.calls == []
         ok = _post(server, "/api/search", {"query": "x", "mode": "vector", "rerank": True})
         assert ok.status == 200
+
+
+def test_address_reuse_is_posix_only() -> None:
+    # On Windows SO_REUSEADDR lets a second socket bind a busy port, so an
+    # occupied port would not fail with "address in use".
+    assert web_server.reuses_address("linux")
+    assert web_server.reuses_address("darwin")
+    assert not web_server.reuses_address("win32")
+    assert web_server.SeekrHTTPServer.allow_reuse_address is web_server.reuses_address()
