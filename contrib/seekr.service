@@ -7,7 +7,7 @@ After=default.target
 Type=simple
 WorkingDirectory=%h
 # pipx installs the CLI here.  Replace this path if seekr lives elsewhere.
-ExecStart=%h/.local/bin/seekr service start
+ExecStart=%h/.local/bin/seekr service start --port 8000
 Restart=on-failure
 RestartSec=2
 # SIGTERM makes the service stop the watcher, close the index and remove its

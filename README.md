@@ -21,6 +21,10 @@ seekr search "bias variance tradeoff" --module machine-learning
 
 `seekr init` writes `config.toml` to your config directory (`~/.config/seekr` on Linux; see [where files live](https://github.com/Swarsin/seekr/blob/main/docs/install-windows-macos.md#where-files-live) for Windows and macOS), explicitly prompts to download `BAAI/bge-small-en-v1.5` (~130 MB of ONNX model files) and tree-sitter code grammars (via `seekr models pull`), and builds your initial index. The default install runs the models with ONNX Runtime on the CPU and is about 350 MB on disk — no PyTorch required. Want to try it before pointing at your own folders? Run `seekr init --demo` to copy and index the packaged sample course, or use `seekr models pull --rerank` / `--all`, `seekr models status`, and `seekr doctor` to inspect local readiness.
 
+### Upgrading from 0.2.0
+
+`seekr daemon` is replaced by `seekr service`. After `pipx upgrade seekr-search`, stop any running `seekr daemon` (Ctrl+C in its terminal, or `systemctl --user restart seekr` if it runs from the systemd unit) so the new code takes over; `seekr service start` refuses to start while an old daemon is still live. If you installed [`contrib/seekr.service`](https://github.com/Swarsin/seekr/blob/main/contrib/seekr.service), change its line to `ExecStart=%h/.local/bin/seekr service start --port 8000` and run `systemctl --user daemon-reload` before 0.4.0, which removes the `seekr daemon` alias.
+
 ### GPU / PyTorch backend
 
 The default ONNX Runtime backend gives the same results as PyTorch (mean cosine similarity 1.000 on 1,000 chunks, identical reranker order; see [`docs/benchmarks.md`](https://github.com/Swarsin/seekr/blob/main/docs/benchmarks.md)). To run the models with PyTorch instead — for example on a CUDA GPU — install the extra and switch the backend; existing indexes keep working without a reindex:

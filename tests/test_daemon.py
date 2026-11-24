@@ -1033,7 +1033,7 @@ class ServiceUnitTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("ExecStart=", service)
-        self.assertIn("seekr service start", service)
+        self.assertIn("seekr service start --port 8000", service)
         self.assertIn("WantedBy=default.target", service)
 
 
