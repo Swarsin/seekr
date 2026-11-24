@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 import subprocess
@@ -401,6 +402,14 @@ class _FakeApp:
 
 
 class CliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # The CLI cases below check the Linux and WSL opener rules; Windows
+        # and macOS hosts would otherwise pick their native opener.
+        linux_rules = functools.partial(opener_module.open_target, platform="linux")
+        patcher = mock.patch.object(cli_open, "open_target", linux_rules)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _registered(self) -> tuple[_FakeApp, _FakeTyper]:
         fake_typer = _FakeTyper()
         app = _FakeApp()

@@ -1516,6 +1516,7 @@ def test_hit_dto_highlights(tmp_path: Path) -> None:
         assert hit.to_dict()["highlights"] == [[10, 17], [26, 34]]
 
 
+@legacy_daemon_only
 def test_search_with_spread_returns_groups(tmp_path: Path) -> None:
     docs = _root(tmp_path)
     _write_docs(
@@ -1630,6 +1631,7 @@ def test_search_with_spread_returns_groups(tmp_path: Path) -> None:
         )
 
 
+@legacy_daemon_only
 def test_hit_dto_location_windows_on_wsl(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path)
     hits = [
@@ -1971,8 +1973,19 @@ def test_preview_page_png_out_of_range_page_is_404(tmp_path: Path) -> None:
     assert _error_code(raised.value) == "not_found"
 
 
-def test_open_chunk_runs_opener_without_shell_and_maps_errors(tmp_path: Path) -> None:
+def test_open_chunk_runs_opener_without_shell_and_maps_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import functools
     import types
+
+    from seekr import opener
+
+    # These are the Linux and WSL opener rules (Windows and macOS hosts would
+    # otherwise use their native opener).
+    monkeypatch.setattr(
+        opener, "open_target", functools.partial(opener.open_target, platform="linux")
+    )
 
     docs = _root(tmp_path, "open-docs")
     pdf_path = _make_pdf(
@@ -2577,7 +2590,11 @@ def test_removed_root_prefixes_match_case_and_unicode_variants_on_darwin() -> No
     configured = [Path("/vol/MO\u0301DULO")]
     with mock.patch("seekr.pathnorm._PLATFORM", "darwin"):
         prefixes = WebService._removed_root_prefixes("/vol/m\u00f3dulo", configured)
-    assert prefixes == ["/vol/m\u00f3dulo", "/vol/MO\u0301DULO"]
+    # The resolved and as-given spellings (which differ on Windows, where
+    # resolving adds a drive), then the configured variant spelling.
+    removed = Path("/vol/m\u00f3dulo")
+    expected = [str(removed.resolve()), str(removed), str(configured[0])]
+    assert prefixes == list(dict.fromkeys(expected))
     with mock.patch("seekr.pathnorm._PLATFORM", "linux"):
         prefixes = WebService._removed_root_prefixes("/vol/m\u00f3dulo", configured)
-    assert prefixes == ["/vol/m\u00f3dulo"]
+    assert prefixes == list(dict.fromkeys(expected[:2]))
