@@ -211,8 +211,9 @@ class LifecycleLockTests(unittest.TestCase):
 
         lock_path = self.db.with_name(self.db.name + ".lock")
         self.assertTrue(lock_path.is_file())
-        mode = stat.S_IMODE(lock_path.stat().st_mode)
-        self.assertEqual(mode & 0o077, 0)
+        if os.name == "posix":  # Windows has no POSIX permission bits
+            mode = stat.S_IMODE(lock_path.stat().st_mode)
+            self.assertEqual(mode & 0o077, 0)
 
 
 class RebuildTests(unittest.TestCase):

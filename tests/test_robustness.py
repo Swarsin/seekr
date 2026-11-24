@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import logging
 import os
 import sqlite3
@@ -61,7 +62,7 @@ class StructuredLoggingTests(unittest.TestCase):
             added=3,
             ok=True,
             empty=None,
-            path=Path("/tmp/my notes/doc.md"),
+            path=Path("/tmp/my notes/doc.md"),  # rendered with the host's separators
             note='a=b "q"',
         )
         output = buf.getvalue()
@@ -72,7 +73,7 @@ class StructuredLoggingTests(unittest.TestCase):
         self.assertIn("added=3", output)
         self.assertIn("ok=true", output)
         self.assertIn("empty=null", output)
-        self.assertIn('path="/tmp/my notes/doc.md"', output)
+        self.assertIn(f"path={json.dumps(str(Path('/tmp/my notes/doc.md')))}", output)
         self.assertIn('note="a=b \\"q\\""', output)
 
     @unittest.skipUnless(_NEEDS_REAL_STORE, "numpy, sqlite-vec and FTS5 are required")
@@ -133,6 +134,8 @@ class SubprocessVerboseCliTests(unittest.TestCase):
                 "XDG_CONFIG_HOME": str(base / "config"),
                 "XDG_DATA_HOME": str(base / "data"),
                 "XDG_RUNTIME_DIR": str(base / "runtime"),
+                # Windows and macOS do not read XDG_CONFIG_HOME.
+                "SEEKR_CONFIG": str(cfg_dir / "config.toml"),
             }
 
             quiet = self._run_cli(env, "search", "alpha", "--mode", "keyword")
