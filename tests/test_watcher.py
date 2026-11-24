@@ -327,6 +327,20 @@ class _FakeObserverTests(unittest.TestCase):
         self.assertTrue(_wait_for(lambda: bool(self.indexer.calls)))
         self.assertEqual(self.indexer.calls, [("move", src.resolve(), dst.resolve())])
 
+    def test_stale_modify_before_a_rename_does_not_drop_the_source(self) -> None:
+        # macOS FSEvents coalesces the earlier write into the rename and
+        # watchdog emits modified(old) before moved(old -> new).
+        src = self.root / "old.md"
+        dst = self.root / "new.md"
+        self.watcher.start()
+
+        self._dispatch("modified", src)
+        self._dispatch("moved", src, dst)
+
+        self.assertTrue(_wait_for(lambda: bool(self.indexer.calls)))
+        time.sleep(0.3)
+        self.assertEqual(self.indexer.calls, [("move", src.resolve(), dst.resolve())])
+
     def test_moves_to_the_same_destination_keep_each_source_pending(self) -> None:
         first = self.root / "first.md"
         second = self.root / "second.md"
