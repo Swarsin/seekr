@@ -401,7 +401,11 @@ def test_background_failure_exits_nonzero_with_hint(
     result = _invoke(["web"])
 
     assert result.exit_code == 1
-    assert "seekr service start --port 8000" in result.output
+    assert (
+        "the seekr service exited during startup (exit code 1); run "
+        "`seekr service start --port 8000` to see why"
+    ) in result.output
+    assert "did not start within" not in result.output
 
 
 def test_background_timeout_exits_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -413,6 +417,7 @@ def test_background_timeout_exits_nonzero(monkeypatch: pytest.MonkeyPatch) -> No
     result = _invoke(["web"])
 
     assert result.exit_code == 1
+    assert "did not start within 0 s" in result.output
     assert "seekr service start" in result.output
 
 

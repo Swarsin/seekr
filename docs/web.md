@@ -18,7 +18,7 @@ seekr web
 seekr is running at http://127.0.0.1:8000/
 ```
 
-The service keeps running after the command exits. If one is already running, `seekr web` reuses it and prints its actual address (which can differ from `--port`). If the service does not come up within 10 seconds the command fails; run `seekr service start` to see the error. Stop the service with `seekr service stop`, and check it with `seekr service status` or `seekr status`. To serve in the terminal instead, with the older Ctrl+C behaviour, use `seekr web --foreground`.
+The service keeps running after the command exits. If one is already running, `seekr web` reuses it and prints its actual address (which can differ from `--port`). If the service exits during startup (for example because the port is in use) or does not come up within 10 seconds, the command fails and says which; run `seekr service start --port <port>` to see the error. Stop the service with `seekr service stop`, and check it with `seekr service status` or `seekr status`. To serve in the terminal instead, with the older Ctrl+C behaviour, use `seekr web --foreground`.
 
 Open the printed `http://127.0.0.1:<port>` address. Use it exactly: the server is loopback-only and rejects `http://localhost:<port>`, other host names, and other machines. There is no option to expose it on your LAN or the public internet.
 

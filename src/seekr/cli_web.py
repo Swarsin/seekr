@@ -119,6 +119,15 @@ def _run_background(typer_module: Any, port: int, open_browser: bool) -> None:
             )
             raise typer_module.Exit(code=1) from None
         info = _wait_for_service(proc)
+        exit_code = getattr(proc, "poll", lambda: None)() if info is None else None
+        if info is None and exit_code is not None:
+            # Exited instead of answering, e.g. the port is already in use.
+            typer_module.echo(
+                f"seekr web: the seekr service exited during startup (exit code "
+                f"{exit_code}); run `seekr service start --port {port}` to see why.",
+                err=True,
+            )
+            raise typer_module.Exit(code=1)
         if info is None:
             typer_module.echo(
                 "seekr web: the background service did not start within "
