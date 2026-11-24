@@ -10,70 +10,249 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # The macOS python.org build that actions/setup-python installs lacks
+      # sqlite3 extension loading, which sqlite-vec needs; uv's managed CPython
+      # has it. Linux and Windows keep setup-python.
+      - if: runner.os != 'macOS'
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -e ".[dev,torch]"
-      - run: ruff check .
+      - if: runner.os == 'macOS'
+        uses: astral-sh/setup-uv@v6
+      - if: runner.os == 'macOS'
+        shell: bash
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
+        run: |
+          uv python install ${{ matrix.python-version }}
+          uv venv --seed --python ${{ matrix.python-version }} "$RUNNER_TEMP/py"
+          echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
+      - shell: bash
+        run: python -c "import sqlite3, sys; print(sys.version); sqlite3.connect(':memory:').enable_load_extension(False)"
+      # PyTorch is large and slow to install; the default backend is ONNX. The
+      # torch-dependent tests skip themselves when sentence-transformers is
+      # absent, so only Linux installs it.
+      - if: runner.os != 'Linux'
+        run: pip install -e ".[dev]"
+      - if: runner.os == 'Linux'
+        run: pip install -e ".[dev,torch]"
+      - if: runner.os == 'Linux' && matrix.python-version == '3.12'
+        run: ruff check .
       - run: pytest -m "not slow"
 
   minimal:
     # Default install only (ONNX Runtime, no PyTorch): the suite must pass
     # without the torch extra.
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - run: |
+          echo "VENV=$RUNNER_TEMP/m" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = Windows ]; then echo "BIN=Scripts" >> "$GITHUB_ENV"; else echo "BIN=bin" >> "$GITHUB_ENV"; fi
+      # The macOS python.org build that actions/setup-python installs lacks
+      # sqlite3 extension loading, which sqlite-vec needs; uv's managed CPython
+      # has it. Linux and Windows keep setup-python.
+      - if: runner.os != 'macOS'
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - if: runner.os == 'macOS'
+        uses: astral-sh/setup-uv@v6
+      - if: runner.os == 'macOS'
+        shell: bash
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
+        run: |
+          uv python install "3.12"
+          uv venv --seed --python "3.12" "$RUNNER_TEMP/py"
+          echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
+      - shell: bash
+        run: python -c "import sqlite3, sys; print(sys.version); sqlite3.connect(':memory:').enable_load_extension(False)"
       - run: pip install build
       - run: python -m build --wheel
       - run: |
-          python -m venv /tmp/m
-          /tmp/m/bin/pip install dist/*.whl pytest hypothesis
-          /tmp/m/bin/python -c "import importlib.util as u, sys; sys.exit(any(u.find_spec(m) for m in ('torch', 'sentence_transformers')))"
-          /tmp/m/bin/python -m pytest -m "not slow"
+          python -m venv "$VENV"
+          "$VENV/$BIN/python" -m pip install dist/*.whl pytest hypothesis
+          "$VENV/$BIN/python" -c "import importlib.util as u, sys; sys.exit(any(u.find_spec(m) for m in ('torch', 'sentence_transformers')))"
+          "$VENV/$BIN/python" -m pytest -m "not slow"
 
   wheel:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - run: |
+          echo "VENV=$RUNNER_TEMP/v" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = Windows ]; then echo "BIN=Scripts" >> "$GITHUB_ENV"; else echo "BIN=bin" >> "$GITHUB_ENV"; fi
+      # The macOS python.org build that actions/setup-python installs lacks
+      # sqlite3 extension loading, which sqlite-vec needs; uv's managed CPython
+      # has it. Linux and Windows keep setup-python.
+      - if: runner.os != 'macOS'
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - if: runner.os == 'macOS'
+        uses: astral-sh/setup-uv@v6
+      - if: runner.os == 'macOS'
+        shell: bash
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
+        run: |
+          uv python install "3.12"
+          uv venv --seed --python "3.12" "$RUNNER_TEMP/py"
+          echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
+      - shell: bash
+        run: python -c "import sqlite3, sys; print(sys.version); sqlite3.connect(':memory:').enable_load_extension(False)"
       - run: pip install build
       - run: python -m build
       - run: |
-          python -m venv /tmp/v
-          /tmp/v/bin/pip install dist/*.whl
-          version="$(/tmp/v/bin/seekr --version)"
+          python -m venv "$VENV"
+          "$VENV/$BIN/python" -m pip install dist/*.whl
+          expected="seekr $(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])' | tr -d '\r')"
+          version="$("$VENV/$BIN/seekr" --version | tr -d '\r')"
           echo "$version"
-          test "$version" = "seekr 0.2.0"
-          /tmp/v/bin/seekr doctor --env-only
+          test "$version" = "$expected"
+          "$VENV/$BIN/seekr" doctor --env-only
 
   slow:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # The macOS python.org build that actions/setup-python installs lacks
+      # sqlite3 extension loading, which sqlite-vec needs; uv's managed CPython
+      # has it. Linux and Windows keep setup-python.
+      - if: runner.os != 'macOS'
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e ".[dev,torch]"
+      - if: runner.os == 'macOS'
+        uses: astral-sh/setup-uv@v6
+      - if: runner.os == 'macOS'
+        shell: bash
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
+        run: |
+          uv python install "3.12"
+          uv venv --seed --python "3.12" "$RUNNER_TEMP/py"
+          echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
+      - shell: bash
+        run: python -c "import sqlite3, sys; print(sys.version); sqlite3.connect(':memory:').enable_load_extension(False)"
+      - if: runner.os != 'Linux'
+        run: pip install -e ".[dev]"
+      - if: runner.os == 'Linux'
+        run: pip install -e ".[dev,torch]"
       - id: hf-cache
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-${{ hashFiles('src/seekr/config.py', 'src/seekr/provision.py') }}
+          key: hf-${{ runner.os }}-${{ hashFiles('src/seekr/config.py', 'src/seekr/provision.py') }}
       - if: steps.hf-cache.outputs.cache-hit != 'true'
+        run: seekr models pull --rerank --yes
+      - if: runner.os == 'Linux' && steps.hf-cache.outputs.cache-hit != 'true'
         run: |
-          seekr models pull --rerank --yes
           python -c 'from sentence_transformers import SentenceTransformer; SentenceTransformer("BAAI/bge-small-en-v1.5")'
           python -c 'from sentence_transformers import CrossEncoder; CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")'
       - run: pytest -m slow
+
+  smoke:
+    # Installs the built wheel into a fresh venv and runs the first-run path:
+    # demo init (downloads models), search, then the background service.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo "VENV=$RUNNER_TEMP/s" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = Windows ]; then echo "BIN=Scripts" >> "$GITHUB_ENV"; else echo "BIN=bin" >> "$GITHUB_ENV"; fi
+          # Windows and macOS use the runner's home; Linux gets isolated dirs.
+          if [ "$RUNNER_OS" = Linux ]; then
+            echo "XDG_CONFIG_HOME=$RUNNER_TEMP/xdg/config" >> "$GITHUB_ENV"
+            echo "XDG_DATA_HOME=$RUNNER_TEMP/xdg/data" >> "$GITHUB_ENV"
+            echo "XDG_STATE_HOME=$RUNNER_TEMP/xdg/state" >> "$GITHUB_ENV"
+            echo "XDG_CACHE_HOME=$RUNNER_TEMP/xdg/cache" >> "$GITHUB_ENV"
+          fi
+      # The macOS python.org build that actions/setup-python installs lacks
+      # sqlite3 extension loading, which sqlite-vec needs; uv's managed CPython
+      # has it. Linux and Windows keep setup-python.
+      - if: runner.os != 'macOS'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - if: runner.os == 'macOS'
+        uses: astral-sh/setup-uv@v6
+      - if: runner.os == 'macOS'
+        shell: bash
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
+        run: |
+          uv python install "3.12"
+          uv venv --seed --python "3.12" "$RUNNER_TEMP/py"
+          echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
+      - run: python -c "import sqlite3, sys; print(sys.version); sqlite3.connect(':memory:').enable_load_extension(False)"
+      - run: pip install build
+      - run: python -m build --wheel
+      - name: Install the wheel into a fresh venv
+        run: |
+          python -m venv "$VENV"
+          "$VENV/$BIN/python" -m pip install dist/*.whl
+          "$VENV/$BIN/seekr" --version
+          "$VENV/$BIN/seekr" doctor --env-only
+      - name: Demo init downloads models and builds the index
+        run: |
+          "$VENV/$BIN/seekr" init --demo --yes
+      - name: Search returns results
+        run: |
+          "$VENV/$BIN/seekr" search "bias variance" --json > search.json
+          "$VENV/$BIN/python" -c "import json, sys; hits = json.load(open('search.json', encoding='utf-8')); print(len(hits), 'results'); sys.exit(0 if hits else 1)"
+      - name: seekr web starts the service
+        run: |
+          "$VENV/$BIN/seekr" web
+      - name: Service reports running
+        run: |
+          out="$("$VENV/$BIN/seekr" service status | tr -d '\r')"
+          echo "$out"
+          echo "$out" | grep -q '^pid: '
+          echo "$out" | grep -q '^port: '
+      - name: Stop the service
+        run: |
+          "$VENV/$BIN/seekr" service stop
+          out="$("$VENV/$BIN/seekr" service status | tr -d '\r')"
+          echo "$out"
+          echo "$out" | grep -q 'not running'
+      - name: Stop the service if a step failed
+        if: failure()
+        run: |
+          "$VENV/$BIN/seekr" service stop || true

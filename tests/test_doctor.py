@@ -158,6 +158,9 @@ class DoctorExpandedTests(unittest.TestCase):
             self.assertEqual(res.exit_code, 0, res.output)
             self.assertEqual(captured, [True])
 
+    @unittest.skipUnless(
+        os.name == "posix", "WSL drive mounts are POSIX mount points, absent on Windows"
+    )
     def test_doctor_wsl_polled_roots_info(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             polled_dir = Path(tmp) / "mnt" / "c" / "course"
@@ -240,7 +243,7 @@ class DoctorExpandedTests(unittest.TestCase):
             file_checks = {c.name: c for c in file_report.checks}
             self.assertFalse(file_checks["roots"].ok)
 
-            if os.geteuid() != 0:
+            if os.name == "posix" and os.geteuid() != 0:  # POSIX modes only
                 unreadable = base / "unreadable"
                 unreadable.mkdir()
                 unreadable.chmod(0o000)

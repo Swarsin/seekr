@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-24
+
+### Upgrading from 0.2.0
+- After `pipx upgrade seekr-search`, stop any `seekr daemon` that is still running the old code (Ctrl+C in its terminal), or run `systemctl --user restart seekr` if it runs from the systemd unit, so the unit starts the new code. While an old daemon is live, `seekr service start` refuses to start and says so.
+- If you installed a copy of `contrib/seekr.service`, change its `ExecStart` to `ExecStart=%h/.local/bin/seekr service start --port 8000` and run `systemctl --user daemon-reload` before 0.4.0, which removes `seekr daemon`. Until then the old `ExecStart=… seekr daemon` line keeps working, because `seekr daemon` is an alias for `seekr service start`.
+
+### Added
+- Native Windows and macOS support alongside Linux, including Windows-safe folder management, UTF-8 output when redirected to a file or pipe, drive-path handling in `seekr open` and the web UI, safe opening (PDFs and Office files use the default app; code, text, Markdown, notebooks and transcripts open in `$EDITOR`, Notepad or the macOS text editor, never through the default action that can run a `.py` or `.js` file; `$SEEKR_OPENER` overrides the opener on every OS), PowerShell syntax in the `seekr init --demo` config hint, and no re-embedding of a renamed file on macOS. See [`docs/install-windows-macos.md`](docs/install-windows-macos.md) for installing, registering the MCP server and starting the service at login (Task Scheduler script `contrib/seekr-task.ps1` and launchd agent `contrib/com.seekr.service.plist`; the systemd unit `contrib/seekr.service` now runs `seekr service start --port 8000` instead of `seekr daemon`).
+- One background service, controlled with `seekr service start`, `seekr service stop` and `seekr service status`. It keeps the model warm, serves the web UI, watches the configured folders, and runs index updates and folder changes so they never race with the watcher.
+- `seekr web` starts the service (or reuses a running one), prints its address and returns; `--foreground` keeps the old serve-in-the-terminal behaviour.
+- CLI searches, `seekr similar`, indexing and `seekr mcp` route through the service when it is running and fall back to local work when it is not. The service API gained `/api/reindex`, `/api/similar`, `/api/shutdown`, path indexing and rerank/explain options, documented in `docs/web-api.md`.
+- `seekr status` reports the service state.
+- `seekr service start` refuses to start on Linux while a `seekr daemon` from an older version still answers on its Unix socket.
+- Commands route to the service only when it uses the same config file and index database as the command; with another `SEEKR_CONFIG` (or a config naming another `db_path`) searches, `seekr similar`, `seekr index` and `seekr reindex` run locally against that index. `/api/status` reports `index.db_path` for this check.
+
+### Changed
+- Config, data and state directories follow the platform conventions through `platformdirs`: `~/Library/Application Support/seekr` on macOS and `%LOCALAPPDATA%\seekr` on Windows. Linux paths (`$XDG_CONFIG_HOME/seekr`, `$XDG_DATA_HOME/seekr`) are unchanged.
+- On macOS, seekr needs a Python whose `sqlite3` can load extensions (the python.org build cannot); use Homebrew Python or a uv-managed CPython and check with `seekr doctor`.
+- Lifecycle locking uses portable shared/exclusive file locks, and the index swap in a reindex is Windows-safe.
+
+### Deprecated
+- `seekr daemon` is a deprecated alias for `seekr service start` and will be removed in 0.4.0. The old Unix-socket query fast path remains Linux-only and is disabled on Windows and macOS.
+
+### Fixed
+- An edit that keeps a file's size and lands within one filesystem timestamp tick of indexing it is now caught when the file is checked again soon after, before the index records other writes more than 2 s later (for example, a quick re-save picked up by the next sync or watcher event). Files modified within 2 s of the latest index write are hashed instead of trusting an unchanged mtime and size. Before, such an edit was always missed.
+- The watcher indexes a file created where another was just moved away (A→B, new A, B→C) instead of leaving it for the next full sync.
+- `--rerank` searches through the service (and the web UI) reuse one warm cross-encoder instead of loading the reranker model again for every query.
+- Removing a folder can no longer leave its documents indexed: an edit under the folder that was waiting for the service's index lane re-added the file after the purge. The watcher now gets the new folder list before the lane is released and re-checks that a path is still watched before indexing it.
+
 ## [0.2.0] - 2026-11-23
 
 ### Added

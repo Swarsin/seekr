@@ -11,7 +11,7 @@ from typing import Literal
 
 from . import platform_info
 from .config import Config, ConfigError, default_config_path, load_config
-from .platform_info import Mount, is_slow_path
+from .platform_info import Mount, is_polled_root
 from .provision import ModelAsset, assets_for, is_cached, missing_grammars
 
 VectorLoader = Callable[[sqlite3.Connection], None]
@@ -69,8 +69,15 @@ class DoctorReport:
 
 
 def _default_daemon_state() -> str:
-    from .daemon import _socket_is_active, socket_path, socket_path_problem
+    from .daemon import (
+        _socket_is_active,
+        legacy_daemon_supported,
+        socket_path,
+        socket_path_problem,
+    )
 
+    if not legacy_daemon_supported():
+        return "unavailable (not supported on this platform)"
     sock = socket_path()
     problem = socket_path_problem(sock)
     if problem is not None:
@@ -373,13 +380,8 @@ def _check_wsl_roots(cfg: Config | None, probes: DoctorProbes) -> DoctorCheck | 
     mounts = probes.mounts()
     polled: list[str] = []
     for raw_root in cfg.roots:
-        expanded = Path(raw_root).expanduser()
-        try:
-            resolved = expanded.resolve(strict=False)
-        except (OSError, RuntimeError):
-            resolved = expanded
-        if is_slow_path(resolved, mounts) or is_slow_path(expanded, mounts):
-            polled.append(str(expanded))
+        if is_polled_root(raw_root, mounts):
+            polled.append(str(Path(raw_root).expanduser()))
 
     if not polled:
         return DoctorCheck(

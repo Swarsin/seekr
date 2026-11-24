@@ -10,19 +10,30 @@ are sanitised and bounded.
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
+import subprocess
+import sys
 import unicodedata
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .models import Hit
 
 __all__ = [
     "OPEN_SUCCESS_CODES",
+    "Argv",
+    "OpenAction",
+    "OpenFailed",
+    "StartFile",
     "format_pick_line",
     "open_command",
+    "open_target",
     "parse_pick_line",
+    "run_open",
 ]
 
 OPEN_SUCCESS_CODES: dict[str, frozenset[int]] = {"explorer.exe": frozenset({0, 1})}
@@ -30,6 +41,8 @@ OPEN_SUCCESS_CODES: dict[str, frozenset[int]] = {"explorer.exe": frozenset({0, 1
 _MAX_SNIPPET_CHARS = 240
 _LINE_LOCATOR_RE = re.compile(r"L(\d+)(?:-\d+)?\Z")
 _PAGE_LOCATOR_RE = re.compile(r"p\.(\d+)\Z")
+# A raw (unescaped) Windows drive path: ``C:\notes\a.md`` or ``C:/notes/a.md``.
+_RAW_DRIVE_PATH_RE = re.compile(r"[A-Za-z]:[\\/]")
 
 _ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
 _SETEXT_UNDERLINE = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
@@ -40,6 +53,11 @@ _INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _ESCAPE_WIDTHS = {"x": 2, "u": 4, "U": 8}
 _TEXT_KINDS = frozenset({"code", "markdown", "text"})
+# Kinds that Windows and macOS hand to their default application.  Everything
+# else (code, text, Markdown, notebooks, transcripts and unknown files) opens in
+# an editor there, because the default verb can *run* a script: Windows Script
+# Host executes ``.js`` and the py launcher executes ``.py``.
+_DOCUMENT_KINDS = frozenset({"pdf", "word", "slides"})
 
 
 def _is_invisible(character: str) -> bool:
@@ -164,14 +182,24 @@ def format_pick_line(hit: Hit) -> str:
     return f"{path}:{locator}\t{_display_snippet(hit.snippet)}"
 
 
-def parse_pick_line(line: str) -> tuple[str, str]:
+def parse_pick_line(line: str, *, platform: str = sys.platform) -> tuple[str, str]:
     """Return ``(path, locator)`` from a pick line or raw ``path:locator``.
 
     The first tab separates the optional snippet.  The path ends at the first
     colon that is not escaped, so raw unambiguous ``path:locator`` inputs and
     the escaped output of :func:`format_pick_line` both round-trip.
+
+    On Windows a raw ``C:\\dir\\file:locator`` is taken as typed: its
+    backslashes are separators, not escapes, and the drive colon does not end
+    the path.  (:func:`format_pick_line` escapes that colon, so its output
+    never looks like this.)
     """
     left = line.split("\t", 1)[0]
+    if platform == "win32" and _RAW_DRIVE_PATH_RE.match(left):
+        end = left.find(":", 2)
+        if end == -1:
+            return left, ""
+        return left[:end], left[end + 1 :]
     encoded_path, encoded_locator = _split_encoded_colon(left)
     return _unescape_value(encoded_path), _unescape_value(encoded_locator)
 
@@ -202,12 +230,27 @@ def _page_number(locator: str) -> int | None:
     return page if page > 0 else None
 
 
+def _split_command(raw: str, *, platform: str = "linux") -> list[str]:
+    """Split a command from the environment without a shell.
+
+    Windows paths keep their backslashes: there the split is non-POSIX and
+    only the surrounding double quotes of a token are removed.
+    """
+    try:
+        if platform == "win32":
+            parts = shlex.split(raw, posix=False)
+            return [
+                part[1:-1] if len(part) >= 2 and part[0] == part[-1] == '"' else part
+                for part in parts
+            ]
+        return shlex.split(raw)
+    except ValueError:
+        return []
+
+
 def _editor_argv(env: Mapping[str, str]) -> list[str]:
     raw = env.get("EDITOR", "")
-    try:
-        argv = shlex.split(raw) if raw else []
-    except ValueError:
-        argv = []
+    argv = _split_command(raw) if raw else []
     return argv or ["nvim"]
 
 
@@ -335,3 +378,118 @@ def open_command(
             return [*_editor_argv(env), f"+{line}", safe_path]
 
     return ["xdg-open", safe_path]
+
+
+@dataclass(frozen=True)
+class Argv:
+    """Run *argv* directly (never through a shell)."""
+
+    argv: list[str]
+
+
+@dataclass(frozen=True)
+class StartFile:
+    """Open *path* with the Windows file association."""
+
+    path: str
+
+
+OpenAction = Argv | StartFile
+
+
+class OpenFailed(Exception):
+    """The opener ran but exited with an unsuccessful status."""
+
+    def __init__(self, program: str, returncode: int) -> None:
+        super().__init__(f"opener {program!r} exited with status {returncode}")
+        self.program = program
+        self.returncode = returncode
+
+
+def open_target(
+    path: str,
+    locator: str,
+    kind: str,
+    *,
+    env: Mapping[str, str],
+    which: Callable[[str], str | None],
+    platform: str = sys.platform,
+    wsl: bool = False,
+    to_windows: Callable[[str], str | None] | None = None,
+) -> OpenAction:
+    """Choose how to open *path* on the current platform.
+
+    ``$SEEKR_OPENER`` (split without a shell, the path appended) wins on every
+    platform and for every kind.  Otherwise Linux and WSL keep the
+    :func:`open_command` behaviour.  On Windows and macOS documents (PDF, Word,
+    PowerPoint) open in their default application; every other kind opens in
+    ``$EDITOR`` (at the line when the locator has one) or, without it, in
+    Notepad or the macOS default text editor -- never through the default
+    verb, which can execute a script.
+    """
+    safe_path = _safe_argv_path(path)
+    opener_argv = _split_command(env.get("SEEKR_OPENER", ""), platform=platform)
+    if opener_argv:
+        return Argv([*opener_argv, safe_path])
+
+    if platform not in ("win32", "darwin"):
+        return Argv(
+            open_command(path, locator, kind, env, which, wsl=wsl, to_windows=to_windows)
+        )
+
+    if kind in _DOCUMENT_KINDS:
+        return StartFile(path) if platform == "win32" else Argv(["open", safe_path])
+
+    editor = _split_command(env.get("EDITOR", ""), platform=platform)
+    if editor:
+        line = _line_number(locator)
+        if line is None and kind == "markdown" and locator.startswith("\u00a7"):
+            line = _markdown_heading_line(path, locator)
+        located = [f"+{line}"] if line is not None else []
+        return Argv([*editor, *located, safe_path])
+    if platform == "win32":
+        return Argv(["notepad.exe", safe_path])
+    return Argv(["open", "-t", safe_path])
+
+
+def run_open(action: OpenAction, *, wait: bool = True) -> None:
+    """Execute *action*.
+
+    With ``wait=True`` (the default, used by ``seekr open``) an ``Argv`` runs in
+    the foreground until it exits, and :class:`OpenFailed` is raised on an
+    unsuccessful exit status (see ``OPEN_SUCCESS_CODES``).
+
+    With ``wait=False`` (used by the web service) an ``Argv`` is started
+    detached -- own session or process group, no shared console, stdio on
+    ``DEVNULL`` -- and this returns as soon as it has started, so a
+    long-lived editor never ties up the caller.  The exit status is never
+    seen, so ``OPEN_SUCCESS_CODES`` does not apply and :class:`OpenFailed` is
+    not raised.
+
+    ``OSError`` and ``ValueError`` from launching propagate to the caller in
+    both modes.
+    """
+    if isinstance(action, StartFile):
+        getattr(os, "startfile")(action.path)  # noqa: B009 - Windows only
+        return
+    if not wait:
+        kwargs: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = getattr(
+                subprocess, "DETACHED_PROCESS", 0x00000008
+            ) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(action.argv, **kwargs)
+        return
+    result = subprocess.run(action.argv, check=False)
+    success_codes = OPEN_SUCCESS_CODES.get(
+        Path(action.argv[0]).name.lower(), frozenset({0})
+    )
+    if result.returncode not in success_codes:
+        raise OpenFailed(action.argv[0], result.returncode)

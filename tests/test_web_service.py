@@ -10,6 +10,8 @@ import contextlib
 import json
 import socket
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -17,13 +19,14 @@ from unittest import mock
 
 import pytest
 
+from _platform import LEGACY_DAEMON, legacy_daemon_only
 from seekr.cli_search import get_hits
 from seekr.config import Config, load_config
 from seekr.embed import FakeEmbedder
 from seekr.indexer import Indexer, SyncReport
 from seekr.lifecycle import LifecycleLock
 from seekr.locations import format_location
-from seekr.models import ChunkSpec, Hit, text_sha
+from seekr.models import ChunkSpec, Hit, HitExplain, text_sha
 from seekr.platform_info import Mount
 from seekr.store import SCHEMA_VERSION, Store, StoredChunk
 from seekr.web_contract import (
@@ -33,6 +36,7 @@ from seekr.web_contract import (
     HitDTO,
     PreviewView,
     SearchRequest,
+    SimilarRequest,
 )
 from seekr.web_service import WebService, _socket_is_live
 
@@ -536,6 +540,8 @@ def test_status_missing_empty_ready_incompatible_and_error(tmp_path: Path) -> No
         assert missing.model["state"] == "unchecked"
         assert missing.config["state"] == "ok"
         assert missing.daemon["present"] is False
+        assert missing.service == {"running": False, "pid": None, "version": None}
+        assert missing.to_dict()["service"] == missing.service
         assert missing.activity == {"lane": "idle", "job_id": None}
         assert not missing_db.exists()
         assert built == []
@@ -780,9 +786,9 @@ def test_engine_lane_busy_keyword_bypass_and_status_real_first_index(
         with pytest.raises(ApiError) as raised:
             service.start_model_check()
         assert _error_code(raised.value) == "busy"
-        with pytest.raises(ApiError) as raised:
-            service.search(SearchRequest("xylophone", mode="hybrid"))
-        assert _error_code(raised.value) == "busy"
+        # Searches read concurrently with the index write.
+        hybrid = service.search(SearchRequest("xylophone", mode="hybrid"))
+        assert hybrid.hits
 
         keyword = service.search(SearchRequest("xylophone", mode="keyword"))
         assert keyword.hits
@@ -875,6 +881,7 @@ def test_keyword_lifecycle_lock_busy_maps_to_409(tmp_path: Path) -> None:
         lock.release()
 
 
+@legacy_daemon_only
 def test_daemon_first_bypasses_lane_and_local_fallback_uses_use_daemon_false(
     tmp_path: Path,
 ) -> None:
@@ -939,6 +946,7 @@ def test_daemon_first_bypasses_lane_and_local_fallback_uses_use_daemon_false(
         assert local_calls == []
 
 
+@legacy_daemon_only
 def test_daemon_failure_and_live_index_refusal_and_root_warning(tmp_path: Path) -> None:
     root = _root(tmp_path)
     config_path = _write_config(tmp_path, roots=[root])
@@ -962,10 +970,11 @@ def test_daemon_failure_and_live_index_refusal_and_root_warning(tmp_path: Path) 
         assert _error_code(raised.value) == "daemon_active"
 
         added = service.add_root(str(_root(tmp_path, "second")), service.roots().revision)
-        assert added.daemon_restart_required is True
-        assert added.warning
+        assert added.daemon_restart_required is False
+        assert added.warning is None
 
 
+@legacy_daemon_only
 def test_daemon_socket_liveness_is_a_real_unix_probe(tmp_path: Path) -> None:
     root = _root(tmp_path)
     config_path = _write_config(tmp_path, roots=[root])
@@ -1235,14 +1244,15 @@ def test_index_preflight_order(tmp_path: Path) -> None:
             service.start_index()
         assert _error_code(raised.value) == "no_roots"
 
-    daemon_root = _root(tmp_path, "daemon-root")
-    daemon_config = _write_config(tmp_path, roots=[daemon_root])
-    with _service(
-        daemon_config, tmp_path, daemon_probe=lambda path: True
-    ) as service:
-        with pytest.raises(ApiError) as raised:
-            service.start_index()
-        assert _error_code(raised.value) == "daemon_active"
+    if LEGACY_DAEMON:  # the daemon only exists on Linux
+        daemon_root = _root(tmp_path, "daemon-root")
+        daemon_config = _write_config(tmp_path, roots=[daemon_root])
+        with _service(
+            daemon_config, tmp_path, daemon_probe=lambda path: True
+        ) as service:
+            with pytest.raises(ApiError) as raised:
+                service.start_index()
+            assert _error_code(raised.value) == "daemon_active"
 
     mismatch_root = _root(tmp_path, "mismatch-root")
     (mismatch_root / "a.txt").write_text("alpha\n", encoding="utf-8")
@@ -1575,53 +1585,54 @@ def test_search_with_spread_returns_groups(tmp_path: Path) -> None:
         assert no_hits.spread == ()
         assert no_hits.to_dict()["spread"] == []
 
-    daemon_calls: list[dict[str, object]] = []
-    daemon_main_hit = Hit(
-        chunk_id=101,
-        path="/course/ml/week4/a.md",
-        locator="L1",
-        loc_start=1.0,
-        snippet="entropy",
-        score=0.9,
-        kind="markdown",
-        module="ml",
-        week=4,
-    )
-    daemon_spread_hits = [
-        daemon_main_hit,
-        Hit(
-            chunk_id=102,
-            path="/course/ml/week2/b.md",
+    if LEGACY_DAEMON:  # the daemon half only exists on Linux
+        daemon_calls: list[dict[str, object]] = []
+        daemon_main_hit = Hit(
+            chunk_id=101,
+            path="/course/ml/week4/a.md",
             locator="L1",
             loc_start=1.0,
             snippet="entropy",
-            score=0.8,
+            score=0.9,
             kind="markdown",
             module="ml",
-            week=2,
-        ),
-    ]
-
-    def daemon_search(*args, **kwargs):
-        daemon_calls.append({"query": args[0], **kwargs})
-        return [daemon_main_hit] if len(daemon_calls) == 1 else daemon_spread_hits
-
-    with _service(
-        config_path,
-        tmp_path,
-        daemon_probe=lambda _path: True,
-        daemon_search=daemon_search,
-    ) as service:
-        res = service.search(
-            SearchRequest("entropy", mode="hybrid", k=1, per_file=1, spread=True)
+            week=4,
         )
-        assert len(daemon_calls) == 2
-        assert daemon_calls[1]["k"] == 30
-        assert daemon_calls[1]["per_file"] == 2
-        assert res.spread == (
-            {"module": "ml", "week": 2, "first": True, "chunk_ids": [102]},
-            {"module": "ml", "week": 4, "first": False, "chunk_ids": [101]},
-        )
+        daemon_spread_hits = [
+            daemon_main_hit,
+            Hit(
+                chunk_id=102,
+                path="/course/ml/week2/b.md",
+                locator="L1",
+                loc_start=1.0,
+                snippet="entropy",
+                score=0.8,
+                kind="markdown",
+                module="ml",
+                week=2,
+            ),
+        ]
+
+        def daemon_search(*args, **kwargs):
+            daemon_calls.append({"query": args[0], **kwargs})
+            return [daemon_main_hit] if len(daemon_calls) == 1 else daemon_spread_hits
+
+        with _service(
+            config_path,
+            tmp_path,
+            daemon_probe=lambda _path: True,
+            daemon_search=daemon_search,
+        ) as service:
+            res = service.search(
+                SearchRequest("entropy", mode="hybrid", k=1, per_file=1, spread=True)
+            )
+            assert len(daemon_calls) == 2
+            assert daemon_calls[1]["k"] == 30
+            assert daemon_calls[1]["per_file"] == 2
+            assert res.spread == (
+                {"module": "ml", "week": 2, "first": True, "chunk_ids": [102]},
+                {"module": "ml", "week": 4, "first": False, "chunk_ids": [101]},
+            )
 
 
 def test_hit_dto_location_windows_on_wsl(tmp_path: Path) -> None:
@@ -1666,6 +1677,9 @@ def test_hit_dto_location_windows_on_wsl(tmp_path: Path) -> None:
         daemon_probe=lambda _path: True,
         daemon_search=lambda *_args, **_kwargs: hits,
     ) as service:
+        # The daemon hook only injects fixed WSL paths; the location mapping
+        # under test is pure string work, so report a daemon on every host.
+        service._daemon_status = lambda: (True, tmp_path / "seekr.sock")
         with (
             mock.patch("seekr.platform_info.is_wsl", return_value=True),
             mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
@@ -1965,8 +1979,18 @@ def test_preview_page_png_out_of_range_page_is_404(tmp_path: Path) -> None:
     assert _error_code(raised.value) == "not_found"
 
 
-def test_open_chunk_runs_opener_without_shell_and_maps_errors(tmp_path: Path) -> None:
-    import types
+def test_open_chunk_runs_opener_without_shell_and_maps_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import functools
+
+    from seekr import opener
+
+    # These are the Linux and WSL opener rules (Windows and macOS hosts would
+    # otherwise use their native opener).
+    monkeypatch.setattr(
+        opener, "open_target", functools.partial(opener.open_target, platform="linux")
+    )
 
     docs = _root(tmp_path, "open-docs")
     pdf_path = _make_pdf(
@@ -1984,15 +2008,12 @@ def test_open_chunk_runs_opener_without_shell_and_maps_errors(tmp_path: Path) ->
         with (
             mock.patch("seekr.platform_info.is_wsl", return_value=False),
             mock.patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}" if name == "zathura" else None),
-            mock.patch(
-                "subprocess.run",
-                return_value=types.SimpleNamespace(returncode=0),
-            ) as run_mock,
+            mock.patch("subprocess.Popen") as run_mock,
         ):
             service.open_chunk(pdf_chunk)
-        run_mock.assert_called_once_with(
-            ["zathura", "-P", "1", str(pdf_path)], check=False
-        )
+        assert run_mock.call_count == 1
+        assert run_mock.call_args.args == (["zathura", "-P", "1", str(pdf_path)],)
+        assert run_mock.call_args.kwargs["stdin"] == subprocess.DEVNULL
 
         mounts = [Mount(source="C:\\", mount_point="/mnt/c", fstype="9p")]
         store = Store(db_path, "fake", 64, vector_quant="int8")
@@ -2016,35 +2037,16 @@ def test_open_chunk_runs_opener_without_shell_and_maps_errors(tmp_path: Path) ->
             mock.patch("seekr.platform_info.is_wsl", return_value=True),
             mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
             mock.patch("shutil.which", return_value=None),
-            mock.patch(
-                "subprocess.run",
-                return_value=types.SimpleNamespace(returncode=1),
-            ) as run_mock,
+            mock.patch("subprocess.Popen") as run_mock,
         ):
             service.open_chunk(wsl_chunk)
-        run_mock.assert_called_once_with(
-            ["explorer.exe", r"C:\course\wsl.pdf"], check=False
-        )
-
-        # Non-success exit code -> 500 internal_error
-        with (
-            mock.patch("seekr.platform_info.is_wsl", return_value=True),
-            mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
-            mock.patch("shutil.which", return_value=None),
-            mock.patch(
-                "subprocess.run",
-                return_value=types.SimpleNamespace(returncode=2),
-            ),
-            pytest.raises(ApiError) as raised,
-        ):
-            service.open_chunk(wsl_chunk)
-        assert _error_code(raised.value) == "internal_error"
+        assert run_mock.call_args.args == (["explorer.exe", r"C:\course\wsl.pdf"],)
 
         # Missing executable -> 500 internal_error
         with (
             mock.patch("seekr.platform_info.is_wsl", return_value=False),
             mock.patch("shutil.which", return_value=None),
-            mock.patch("subprocess.run", side_effect=FileNotFoundError("xdg-open")),
+            mock.patch("subprocess.Popen", side_effect=FileNotFoundError("xdg-open")),
             pytest.raises(ApiError) as raised,
         ):
             service.open_chunk(pdf_chunk)
@@ -2067,6 +2069,41 @@ def test_open_chunk_runs_opener_without_shell_and_maps_errors(tmp_path: Path) ->
         assert _error_code(raised.value) == "not_found"
 
 
+def test_open_chunk_returns_while_opener_still_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code = "import time; time.sleep(5)"
+    monkeypatch.setenv("SEEKR_OPENER", subprocess.list2cmdline([sys.executable, "-c", code]))
+
+    docs = _root(tmp_path, "open-slow")
+    _write_docs(docs, {"notes.md": "# Title\n\nsome body text\n"})
+    db_path = tmp_path / "slow.db"
+    config_path = _write_config(tmp_path, roots=[docs], db_path=db_path)
+    real_popen = subprocess.Popen
+    children: list[subprocess.Popen[bytes]] = []
+
+    def spy(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        child = real_popen(*args, **kwargs)  # type: ignore[call-overload]
+        children.append(child)
+        return child
+
+    try:
+        with _service(config_path, tmp_path) as service:
+            assert _wait_job(service, service.start_index()).state == "succeeded"
+            chunk = _chunk_id_for_path(db_path, str(docs / "notes.md"))
+            with mock.patch("subprocess.Popen", side_effect=spy):
+                started = time.monotonic()
+                service.open_chunk(chunk)
+                elapsed = time.monotonic() - started
+            assert elapsed < 3
+            assert len(children) == 1
+            assert children[0].poll() is None  # still running after return
+    finally:
+        for child in children:
+            child.kill()
+            child.wait(timeout=10)
+
+
 def test_remove_root_purges_config_and_db_respects_prefix_lane_and_daemon(
     tmp_path: Path,
 ) -> None:
@@ -2077,11 +2114,12 @@ def test_remove_root_purges_config_and_db_respects_prefix_lane_and_daemon(
     db_path = tmp_path / "remove.db"
     config_path = _write_config(tmp_path, roots=[root, root2], db_path=db_path)
 
-    with _service(config_path, tmp_path, daemon_probe=lambda _p: True) as daemon_service:
-        rev = daemon_service.roots().revision
-        with pytest.raises(ApiError) as raised:
-            daemon_service.remove_root(str(root), rev)
-        assert _error_code(raised.value) == "daemon_active"
+    if LEGACY_DAEMON:  # the daemon only exists on Linux
+        with _service(config_path, tmp_path, daemon_probe=lambda _p: True) as daemon_service:
+            rev = daemon_service.roots().revision
+            with pytest.raises(ApiError) as raised:
+                daemon_service.remove_root(str(root), rev)
+            assert _error_code(raised.value) == "daemon_active"
 
     paused = _PausingIndexer()
     with _service(
@@ -2312,3 +2350,313 @@ def test_preview_page_png_locator_variants_and_encrypted_pdf(tmp_path: Path) -> 
             service.preview_page_png(empty_id)
         assert _error_code(raised.value) == "not_found"
         assert closed == [True]
+
+
+# -- service-client surface: rerank/explain, similar, shutdown, path indexing --
+
+
+def test_search_passes_rerank_and_explain_and_maps_explain(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    config_path = _write_config(tmp_path, roots=[root])
+    _add_indexed_document(tmp_path / "index.db")
+    seen: list[dict[str, object]] = []
+    explained = Hit(
+        chunk_id=1,
+        path="/notes/a.txt",
+        locator="L1",
+        loc_start=1.0,
+        snippet="alpha",
+        score=0.5,
+        kind="text",
+        explain=HitExplain(keyword_rank=1, keyword_bm25=-2.5, rrf_score=0.03),
+    )
+
+    def local(query, **kwargs):
+        seen.append(kwargs)
+        return [explained]
+
+    with _service(config_path, tmp_path, local_search=local) as service:
+        plain = service.search(SearchRequest("alpha", mode="hybrid"))
+        assert seen[-1]["rerank"] is False
+        assert seen[-1]["explain"] is False
+        assert "explain" not in plain.to_dict()["hits"][0]
+
+        rich = service.search(
+            SearchRequest("alpha", mode="hybrid", rerank=True, explain=True)
+        )
+        assert seen[-1]["rerank"] is True
+        assert seen[-1]["explain"] is True
+        payload = rich.to_dict()["hits"][0]["explain"]
+        assert payload["keyword_rank"] == 1
+        assert payload["keyword_bm25"] == -2.5
+        assert payload["rrf_score"] == 0.03
+        assert payload["vector_rank"] is None
+        json.dumps(payload, allow_nan=False)
+
+
+@legacy_daemon_only
+def test_daemon_search_passes_rerank_and_explain(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    config_path = _write_config(tmp_path, roots=[root])
+    seen: list[dict[str, object]] = []
+
+    def daemon(query, **kwargs):
+        seen.append(kwargs)
+        return []
+
+    with _service(
+        config_path,
+        tmp_path,
+        daemon_probe=lambda path: True,
+        daemon_search=daemon,
+    ) as service:
+        service.search(SearchRequest("alpha", rerank=True, explain=True))
+        assert seen[-1]["rerank"] is True
+        assert seen[-1]["explain"] is True
+
+
+def test_search_rejects_non_boolean_rerank_and_explain(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, roots=[_root(tmp_path)])
+    with _service(config_path, tmp_path) as service:
+        for field in ("rerank", "explain"):
+            with pytest.raises(ApiError) as raised:
+                service.search(SearchRequest("alpha", **{field: "yes"}))
+            assert _error_code(raised.value) == "invalid_request"
+
+
+def test_similar_calls_shared_similarity_with_filters(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, roots=[_root(tmp_path)])
+    _add_indexed_document(tmp_path / "index.db")
+    seen: list[tuple[object, dict[str, object]]] = []
+    notes = str(tmp_path / "notes")  # absolute on every host
+    target_path = str(tmp_path / "notes" / "a.txt")
+    hit = Hit(
+        chunk_id=7,
+        path="/notes/b.txt",
+        locator="L2",
+        loc_start=2.0,
+        snippet="beta",
+        score=0.8,
+        kind="text",
+    )
+
+    def fake_similar(target, **kwargs):
+        seen.append((target, kwargs))
+        return [hit]
+
+    with _service(config_path, tmp_path) as service:
+        with mock.patch("seekr.cli_search.get_similar_hits", fake_similar):
+            result = service.similar(
+                SimilarRequest(
+                    path=target_path,
+                    k=3,
+                    per_file=2,
+                    path_prefix=notes,
+                    kind="text",
+                    since="7d",
+                    module="ml",
+                    week="1-2",
+                )
+            )
+        assert [h.chunk_id for h in result.hits] == [7]
+        assert result.took_ms >= 0.0
+        target, kwargs = seen[0]
+        assert str(target) == target_path
+        assert kwargs["k"] == 3
+        assert kwargs["per_file"] == 2
+        assert kwargs["path_prefix"] == notes
+        assert kwargs["kind"] == "text"
+        assert kwargs["since"] == "7d"
+        assert kwargs["module"] == "ml"
+        assert kwargs["week"] == "1-2"
+        assert service.status().activity["lane"] == "idle"
+
+
+def test_similar_validation_and_error_mapping(tmp_path: Path) -> None:
+    from seekr.cli_search import SearchError
+
+    config_path = _write_config(tmp_path, roots=[_root(tmp_path)])
+    with _service(config_path, tmp_path) as service:
+        for bad in (
+            SimilarRequest(path=""),
+            SimilarRequest(path=str(tmp_path / "a"), k=0),
+            SimilarRequest(path=str(tmp_path / "a"), k=51),
+            SimilarRequest(path=str(tmp_path / "a"), per_file=11),
+            SimilarRequest(path=str(tmp_path / "a"), kind="nonsense-kind"),
+            SimilarRequest(path=str(tmp_path / "a"), since="not-a-date"),
+        ):
+            with pytest.raises(ApiError) as raised:
+                service.similar(bad)
+            assert _error_code(raised.value) == "invalid_request", bad
+
+        def failing(target, **kwargs):
+            raise SearchError("file not found and not in index")
+
+        with (
+            mock.patch("seekr.cli_search.get_similar_hits", failing),
+            pytest.raises(ApiError) as raised,
+        ):
+            service.similar(SimilarRequest(path=str(tmp_path / "missing")))
+        assert _error_code(raised.value) == "index_unavailable"
+
+        service.begin_shutdown()
+        with pytest.raises(ApiError):
+            service.similar(SimilarRequest(path=str(tmp_path / "a")))
+
+
+def test_similar_runs_during_index_but_not_during_download(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, roots=[_root(tmp_path)])
+    with (
+        _service(config_path, tmp_path) as service,
+        mock.patch("seekr.cli_search.get_similar_hits", lambda *a, **k: []),
+    ):
+        service._begin_lane("index")
+        try:
+            assert service.similar(SimilarRequest(path=str(tmp_path / "a"))).hits == ()
+        finally:
+            service._end_lane()
+        service._begin_lane("download")
+        try:
+            with pytest.raises(ApiError) as raised:
+                service.similar(SimilarRequest(path=str(tmp_path / "a")))
+            assert _error_code(raised.value) == "busy"
+        finally:
+            service._end_lane()
+
+
+def test_search_is_refused_during_model_download(tmp_path: Path) -> None:
+    docs = _root(tmp_path)
+    _write_docs(docs, {"a.txt": "alpha xylophone notes\n"})
+    config_path = _write_config(tmp_path, roots=[docs])
+    with _service(config_path, tmp_path) as service:
+        assert _wait_job(service, service.start_index()).state == "succeeded"
+        service._begin_lane("download")
+        try:
+            with pytest.raises(ApiError) as raised:
+                service.search(SearchRequest("xylophone", mode="hybrid"))
+            assert _error_code(raised.value) == "busy"
+            assert service.search(SearchRequest("xylophone", mode="keyword")).hits
+        finally:
+            service._end_lane()
+
+
+def test_status_is_refused_once_shutdown_begins(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, roots=[_root(tmp_path)])
+    with _service(config_path, tmp_path) as service:
+        service.begin_shutdown()
+        with pytest.raises(ApiError) as raised:
+            service.status()
+        assert _error_code(raised.value) == "busy"
+
+
+def test_request_shutdown_invokes_callback_once_and_is_noop_without_one(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_config(tmp_path, roots=[_root(tmp_path)])
+    calls: list[str] = []
+    with _service(config_path, tmp_path, on_shutdown=lambda: calls.append("stop")) as service:
+        service.request_shutdown()
+        service.request_shutdown()
+        assert calls == ["stop"]
+    with _service(config_path, tmp_path) as service:
+        service.request_shutdown()
+
+
+def test_start_index_paths_indexes_only_given_paths(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    other = _root(tmp_path, "other")
+    _write_docs(root, {"keep.md": "# Keep\n\nzebra notes here.\n"})
+    _write_docs(other, {"extra.md": "# Extra\n\nokapi notes here.\n"})
+    config_path = _write_config(tmp_path, roots=[root])
+    embedder = FakeEmbedder(dim=64)
+    with _service(config_path, tmp_path, embedder_factory=lambda _cfg: embedder) as service:
+        job = _wait_job(service, service.start_index_paths([str(other)]))
+        assert job.operation == "index"
+        assert job.state == "succeeded", job
+        found = service.search(SearchRequest("okapi", mode="keyword"))
+        assert [Path(h.path).name for h in found.hits] == ["extra.md"]
+        assert service.search(SearchRequest("zebra", mode="keyword")).hits == ()
+
+
+def test_start_index_paths_validation_and_daemon_refusal(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    config_path = _write_config(tmp_path, roots=[root])
+    with _service(config_path, tmp_path) as service:
+        for bad in ([], [""], [str(tmp_path / "does-not-exist")]):
+            with pytest.raises(ApiError) as raised:
+                service.start_index_paths(bad)
+            assert _error_code(raised.value) == "invalid_request", bad
+    if LEGACY_DAEMON:  # the daemon only exists on Linux
+        with _service(config_path, tmp_path, daemon_probe=lambda path: True) as service:
+            with pytest.raises(ApiError) as raised:
+                service.start_index_paths([str(root)])
+            assert _error_code(raised.value) == "daemon_active"
+
+
+def test_keyword_rerank_and_relative_paths_are_invalid_requests(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, roots=[_root(tmp_path)])
+    with _service(config_path, tmp_path) as service:
+        for call in (
+            lambda: service.search(SearchRequest("alpha", mode="keyword", rerank=True)),
+            lambda: service.similar(SimilarRequest(path="rel/a.md")),
+            lambda: service.start_index_paths(["rel"]),
+        ):
+            with pytest.raises(ApiError) as raised:
+                call()
+            assert _error_code(raised.value) == "invalid_request"
+
+
+def test_removed_root_prefixes_match_case_and_unicode_variants_on_darwin() -> None:
+    configured = [Path("/vol/MO\u0301DULO")]
+    with mock.patch("seekr.pathnorm._PLATFORM", "darwin"):
+        prefixes = WebService._removed_root_prefixes("/vol/m\u00f3dulo", configured)
+    # The resolved and as-given spellings (which differ on Windows, where
+    # resolving adds a drive), then the configured variant spelling.
+    removed = Path("/vol/m\u00f3dulo")
+    expected = [str(removed.resolve()), str(removed), str(configured[0])]
+    assert prefixes == list(dict.fromkeys(expected))
+    with mock.patch("seekr.pathnorm._PLATFORM", "linux"):
+        prefixes = WebService._removed_root_prefixes("/vol/m\u00f3dulo", configured)
+    assert prefixes == list(dict.fromkeys(expected[:2]))
+
+
+def test_rerank_searches_share_one_warm_reranker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from seekr import rerank
+    from seekr.rerank import FakeReranker
+
+    built: list[str] = []
+    gate = threading.Event()
+
+    def build(cfg: Config) -> FakeReranker:
+        built.append(cfg.rerank_model)
+        gate.wait(0.2)  # widen the window for a racing first construction
+        return FakeReranker({"alpha": 1.0})
+
+    monkeypatch.setattr(rerank, "build_reranker", build)
+    root = _root(tmp_path, "rerank-docs")
+    _write_docs(root, {"a.md": "alpha words here\n", "b.md": "beta alpha words\n"})
+    config_path = _write_config(tmp_path, roots=[root], db_path=tmp_path / "rerank.db")
+
+    with _service(config_path, tmp_path) as service:
+        assert _wait_job(service, service.start_index()).state == "succeeded"
+        results: list[object] = []
+        threads = [
+            threading.Thread(
+                target=lambda: results.append(
+                    service.search(SearchRequest("alpha", mode="hybrid", rerank=True))
+                )
+            )
+            for _ in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        service.search(SearchRequest("alpha", mode="vector", rerank=True))
+
+    assert len(results) == 2 and all(result.hits for result in results)
+    assert len(built) == 1

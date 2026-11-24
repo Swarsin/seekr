@@ -87,13 +87,13 @@ def _resolve_model_source(raw: str) -> str:
         return str(path.resolve())
     if path.exists():
         raise ModelUnavailableError(
-            f"model path {raw!r} exists but is not a directory; "
+            f"model path '{raw}' exists but is not a directory; "
             "provide a pre-provisioned model directory or a cached model ID. "
             "seekr never downloads models implicitly."
         )
     if _looks_like_explicit_path(raw):
         raise ModelUnavailableError(
-            f"local model directory {raw!r} does not exist; "
+            f"local model directory '{raw}' does not exist; "
             "provide a pre-provisioned model directory or a cached model ID. "
             "seekr never downloads models implicitly."
         )

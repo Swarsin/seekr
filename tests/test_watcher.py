@@ -11,7 +11,9 @@ from __future__ import annotations
 import importlib.util
 import os
 import sqlite3
+import sys
 import tempfile
+import threading
 import time
 import unittest
 from collections.abc import Iterable
@@ -19,7 +21,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
+from seekr import pathnorm
 from seekr.config import Config
 from seekr.embed import FakeEmbedder
 from seekr.indexer import Indexer
@@ -202,12 +206,8 @@ class _MemoryStore:
         paths = sorted(self.documents)
         if prefix is None:
             return paths
-        value = str(prefix).rstrip("/")
-        return [
-            path
-            for path in paths
-            if path == value or path.startswith(value + "/")
-        ]
+        # Component-aware, with the host's separator and case rules, like Store.
+        return [path for path in paths if pathnorm.has_prefix(path, str(prefix))]
 
     def set_last_error_count(self, n: int) -> None:
         return None
@@ -327,6 +327,39 @@ class _FakeObserverTests(unittest.TestCase):
         self.assertTrue(_wait_for(lambda: bool(self.indexer.calls)))
         self.assertEqual(self.indexer.calls, [("move", src.resolve(), dst.resolve())])
 
+    def test_stale_modify_before_a_rename_does_not_drop_the_source(self) -> None:
+        # macOS FSEvents coalesces the earlier write into the rename and
+        # watchdog emits modified(old) before moved(old -> new).
+        src = self.root / "old.md"
+        dst = self.root / "new.md"
+        self.watcher.start()
+
+        self._dispatch("modified", src)
+        self._dispatch("moved", src, dst)
+
+        self.assertTrue(_wait_for(lambda: bool(self.indexer.calls)))
+        time.sleep(0.3)
+        self.assertEqual(self.indexer.calls, [("move", src.resolve(), dst.resolve())])
+
+    def test_new_file_at_a_vacated_source_survives_a_merged_move(self) -> None:
+        # A -> B is pending, a new file appears at A, then B -> C arrives.  The
+        # chain merges into A -> C, but the new file at A must still be indexed.
+        a = self.root / "a.md"
+        b = self.root / "b.md"
+        c = self.root / "c.md"
+        self.watcher.start()
+
+        self._dispatch("moved", a, b)
+        self._dispatch("created", a)
+        self._dispatch("moved", b, c)
+
+        self.assertTrue(_wait_for(lambda: len(self.indexer.calls) >= 2))
+        time.sleep(0.3)
+        self.assertCountEqual(
+            self.indexer.calls,
+            [("index", a.resolve()), ("move", a.resolve(), c.resolve())],
+        )
+
     def test_moves_to_the_same_destination_keep_each_source_pending(self) -> None:
         first = self.root / "first.md"
         second = self.root / "second.md"
@@ -431,6 +464,20 @@ class _FakeObserverTests(unittest.TestCase):
         self.assertTrue(_wait_for(lambda: bool(self.indexer.calls)))
         self.assertEqual(self.indexer.calls, [("index", path.resolve())])
 
+    def test_pause_buffers_events_until_resume(self) -> None:
+        self.watcher.start()
+        self.watcher.pause()
+        path = self.root / "paused.md"
+        path.write_text("paused", encoding="utf-8")
+
+        self._dispatch("created", path)
+        time.sleep(0.3)
+        self.assertEqual(self.indexer.calls, [])
+
+        self.watcher.resume()
+        self.assertTrue(_wait_for(lambda: bool(self.indexer.calls)))
+        self.assertEqual(self.indexer.calls, [("index", path.resolve())])
+
     def test_stop_is_idempotent_and_discards_pending_events(self) -> None:
         watcher = Watcher(
             self.indexer,
@@ -454,6 +501,170 @@ class _FakeObserverTests(unittest.TestCase):
 
         with self.assertRaises(WatcherError):
             self.watcher.start()
+
+
+class _RootChangeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.first = self.tmp / "first"
+        self.first.mkdir()
+        self.second = self.tmp / "second"
+        self.second.mkdir()
+        self.indexer = _RecordingIndexer()
+        self.observers: list[_FakeObserver] = []
+
+    def _factory(self) -> _FakeObserver:
+        observer = _FakeObserver()
+        self.observers.append(observer)
+        return observer
+
+    def _watcher(self, **kwargs: object) -> Watcher:
+        watcher = Watcher(
+            self.indexer,
+            [self.first],
+            debounce_s=0.05,
+            observer_factory=self._factory,
+            mounts=(),
+            **kwargs,
+        )
+        self.addCleanup(watcher.stop)
+        return watcher
+
+    def _dispatch(self, watcher: Watcher, event_type: str, src: Path) -> None:
+        assert watcher._handler is not None
+        watcher._handler.dispatch(_FakeEvent(event_type, str(src)))
+
+    def test_run_exclusive_wraps_every_indexing_action(self) -> None:
+        inside = threading.local()
+        seen: list[bool] = []
+        wrapped: list[int] = []
+
+        def run_exclusive(action) -> None:
+            inside.active = True
+            try:
+                action()
+            finally:
+                inside.active = False
+            wrapped.append(1)
+
+        original = self.indexer.index_path
+
+        def index_path(path: Path) -> str:
+            seen.append(getattr(inside, "active", False))
+            return original(path)
+
+        self.indexer.index_path = index_path  # type: ignore[method-assign]
+        watcher = self._watcher(run_exclusive=run_exclusive)
+        watcher.start()
+        path = self.first / "a.md"
+        path.write_text("alpha", encoding="utf-8")
+
+        self._dispatch(watcher, "created", path)
+
+        self.assertTrue(_wait_for(lambda: bool(wrapped)))
+        self.assertEqual(seen, [True])
+
+    def test_set_roots_reschedules_running_watcher(self) -> None:
+        watcher = self._watcher()
+        watcher.start()
+        self.assertEqual(len(self.observers), 1)
+
+        watcher.set_roots([self.second])
+
+        self.assertTrue(self.observers[0].stopped)
+        newest = self.observers[-1]
+        self.assertTrue(newest.started)
+        self.assertEqual(
+            [entry[1] for entry in newest.schedules], [str(self.second.resolve())]
+        )
+        moved_in = self.second / "b.md"
+        moved_in.write_text("beta", encoding="utf-8")
+        self._dispatch(watcher, "created", self.first / "ignored.md")
+        self._dispatch(watcher, "created", moved_in)
+        self.assertTrue(_wait_for(lambda: bool(self.indexer.calls)))
+        time.sleep(0.1)
+        self.assertEqual(self.indexer.calls, [("index", moved_in.resolve())])
+
+    def test_set_roots_drops_pending_events_outside_new_roots(self) -> None:
+        watcher = self._watcher()
+        watcher.start(paused=True)
+        self._dispatch(watcher, "created", self.first / "pending.md")
+
+        watcher.set_roots([self.second])
+        watcher.resume()
+
+        time.sleep(0.2)
+        self.assertEqual(self.indexer.calls, [])
+
+    def _blocked_action(self, watcher_kwargs: dict[str, object] | None = None):
+        """Start a watcher whose actions wait at the lane until released."""
+        handed = threading.Event()
+        release = threading.Event()
+
+        def run_exclusive(action) -> None:
+            handed.set()
+            release.wait(5)
+            action()
+
+        watcher = self._watcher(run_exclusive=run_exclusive, **(watcher_kwargs or {}))
+        watcher.start()
+        return watcher, handed, release
+
+    def test_action_waiting_for_the_lane_is_dropped_when_its_root_is_removed(self) -> None:
+        watcher, handed, release = self._blocked_action()
+        path = self.first / "late.md"
+        path.write_text("late", encoding="utf-8")
+        self._dispatch(watcher, "created", path)
+        self.assertTrue(handed.wait(5))
+
+        # The folder is removed while the action waits for the engine lane.
+        watcher.set_roots([self.second])
+        release.set()
+
+        time.sleep(0.2)
+        self.assertEqual(self.indexer.calls, [])
+
+    def test_move_out_of_the_roots_after_removal_becomes_a_remove(self) -> None:
+        watcher, handed, release = self._blocked_action()
+        src = self.first / "a.md"
+        dst = self.first / "b.md"
+        dst.write_text("moved", encoding="utf-8")
+        assert watcher._handler is not None
+        watcher._handler.dispatch(_FakeEvent("moved", str(src), str(dst)))
+        self.assertTrue(handed.wait(5))
+
+        watcher.set_roots([self.second])
+        release.set()
+
+        self.assertTrue(_wait_for(lambda: bool(self.indexer.calls)))
+        time.sleep(0.1)
+        self.assertEqual(self.indexer.calls, [("remove", src.resolve())])
+
+    def test_remove_outside_the_roots_still_runs(self) -> None:
+        watcher, handed, release = self._blocked_action()
+        gone = self.first / "gone.md"
+        self._dispatch(watcher, "deleted", gone)
+        self.assertTrue(handed.wait(5))
+
+        watcher.set_roots([self.second])
+        release.set()
+
+        self.assertTrue(_wait_for(lambda: bool(self.indexer.calls)))
+        self.assertEqual(self.indexer.calls, [("remove", gone.resolve())])
+
+    def test_set_roots_before_start_only_changes_roots(self) -> None:
+        watcher = self._watcher()
+        watcher.set_roots([self.second])
+        self.assertEqual(self.observers, [])
+
+        watcher.start()
+
+        self.assertEqual(
+            [entry[1] for entry in self.observers[0].schedules],
+            [str(self.second.resolve())],
+        )
 
 
 class _RealIndexerRenameTests(unittest.TestCase):
@@ -546,6 +757,24 @@ class _RealIndexerRenameTests(unittest.TestCase):
             self.assertEqual(embedder.document_calls, 1)
 
 
+def _network_mounts(test: unittest.TestCase, root: Path, fstype: str) -> list[Mount]:
+    """Return mounts that put *root* on a network filesystem of *fstype*.
+
+    Windows has no mount table (seekr asks for the drive type there), so on
+    Windows *root* is reported as a network drive instead.
+    """
+    if sys.platform != "win32":
+        return [Mount(source="C:\\", mount_point=str(root), fstype=fstype)]
+    slow = str(root.resolve())
+    patcher = mock.patch(
+        "seekr.platform_info._is_slow_windows_path",
+        lambda path: pathnorm.has_prefix(str(path), slow),
+    )
+    patcher.start()
+    test.addCleanup(patcher.stop)
+    return []
+
+
 @unittest.skipUnless(_HAS_WATCHDOG, "watchdog is not installed")
 class _RealWatchdogIntegrationTests(unittest.TestCase):
     """Real recursive observer, real Indexer, stdlib store and embedder."""
@@ -602,7 +831,7 @@ class _RealWatchdogIntegrationTests(unittest.TestCase):
         self.assertEqual(self.embedder.document_calls, calls_after_index)
 
     def test_polling_observer_detects_create_and_delete(self) -> None:
-        mounts = [Mount(source="C:\\", mount_point=str(self.root), fstype="9p")]
+        mounts = _network_mounts(self, self.root, "9p")
         self.watcher = Watcher(
             self.indexer,
             [self.root],
@@ -645,7 +874,7 @@ class _PollingObserverTests(unittest.TestCase):
         poll_intervals: list[float] = []
         mounts = [
             Mount(source="/dev/sdc", mount_point="/", fstype="ext4"),
-            Mount(source="C:\\", mount_point=str(self.slow_root), fstype="9p"),
+            *_network_mounts(self, self.slow_root, "9p"),
         ]
 
         def poll_factory(interval: float) -> _FakeObserver:
@@ -720,7 +949,7 @@ class _PollingObserverTests(unittest.TestCase):
         poll_obs = _FakeObserver()
         mounts = [
             Mount(source="/dev/sdc", mount_point="/", fstype="ext4"),
-            Mount(source="C:\\", mount_point=str(self.slow_root), fstype="drvfs"),
+            *_network_mounts(self, self.slow_root, "drvfs"),
         ]
 
         def native_factory() -> _FakeObserver:
@@ -770,7 +999,7 @@ class _PollingObserverTests(unittest.TestCase):
         poll_obs.start = fail_start  # type: ignore[method-assign]
         mounts = [
             Mount(source="/dev/sdc", mount_point="/", fstype="ext4"),
-            Mount(source="C:\\", mount_point=str(self.slow_root), fstype="cifs"),
+            *_network_mounts(self, self.slow_root, "cifs"),
         ]
 
         watcher = Watcher(
@@ -854,3 +1083,37 @@ class _RealStoreWatchdogIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(
+    os.name == "posix",
+    "macOS and Linux path rules use / boundaries, which never apply to Windows paths",
+)
+class CanonicalContainmentTests(unittest.TestCase):
+    NFC = "M\u00f3dulo"
+    NFD = "Mo\u0301dulo"
+
+    def _watcher(self, root: Path) -> Watcher:
+        return Watcher(_RecordingIndexer(), [root], 0.0, mounts=())
+
+    def test_darwin_event_paths_match_roots_across_case_and_unicode_form(self) -> None:
+        with mock.patch("seekr.pathnorm._PLATFORM", "darwin"):
+            watcher = self._watcher(Path("/vol") / self.NFD.upper())
+            self.assertEqual(watcher._resolved_roots, (Path("/vol") / "M\u00d3DULO",))
+            inside = watcher._inside_roots(f"/vol/{self.NFC.lower()}/a.md")
+            self.assertEqual(inside, Path(f"/vol/{self.NFC.lower()}/a.md"))
+            nfd_event = watcher._inside_roots(f"/vol/{self.NFD}/b.md")
+            self.assertEqual(nfd_event, Path(f"/vol/{self.NFC}/b.md"))
+            self.assertIsNone(watcher._inside_roots(f"/vol/{self.NFC}2/a.md"))
+
+    def test_linux_containment_is_exact(self) -> None:
+        with mock.patch("seekr.pathnorm._PLATFORM", "linux"):
+            watcher = self._watcher(Path("/vol") / self.NFD)
+            self.assertEqual(watcher._resolved_roots, (Path("/vol") / self.NFD,))
+            self.assertIsNone(watcher._inside_roots(f"/vol/{self.NFC}/a.md"))
+            self.assertIsNone(watcher._inside_roots(f"/vol/{self.NFD.lower()}/a.md"))
+            self.assertEqual(
+                watcher._inside_roots(f"/vol/{self.NFD}/a.md"), Path(f"/vol/{self.NFD}/a.md")
+            )
+            whole = Watcher(_RecordingIndexer(), [Path("/")], 0.0, mounts=())
+            self.assertEqual(whole._inside_roots("/x/y.md"), Path("/x/y.md"))

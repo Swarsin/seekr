@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
 from . import extract as _extract_module
+from . import pathnorm
 from .chunking import ChunkingWarning, MissingGrammarWarning, chunk
 from .config import Config
 from .course import CourseLabel, compile_week_pattern, label_for, labels_signature
@@ -147,6 +148,13 @@ def language_for(path: Path) -> str | None:
     return _extract_module.language_for(path)
 
 
+def _canonical_walked(path: Path) -> Path:
+    """Return a walked file path in canonical (NFC on macOS) form."""
+    text = str(path)
+    normalized = pathnorm.normalize_unicode(text)
+    return path if normalized == text else Path(normalized)
+
+
 def _is_within(path: Path, root: Path) -> bool:
     """Return whether *path* is *root* or below it using path components."""
     try:
@@ -154,6 +162,19 @@ def _is_within(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+# Meta key holding the wall-clock time (ns) of the latest write of any
+# document.  An equal-size edit within the filesystem's timestamp granularity
+# (a 15.6 ms tick on Windows, 2 s on FAT/SMB, a few ms on Linux) keeps
+# (mtime, size) unchanged.  So a file whose mtime is within _RACY_WINDOW_NS of
+# that marker is hashed instead of trusted.  The marker is store-wide, not per
+# document: the edit is caught only if the file is checked again before later
+# writes move the marker more than the window past its mtime (for example, a
+# quick re-save picked up by the next sync or watcher event).  During a long
+# sync that keeps writing other documents, an earlier file's window can expire.
+_LAST_WRITE_META = "last_document_write_ns"
+_RACY_WINDOW_NS = 2_000_000_000
 
 
 def _signature(stat_result: os.stat_result) -> tuple[int, int]:
@@ -232,6 +253,8 @@ class Indexer:
         self.cfg = cfg
         self._last_report: SyncReport | None = None
         self._last_outcome: _Outcome | None = None
+        # Set for the duration of sync(); None means "read it when needed".
+        self._racy_cutoff_ns: int | None = None
         self._ignore_cache_key: tuple[str, ...] | None = None
         self._ignore_exact_parts: frozenset[str] = frozenset()
         self._ignore_glob_patterns: tuple[str, ...] = ()
@@ -320,6 +343,7 @@ class Indexer:
         report = SyncReport()
         seen: set[str] = set()
         healthy_roots: list[Path] = []
+        self._racy_cutoff_ns = self._load_racy_cutoff()
 
         try:
             try:
@@ -365,6 +389,7 @@ class Indexer:
             for root in self._unique_roots(healthy_roots):
                 self._prune_root(root, seen, report)
         finally:
+            self._racy_cutoff_ns = None
             if report.missing_grammars:
                 report.missing_grammars = dict(sorted(report.missing_grammars.items()))
                 first_root = (
@@ -427,7 +452,7 @@ class Indexer:
                     name for name in dirnames if not os.path.islink(os.path.join(dirpath, name))
                 ]
                 for name in filenames:
-                    files.append(Path(dirpath) / name)
+                    files.append(_canonical_walked(Path(dirpath) / name))
         except OSError as exc:
             walk_ok = False
             report.errors.append((str(root), f"cannot walk root: {_error_text(exc)}"))
@@ -502,6 +527,7 @@ class Indexer:
                         doc is not None
                         and (doc.mtime_ns, doc.size) == _signature(before_opt)
                         and doc.kind == kind
+                        and self._signature_trusted(doc)
                     ):
                         report.unchanged += 1
                         continue
@@ -792,6 +818,7 @@ class Indexer:
                 and doc is not None
                 and (doc.mtime_ns, doc.size) == signature
                 and doc.kind == kind
+                and self._signature_trusted(doc)
             ):
                 outcome.result = "unchanged"
                 return None, outcome
@@ -1014,7 +1041,41 @@ class Indexer:
         ]
         return self._write_prepared_single(prepared, stored, docs_cache=docs_cache)
 
+    def _load_racy_cutoff(self) -> int:
+        """Return the mtime at or above which a stored signature is not trusted."""
+        try:
+            raw = self.store.get_meta_value(_LAST_WRITE_META)
+        except Exception:  # an unreadable marker: hash rather than guess
+            return -(2**63)
+        if raw is None:
+            # An index from before the marker existed: trust signatures, as
+            # earlier versions did, until the next write records one.
+            return 2**63
+        try:
+            return int(raw) - _RACY_WINDOW_NS
+        except (TypeError, ValueError):
+            return -(2**63)
+
+    def _signature_trusted(self, doc: DocRow) -> bool:
+        cutoff = self._racy_cutoff_ns
+        if cutoff is None:
+            cutoff = self._load_racy_cutoff()
+        return doc.mtime_ns < cutoff
+
     def _upsert_document(
+        self,
+        path: str,
+        mtime_ns: int,
+        size: int,
+        sha256: str,
+        kind: str,
+        label: CourseLabel,
+    ) -> int:
+        doc_id = self._upsert_document_row(path, mtime_ns, size, sha256, kind, label)
+        self.store.set_meta_value(_LAST_WRITE_META, str(time.time_ns()))
+        return doc_id
+
+    def _upsert_document_row(
         self,
         path: str,
         mtime_ns: int,
@@ -1444,7 +1505,8 @@ class Indexer:
         except (OSError, RuntimeError) as exc:
             return None, f"cannot expand path: {_error_text(exc)}"
         try:
-            return expanded.resolve(strict=False), None
+            # On Linux this is exactly Path.resolve(); macOS also applies NFC.
+            return Path(pathnorm.canonical_path(expanded)), None
         except (OSError, RuntimeError) as exc:
             return None, f"cannot resolve path: {_error_text(exc)}"
 

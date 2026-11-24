@@ -108,7 +108,7 @@ class PackagingMetadataTests(unittest.TestCase):
 
     def test_version_matches_package(self) -> None:
         self.assertEqual(self.project["version"], seekr.__version__)
-        self.assertEqual(seekr.__version__, "0.2.0")
+        self.assertEqual(seekr.__version__, "0.3.0")
 
     @unittest.skipUnless(_HAS_TYPER, "typer is not installed")
     def test_cli_version_prints_seekr_0_1_1(self) -> None:
@@ -118,7 +118,7 @@ class PackagingMetadataTests(unittest.TestCase):
 
         result = CliRunner().invoke(app, ["--version"])
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertEqual(result.stdout.strip(), "seekr 0.2.0")
+        self.assertEqual(result.stdout.strip(), "seekr 0.3.0")
 
     def test_stale_files_removed(self) -> None:
         for name in ("uv.lock",):

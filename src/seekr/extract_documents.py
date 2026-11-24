@@ -11,7 +11,7 @@ import zlib
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from .extract import ExtractionError, ExtractionResult
+from .extract import ExtractionError, ExtractionResult, os_open_path
 from .models import ExtractedUnit
 
 __all__ = ["extract_docx", "extract_notebook", "extract_pptx"]
@@ -175,7 +175,7 @@ def extract_docx(path: Path) -> ExtractionResult:
 
     lines: list[str] = []
     try:
-        with source.open("rb") as handle:
+        with os_open_path(source).open("rb") as handle:
             _reject_ole2_header(handle, source)
             document = docx_mod.Document(handle)
             for item in document.iter_inner_content():
@@ -231,7 +231,7 @@ def extract_pptx(path: Path) -> ExtractionResult:
     units: list[ExtractedUnit] = []
     warnings: list[str] = []
     try:
-        with source.open("rb") as handle:
+        with os_open_path(source).open("rb") as handle:
             _reject_ole2_header(handle, source)
             presentation = pptx_mod.Presentation(handle)
             for number, slide in enumerate(presentation.slides, start=1):
@@ -286,7 +286,7 @@ def extract_notebook(path: Path) -> ExtractionResult:
     """Extract markdown, code and raw cells from an nbformat-4 ``.ipynb`` notebook."""
     source = Path(path)
     try:
-        raw = source.read_bytes()
+        raw = os_open_path(source).read_bytes()
     except FileNotFoundError:
         raise
     except OSError as exc:

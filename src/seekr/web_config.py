@@ -24,6 +24,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import pathnorm
 from .config import Config, ConfigError, load_config
 from .web_contract import ApiError
 
@@ -260,6 +261,11 @@ def _canonical_existing(value: str) -> Path | None:
         return Path(value).expanduser().resolve(strict=False)
     except (OSError, RuntimeError):
         return None
+
+
+def _same_existing(value: str, target: Path) -> bool:
+    candidate = _canonical_existing(value)
+    return candidate is not None and pathnorm.same_path(candidate, target)
 
 
 def toml_string(value: str) -> str:
@@ -568,7 +574,7 @@ def _add_root_locked(config_path: Path, path: str, revision: str) -> RootsConfig
     def compute(existing_roots: tuple[str, ...]) -> tuple[str, ...]:
         for existing in existing_roots:
             candidate = _canonical_existing(existing)
-            if candidate == resolved:
+            if candidate is not None and pathnorm.same_path(candidate, resolved):
                 raise ApiError(
                     409,
                     "duplicate_root",
@@ -602,7 +608,7 @@ def _remove_root_locked(config_path: Path, path: str, revision: str) -> RootsCon
             for existing in existing_roots
             if not (
                 existing == validated
-                or (target is not None and _canonical_existing(existing) == target)
+                or (target is not None and _same_existing(existing, target))
             )
         )
         if len(remaining) == len(existing_roots):
@@ -714,7 +720,8 @@ def _rewrite_roots(
             suffix=".tmp",
         )
         temp_path = Path(temp_name)
-        os.fchmod(descriptor, 0o600 if existing_mode == 0o600 else existing_mode)
+        if hasattr(os, "fchmod"):  # absent on Windows before Python 3.13
+            os.fchmod(descriptor, 0o600 if existing_mode == 0o600 else existing_mode)
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = None
             handle.write(candidate)

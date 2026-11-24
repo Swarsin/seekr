@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 import subprocess
@@ -14,12 +15,18 @@ from typing import Any
 from unittest import mock
 
 from seekr import cli_open
+from seekr import opener as opener_module
 from seekr.models import Hit
 from seekr.opener import (
     OPEN_SUCCESS_CODES,
+    Argv,
+    OpenFailed,
+    StartFile,
     format_pick_line,
     open_command,
+    open_target,
     parse_pick_line,
+    run_open,
 )
 from seekr.platform_info import Mount
 
@@ -64,6 +71,23 @@ def _run_popup(rofi_body: str, seekr_body: str) -> subprocess.CompletedProcess[s
 
 
 class PickLineTests(unittest.TestCase):
+    def test_raw_windows_drive_path_is_taken_as_typed(self) -> None:
+        win = {"platform": "win32"}
+        self.assertEqual(
+            parse_pick_line(r"C:\Users\me\a.py:L10-12", **win), (r"C:\Users\me\a.py", "L10-12")
+        )
+        self.assertEqual(
+            parse_pick_line("C:/x/talk.vtt:00:01:02\tsnippet", **win), ("C:/x/talk.vtt", "00:01:02")
+        )
+        self.assertEqual(parse_pick_line(r"D:\notes\a.md", **win), (r"D:\notes\a.md", ""))
+        # Escaped pick lines still round-trip on Windows.
+        hit = _hit(r"C:\Users\me\a.md", "§Methods: Results")
+        self.assertEqual(
+            parse_pick_line(format_pick_line(hit), **win), (r"C:\Users\me\a.md", "§Methods: Results")
+        )
+        # Elsewhere a backslash is an escape and the first colon ends the path.
+        self.assertEqual(parse_pick_line(r"C:\\x:L1", platform="linux"), ("C", r"\x:L1"))
+
     def test_pick_line_roundtrip_with_colons_in_path(self) -> None:
         path = "/a/b:c/d.md"
         locator = "§Intro"
@@ -395,6 +419,14 @@ class _FakeApp:
 
 
 class CliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # The CLI cases below check the Linux and WSL opener rules; Windows
+        # and macOS hosts would otherwise pick their native opener.
+        linux_rules = functools.partial(opener_module.open_target, platform="linux")
+        patcher = mock.patch.object(cli_open, "open_target", linux_rules)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _registered(self) -> tuple[_FakeApp, _FakeTyper]:
         fake_typer = _FakeTyper()
         app = _FakeApp()
@@ -438,12 +470,36 @@ class CliTests(unittest.TestCase):
         with (
             mock.patch("seekr.platform_info.is_wsl", return_value=False),
             mock.patch.dict(os.environ, {"EDITOR": "nano"}),
-            mock.patch.object(cli_open.subprocess, "run", return_value=completed) as run,
+            mock.patch.object(opener_module.subprocess, "run", return_value=completed) as run,
+            mock.patch.object(opener_module.subprocess, "Popen") as popen,
         ):
             app.commands["open"](target=f"{py_file}:L10-12")
 
+        # The CLI waits for the editor: blocking run, never a detached Popen.
         run.assert_called_once_with(["nano", "+10", str(py_file)], check=False)
+        popen.assert_not_called()
         self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_open_never_runs_a_script_hit_on_windows_or_macos(self) -> None:
+        app, _ = self._registered()
+        completed = types.SimpleNamespace(returncode=0)
+        expected = {"win32": ["notepad.exe"], "darwin": ["open", "-t"]}
+        for platform, prefix in expected.items():
+            for name in ("hit.py", "hit.js"):
+                with self.subTest(platform=platform, name=name):
+                    script = str(Path(tempfile.gettempdir()) / name)
+                    rules = functools.partial(opener_module.open_target, platform=platform)
+                    env = {k: v for k, v in os.environ.items() if k not in ("EDITOR", "SEEKR_OPENER")}
+                    with (
+                        mock.patch.object(cli_open, "open_target", rules),
+                        mock.patch("seekr.platform_info.is_wsl", return_value=False),
+                        mock.patch.dict(os.environ, env, clear=True),
+                        mock.patch.object(os, "startfile", create=True) as startfile,
+                        mock.patch.object(opener_module.subprocess, "run", return_value=completed) as run,
+                    ):
+                        app.commands["open"](target=f"{script}:L3")
+                    startfile.assert_not_called()
+                    run.assert_called_once_with([*prefix, script], check=False)
 
     def test_open_accepts_a_pick_line_and_never_fakes_transcript_media(self) -> None:
         app, _ = self._registered()
@@ -453,7 +509,7 @@ class CliTests(unittest.TestCase):
 
         with (
             mock.patch("seekr.platform_info.is_wsl", return_value=False),
-            mock.patch.object(cli_open.subprocess, "run", return_value=completed) as run,
+            mock.patch.object(opener_module.subprocess, "run", return_value=completed) as run,
         ):
             app.commands["open"](target=line)
 
@@ -470,7 +526,7 @@ class CliTests(unittest.TestCase):
             with (
                 mock.patch("seekr.platform_info.is_wsl", return_value=False),
                 mock.patch.dict(os.environ, {}, clear=True),
-                mock.patch.object(cli_open.subprocess, "run", return_value=completed) as run,
+                mock.patch.object(opener_module.subprocess, "run", return_value=completed) as run,
             ):
                 app.commands["open"](target=line)
 
@@ -487,7 +543,7 @@ class CliTests(unittest.TestCase):
                 "which",
                 side_effect=lambda name: "/usr/bin/wslview" if name == "wslview" else None,
             ),
-            mock.patch.object(cli_open.subprocess, "run", return_value=completed) as run,
+            mock.patch.object(opener_module.subprocess, "run", return_value=completed) as run,
         ):
             app.commands["open"](target="/mnt/c/Users/me/a.pdf:p.14")
 
@@ -503,7 +559,7 @@ class CliTests(unittest.TestCase):
             mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
             mock.patch.object(cli_open.shutil, "which", return_value=None),
             mock.patch.object(
-                cli_open.subprocess,
+                opener_module.subprocess,
                 "run",
                 return_value=types.SimpleNamespace(returncode=1),
             ) as run,
@@ -517,7 +573,7 @@ class CliTests(unittest.TestCase):
             mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
             mock.patch.object(cli_open.shutil, "which", return_value=None),
             mock.patch.object(
-                cli_open.subprocess,
+                opener_module.subprocess,
                 "run",
                 return_value=types.SimpleNamespace(returncode=2),
             ),
@@ -539,7 +595,7 @@ class CliTests(unittest.TestCase):
             ),
             mock.patch.object(cli_open.shutil, "which", return_value=None),
             mock.patch.object(
-                cli_open.subprocess,
+                opener_module.subprocess,
                 "run",
                 return_value=types.SimpleNamespace(returncode=1),
             ) as run,
@@ -555,7 +611,7 @@ class CliTests(unittest.TestCase):
             mock.patch("seekr.platform_info.read_mounts", return_value=ext4_mounts),
             mock.patch("seekr.platform_info.wslpath_windows", return_value=None),
             mock.patch.object(cli_open.shutil, "which", return_value=None),
-            mock.patch.object(cli_open.subprocess, "run") as run,
+            mock.patch.object(opener_module.subprocess, "run") as run,
             self.assertRaises(_FakeExit) as ctx,
         ):
             app.commands["open"](target="/home/me/a.pdf:p.14")
@@ -565,6 +621,150 @@ class CliTests(unittest.TestCase):
         self.assertTrue(
             any("cannot convert /home/me/a.pdf to a Windows path" in line for line in fake_typer.output)
         )
+
+
+class OpenTargetTests(unittest.TestCase):
+    def test_windows_uses_startfile_and_ignores_locator(self) -> None:
+        action = open_target(
+            "C:\\a.pdf", "p.3", "pdf", env={}, which=lambda _n: "/x", platform="win32"
+        )
+        self.assertEqual(action, StartFile("C:\\a.pdf"))
+
+    def test_windows_documents_use_the_default_application(self) -> None:
+        for path, kind in (("C:\\a.docx", "word"), ("C:\\a.pptx", "slides")):
+            action = open_target(path, "", kind, env={}, which=lambda _n: None, platform="win32")
+            self.assertEqual(action, StartFile(path))
+
+    def test_windows_scripts_open_in_notepad_never_the_default_verb(self) -> None:
+        for path in ("C:\\x\\a.py", "C:\\x\\a.js"):
+            action = open_target(
+                path, "L3", "code", env={}, which=lambda _n: None, platform="win32"
+            )
+            self.assertEqual(action, Argv(["notepad.exe", path]))
+
+    def test_windows_text_like_kinds_open_in_notepad(self) -> None:
+        for kind in ("text", "markdown", "notebook", "transcript", ""):
+            action = open_target("C:\\a.x", "", kind, env={}, which=lambda _n: None, platform="win32")
+            self.assertEqual(action, Argv(["notepad.exe", "C:\\a.x"]))
+
+    def test_macos_documents_use_open(self) -> None:
+        action = open_target("/a.pdf", "p.2", "pdf", env={}, which=lambda _n: None, platform="darwin")
+        self.assertEqual(action, Argv(["open", "/a.pdf"]))
+
+    def test_macos_scripts_open_in_the_text_editor(self) -> None:
+        for path in ("/x/a.py", "/x/a.js"):
+            action = open_target(path, "L3", "code", env={}, which=lambda _n: None, platform="darwin")
+            self.assertEqual(action, Argv(["open", "-t", path]))
+
+    def test_macos_text_editor_path_cannot_become_an_option(self) -> None:
+        action = open_target("-a.py", "", "code", env={}, which=lambda _n: None, platform="darwin")
+        self.assertEqual(action, Argv(["open", "-t", "./-a.py"]))
+
+    def test_editor_is_honoured_on_windows_and_macos(self) -> None:
+        for platform, path in (("win32", "C:\\a.py"), ("darwin", "/a.js")):
+            with self.subTest(platform=platform):
+                env = {"EDITOR": "nano"}
+                located = open_target(path, "L7", "code", env=env, which=lambda _n: None, platform=platform)
+                self.assertEqual(located, Argv(["nano", "+7", path]))
+                unlocated = open_target(path, "", "code", env=env, which=lambda _n: None, platform=platform)
+                self.assertEqual(unlocated, Argv(["nano", path]))
+
+    def test_windows_editor_keeps_backslashes_and_quoted_spaces(self) -> None:
+        env = {"EDITOR": '"C:\\Program Files\\Notepad++\\notepad++.exe" -multiInst'}
+        action = open_target("C:\\a.py", "", "code", env=env, which=lambda _n: None, platform="win32")
+        self.assertEqual(
+            action,
+            Argv(["C:\\Program Files\\Notepad++\\notepad++.exe", "-multiInst", "C:\\a.py"]),
+        )
+
+    def test_editor_does_not_replace_the_document_application(self) -> None:
+        env = {"EDITOR": "nano"}
+        self.assertEqual(
+            open_target("C:\\a.pdf", "p.1", "pdf", env=env, which=lambda _n: None, platform="win32"),
+            StartFile("C:\\a.pdf"),
+        )
+        self.assertEqual(
+            open_target("/a.pdf", "p.1", "pdf", env=env, which=lambda _n: None, platform="darwin"),
+            Argv(["open", "/a.pdf"]),
+        )
+
+    def test_seekr_opener_wins_on_every_platform_and_kind(self) -> None:
+        env = {"SEEKR_OPENER": "my-opener --flag", "EDITOR": "nano"}
+        for platform in ("win32", "darwin", "linux"):
+            for kind in ("pdf", "code"):
+                with self.subTest(platform=platform, kind=kind):
+                    action = open_target("/a.x", "L2", kind, env=env, which=lambda _n: "/x", platform=platform)
+                    self.assertEqual(action, Argv(["my-opener", "--flag", "/a.x"]))
+
+    def test_seekr_opener_wins_on_wsl(self) -> None:
+        action = open_target(
+            "/mnt/c/a.py", "L1", "code", env={"SEEKR_OPENER": "code"}, which=lambda _n: "/x",
+            platform="linux", wsl=True, to_windows=lambda _p: "C:\\a.py",
+        )
+        self.assertEqual(action, Argv(["code", "/mnt/c/a.py"]))
+
+    def test_blank_seekr_opener_is_ignored(self) -> None:
+        action = open_target("/a.py", "", "code", env={"SEEKR_OPENER": "  "}, which=lambda _n: None, platform="darwin")
+        self.assertEqual(action, Argv(["open", "-t", "/a.py"]))
+
+    def test_linux_matches_open_command(self) -> None:
+        env = {"EDITOR": "nano"}
+        which = lambda _n: None
+        action = open_target("/a.py", "L10", "code", env=env, which=which, platform="linux")
+        self.assertEqual(action, Argv(open_command("/a.py", "L10", "code", env, which)))
+
+    def test_wsl_matches_open_command(self) -> None:
+        which = lambda _n: None
+        to_win = lambda p: "C:\\a.pdf"
+        action = open_target(
+            "/mnt/c/a.pdf", "p.1", "pdf", env={}, which=which, platform="linux",
+            wsl=True, to_windows=to_win,
+        )
+        self.assertEqual(action, Argv(["explorer.exe", "C:\\a.pdf"]))
+
+
+class RunOpenTests(unittest.TestCase):
+    def test_startfile_is_called(self) -> None:
+        with mock.patch.object(os, "startfile", create=True) as start:
+            run_open(StartFile("C:\\a.pdf"))
+        start.assert_called_once_with("C:\\a.pdf")
+
+    def test_argv_runs_without_shell(self) -> None:
+        with mock.patch.object(
+            opener_module.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)
+        ) as run:
+            run_open(Argv(["open", "/a"]))
+        run.assert_called_once_with(["open", "/a"], check=False)
+
+    def test_nowait_launches_detached_and_ignores_exit_code(self) -> None:
+        with (
+            mock.patch.object(opener_module.subprocess, "Popen") as popen,
+            mock.patch.object(opener_module.subprocess, "run") as run,
+        ):
+            run_open(Argv(["xdg-open", "x"]), wait=False)
+        run.assert_not_called()
+        self.assertEqual(popen.call_args.args, (["xdg-open", "x"],))
+        kwargs = popen.call_args.kwargs
+        self.assertNotIn("shell", kwargs)
+        for stream in ("stdin", "stdout", "stderr"):
+            self.assertEqual(kwargs[stream], opener_module.subprocess.DEVNULL)
+        self.assertTrue(kwargs.get("start_new_session") or kwargs.get("creationflags"))
+
+    def test_nowait_launch_failure_propagates(self) -> None:
+        with mock.patch.object(
+            opener_module.subprocess, "Popen", side_effect=FileNotFoundError("x")
+        ), self.assertRaises(FileNotFoundError):
+            run_open(Argv(["nope", "x"]), wait=False)
+
+    def test_explorer_one_ok_and_other_codes_raise(self) -> None:
+        with mock.patch.object(
+            opener_module.subprocess, "run", return_value=types.SimpleNamespace(returncode=1)
+        ):
+            run_open(Argv(["explorer.exe", "x"]))
+            with self.assertRaises(OpenFailed) as ctx:
+                run_open(Argv(["xdg-open", "x"]))
+        self.assertEqual(ctx.exception.returncode, 1)
+        self.assertEqual(ctx.exception.program, "xdg-open")
 
 
 class PopupScriptTests(unittest.TestCase):

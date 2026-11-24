@@ -22,6 +22,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+from _platform import use_posix_stored_paths
 from seekr.config import Config
 from seekr.models import ChunkSpec, text_sha
 from seekr.store import (
@@ -142,6 +143,7 @@ def _fake_vector_backend():
 
 class _FakeBackendTestCase(unittest.TestCase):
     def setUp(self) -> None:
+        use_posix_stored_paths(self)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.db_path = Path(self._tmp.name) / "index.db"
@@ -588,6 +590,54 @@ class StorePathTests(_FakeBackendTestCase):
         self.assertEqual(store.list_paths(""), sorted(paths))
         self.assertEqual(store.list_paths("/"), sorted(paths))
 
+    def test_case_insensitive_prefix_filters_fold_case_on_boundaries(self) -> None:
+        store = Store(self.db_path, "test/model", 8, case_insensitive_paths=True)
+        self._stores.append(store)
+        for path in ("/Users/Me/Notes/a.md", "/users/me/notes2/b.md", "/users/me/n_tes/c.md"):
+            _add_document(store, path)
+
+        self.assertEqual(store.list_paths("/users/me/notes"), ["/Users/Me/Notes/a.md"])
+        self.assertEqual(store.list_paths("/USERS/ME/NOTES/"), ["/Users/Me/Notes/a.md"])
+        self.assertEqual(
+            list(store.get_documents_metadata("/users/ME/notes")), ["/Users/Me/Notes/a.md"]
+        )
+        # LIKE wildcards in the prefix are literal.
+        self.assertEqual(store.list_paths("/users/me/n_tes"), ["/users/me/n_tes/c.md"])
+        self.assertEqual(store.list_paths("/users/me/n%"), [])
+        self.assertEqual(store.delete_documents_under("/USERS/me/notes"), 1)
+        self.assertEqual(
+            store.list_paths(), ["/users/me/n_tes/c.md", "/users/me/notes2/b.md"]
+        )
+
+    def test_prefix_with_literal_like_characters(self) -> None:
+        for insensitive in (True, False):
+            with self.subTest(case_insensitive=insensitive):
+                path = self.tmp_db_dir(insensitive)
+                store = Store(path, "test/model", 8, case_insensitive_paths=insensitive)
+                self._stores.append(store)
+                for doc in ("/a!b%c_d/x.md", "/a!b%cxd/y.md", "/aXb%c_d/z.md", "/a!!b/w.md"):
+                    _add_document(store, doc)
+                self.assertEqual(store.list_paths("/a!b%c_d"), ["/a!b%c_d/x.md"])
+                self.assertEqual(store.list_paths("/a!b"), [])
+                self.assertEqual(store.list_paths("/a!!b"), ["/a!!b/w.md"])
+                self.assertEqual(store.list_paths("/a%"), [])
+
+    def tmp_db_dir(self, insensitive: bool) -> Path:
+        return self.db_path.with_name(f"like-{int(insensitive)}.db")
+
+    def test_case_sensitive_store_keeps_exact_prefixes(self) -> None:
+        store = Store(self.db_path, "test/model", 8, case_insensitive_paths=False)
+        self._stores.append(store)
+        _add_document(store, "/Users/Me/Notes/a.md")
+        self.assertEqual(store.list_paths("/users/me/notes"), [])
+        self.assertEqual(store.list_paths("/Users/Me/Notes"), ["/Users/Me/Notes/a.md"])
+
+    def test_case_insensitive_default_follows_platform(self) -> None:
+        from seekr import pathnorm
+
+        store = self.open_store()
+        self.assertEqual(store.case_insensitive_paths, pathnorm.case_insensitive())
+
     def test_get_documents_metadata_has_chunks_and_batch_sha_lookup(self) -> None:
         import numpy as np
 
@@ -858,6 +908,33 @@ class StdlibStoreTests(_FakeBackendTestCase):
         self.assertEqual(len(store.keyword_search("aftertoken", 10)), 1)
         self.assertEqual(store.fetch_chunks([chunk_id])[chunk_id].text, "aftertoken")
 
+    def test_darwin_keyword_prefix_in_nfd_and_other_case_matches_nfc_paths(self) -> None:
+        with mock.patch("seekr.pathnorm._PLATFORM", "darwin"):
+            store = self.open_store()
+            self.assertTrue(store.case_insensitive_paths)
+            _add_document(
+                store,
+                "/notes/M\u00f3dulo/a.md",
+                self._bytes_chunk("sharedtoken alpha", fill=1),
+            )
+            _add_document(
+                store, "/notes/other/b.md", self._bytes_chunk("sharedtoken beta", fill=2)
+            )
+            nfd_prefix = "/NOTES/mo\u0301dulo"
+            hits = store.keyword_search('"sharedtoken"', 10, path_prefix=nfd_prefix)
+            self.assertEqual(
+                [store.fetch_chunks([hit[0]])[hit[0]].path for hit in hits],
+                ["/notes/M\u00f3dulo/a.md"],
+            )
+            self.assertEqual(store.list_paths(nfd_prefix), ["/notes/M\u00f3dulo/a.md"])
+
+    def test_linux_prefix_keeps_unicode_form_and_case(self) -> None:
+        with mock.patch("seekr.pathnorm._PLATFORM", "linux"):
+            store = self.open_store()
+            _add_document(store, "/notes/M\u00f3dulo/a.md")
+            self.assertEqual(store.list_paths("/notes/Mo\u0301dulo"), [])
+            self.assertEqual(store.list_paths("/notes/m\u00f3dulo"), [])
+
     def test_keyword_path_prefix_filters_before_limit(self) -> None:
         store = self.open_store()
         _add_document(
@@ -940,6 +1017,7 @@ class StdlibStoreTests(_FakeBackendTestCase):
 )
 class RealSqliteVecTests(unittest.TestCase):
     def setUp(self) -> None:
+        use_posix_stored_paths(self)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.db_path = Path(self._tmp.name) / "index.db"
@@ -1262,6 +1340,7 @@ class ReadOnlyStoreTests(_FakeBackendTestCase):
 @unittest.skipUnless(_HAS_NUMPY and _HAS_FTS5, "numpy and FTS5 are required")
 class SchemaV3Tests(unittest.TestCase):
     def setUp(self) -> None:
+        use_posix_stored_paths(self)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.db_path = Path(self._tmp.name) / "index.db"
@@ -1702,3 +1781,61 @@ class MissingVectorBackendTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PathPrefixClauseTests(unittest.TestCase):
+    """The SQL prefix predicate, evaluated directly for Windows-style paths."""
+
+    PATHS = (
+        r"C:\Notes\a.md",
+        r"C:\notes2\b.md",
+        r"c:\notes\sub\c.md",
+        r"C:\Notes",
+        r"D:\x_y\d.md",
+        r"D:\xzy\e.md",
+    )
+
+    def _matching(self, prefix: str, **kwargs: object) -> list[str]:
+        from seekr.store import _document_filter_clause, _path_prefix_clause
+
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute("CREATE TABLE documents(path TEXT)")
+        conn.executemany("INSERT INTO documents VALUES (?)", [(p,) for p in self.PATHS])
+        clause, params = _path_prefix_clause(prefix, **kwargs)
+        doc_clause, doc_params = _document_filter_clause(
+            path_prefix=prefix, alias="documents", **kwargs
+        )
+        self.assertEqual((clause.replace("path", "documents.path"), params),
+                         (doc_clause, doc_params))
+        rows = conn.execute(
+            f"SELECT path FROM documents WHERE {clause} ORDER BY path", params
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def test_windows_prefix_is_case_insensitive_on_backslash_boundaries(self) -> None:
+        kwargs = {"case_insensitive": True, "separator": "\\"}
+        self.assertEqual(
+            self._matching(r"c:\notes", **kwargs),
+            [r"C:\Notes", r"C:\Notes\a.md", r"c:\notes\sub\c.md"],
+        )
+        self.assertEqual(
+            self._matching("C:\\NOTES\\", **kwargs),
+            [r"C:\Notes", r"C:\Notes\a.md", r"c:\notes\sub\c.md"],
+        )
+        self.assertEqual(self._matching(r"d:\x_y", **kwargs), [r"D:\x_y\d.md"])
+        self.assertEqual(len(self._matching("C:\\", **kwargs)), 4)
+
+    def test_windows_prefix_accepts_forward_slashes(self) -> None:
+        kwargs = {"case_insensitive": True, "separator": "\\"}
+        self.assertEqual(
+            self._matching("c:/notes/sub", **kwargs), [r"c:\notes\sub\c.md"]
+        )
+
+    def test_default_clause_is_unchanged_for_posix(self) -> None:
+        from seekr.store import _path_prefix_clause
+
+        self.assertEqual(
+            _path_prefix_clause("/notes/"),
+            ("(path = ? OR substr(path, 1, ?) = ?)", ("/notes", 7, "/notes/")),
+        )

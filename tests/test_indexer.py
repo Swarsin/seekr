@@ -14,6 +14,7 @@ import importlib.util
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -22,6 +23,7 @@ from pathlib import Path
 from unittest import mock
 
 from seekr import indexer as indexer_module
+from seekr import pathnorm
 from seekr.config import Config
 from seekr.course import CourseLabel
 from seekr.extract import ExtractionError
@@ -209,10 +211,10 @@ class FakeStore:
         paths = sorted(self.documents)
         if prefix is None:
             return paths
-        base = str(prefix).rstrip("/")
-        if not base:
+        # Component-aware, with the host's separator and case rules, like Store.
+        if not str(prefix).rstrip(pathnorm.path_separator()):
             return paths
-        return [path for path in paths if path == base or path.startswith(base + "/")]
+        return [path for path in paths if pathnorm.has_prefix(path, str(prefix))]
 
     def find_vector_by_text_sha(self, sha: str) -> object | None:
         for chunk in self.chunks.values():
@@ -386,6 +388,38 @@ class SyncTests(_IndexerTestCase):
         doc = self.stored(path)
         assert doc is not None
         self.assertEqual(doc.mtime_ns, new_mtime)
+
+    def test_equal_size_edit_within_one_timestamp_tick_is_reindexed(self) -> None:
+        # Windows (15.6 ms ticks), FAT/SMB (2 s) and coarse Linux clocks can
+        # leave mtime unchanged by a quick rewrite; with the same size the
+        # (mtime, size) signature cannot see the edit, so a file modified
+        # around the last index write must be hashed.
+        path = self.write("notes.txt", "alpha bravo charlie")
+        self.indexer.sync([self.root])
+        before = path.stat()
+        path.write_text("alpha delta charlie", encoding="utf-8")
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))  # same tick
+        self.assertEqual(path.stat().st_size, before.st_size)
+
+        report = self.indexer.sync([self.root])
+
+        self.assertEqual((report.added, report.updated, report.unchanged), (0, 1, 0))
+        doc = self.stored(path)
+        assert doc is not None
+        self.assertEqual(doc.sha256, indexer_module.Indexer._sha256_file(path))
+
+    def test_settled_unchanged_files_skip_hashing(self) -> None:
+        path = self.write("old.txt", "alpha bravo charlie")
+        hour_ago = time.time_ns() - 3600 * 1_000_000_000
+        os.utime(path, ns=(hour_ago, hour_ago))
+        self.indexer.sync([self.root])
+
+        with mock.patch.object(
+            indexer_module.Indexer, "_sha256_file", side_effect=AssertionError("hashed")
+        ):
+            report = self.indexer.sync([self.root])
+
+        self.assertEqual(report.unchanged, 1)
 
     def test_edit_one_paragraph_embeds_only_changed_chunks(self) -> None:
         first = _short_paragraph("alpha")
@@ -873,7 +907,7 @@ class MovePathTests(_IndexerTestCase):
         old_size = dst_doc.size
         calls = len(self.embedder.calls)
 
-        src.rename(dst)
+        src.replace(dst)  # overwrite, as rename(2) does (Windows rename refuses)
         os.utime(dst, ns=(old_mtime, old_mtime))
         self.assertEqual(dst.stat().st_size, old_size)
 
@@ -1247,19 +1281,21 @@ class RealStoreIndexerTests(unittest.TestCase):
         self.assertEqual(len(self.embedder.calls), calls)
         hits = self.store.keyword_search('"alpha"', 10)
         self.assertEqual(hits[0][0], old_chunk_id)
-        self.assertEqual(self.store.fetch_chunks([old_chunk_id])[old_chunk_id].path, str(dst))
+        self.assertEqual(
+            self.store.fetch_chunks([old_chunk_id])[old_chunk_id].path, str(dst.resolve())
+        )
 
     def test_real_failure_preserves_last_good_document(self) -> None:
         path = self.write("notes.txt", "keepword alpha beta")
         self.indexer.sync([self.root])
-        old_doc = self.store.get_document(str(path))
+        old_doc = self.store.get_document(str(path.resolve()))
         assert old_doc is not None
 
         path.write_bytes(b"\x00\x01binary")
         report = self.indexer.sync([self.root])
 
         self.assertEqual(len(report.errors), 1)
-        current = self.store.get_document(str(path))
+        current = self.store.get_document(str(path.resolve()))
         assert current is not None
         self.assertEqual(current.sha256, old_doc.sha256)
         self.assertEqual(len(self.store.keyword_search("keepword", 10)), 1)
@@ -1377,7 +1413,7 @@ class CourseLabelIndexTests(_IndexerTestCase):
         self.assertEqual(self.doc_label("ds/week4/a.md"), ("ds", 4))
 
         # Moving over an already-indexed identical destination keeps destination label.
-        other_src.rename(existing_dst)
+        other_src.replace(existing_dst)  # overwrite (Windows rename refuses)
         self.assertEqual(indexer.move_path(other_src, existing_dst), "removed")
         self.assertEqual(len(self.embedder.calls), calls)
         self.assertEqual(self.doc_label("ds/week5/dup.md"), ("ds", 5))
@@ -1569,3 +1605,34 @@ class OfficeAndNotebookIndexTests(_IndexerTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CanonicalPathTests(_IndexerTestCase):
+    NFD = "Módulo"
+    NFC = "Módulo"
+
+    def test_linux_stored_paths_are_unchanged_resolve_output(self) -> None:
+        nfd_file = self.write(f"{self.NFD}/a.txt", "alpha beta gamma")
+        link = self.tmp / "link-root"
+        link.symlink_to(self.root, target_is_directory=True)
+
+        with mock.patch("seekr.pathnorm._PLATFORM", "linux"):
+            self.indexer.sync([link])
+            self.indexer.index_path(nfd_file)
+
+        # Byte-for-byte what Path.resolve() gives: no Unicode normalisation.
+        self.assertEqual(sorted(self.store.documents), [str(nfd_file.resolve())])
+        self.assertIn(self.NFD, next(iter(self.store.documents)))
+
+    def test_darwin_resolves_and_walks_to_nfc_paths(self) -> None:
+        # The NFC spelling opens the same file on APFS/HFS+; on this test host
+        # only the recorded strings are checked.
+        self.write(f"{self.NFD}/a.txt", "alpha beta gamma")
+        expected = self.root.resolve() / self.NFC / "a.txt"
+        with mock.patch("seekr.pathnorm._PLATFORM", "darwin"):
+            resolved, issue = Indexer._resolve(self.root / self.NFD / "a.txt")
+            files, ok = self.indexer._walk_root(self.root.resolve(), indexer_module.SyncReport())
+        self.assertIsNone(issue)
+        self.assertEqual(str(resolved), str(expected))
+        self.assertTrue(ok)
+        self.assertEqual([str(item) for item in files], [str(expected)])

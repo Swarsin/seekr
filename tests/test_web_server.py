@@ -41,6 +41,7 @@ from seekr.web_contract import (
     HitDTO,
     SearchRequest,
     SearchResult,
+    SimilarRequest,
 )
 from seekr.web_server import SECURITY_HEADERS, create_server, run_web
 from web_fixtures import (
@@ -211,11 +212,26 @@ def drip_until_closed(
             readable, _, _ = select.select([connection], [], [], 0)
             if not readable:
                 continue
-            chunk = connection.recv(65536)
+            try:
+                chunk = connection.recv(65536)
+            except OSError:
+                # Closing with our unread bytes queued resets the connection;
+                # macOS and Windows report that reset here.
+                return time.monotonic() - started, bytes(received)
             if not chunk:
                 return time.monotonic() - started, bytes(received)
             received.extend(chunk)
         return None, bytes(received)
+
+
+
+# An absolute directory in the host's own form (drive-qualified on Windows,
+# where a rooted "/tmp" is not absolute); the fake backend never opens it.
+_TMP = os.path.abspath(os.path.join(os.sep, "tmp"))
+
+
+def _abs(*parts: str) -> str:
+    return os.path.join(_TMP, *parts)
 
 
 @contextmanager
@@ -806,6 +822,56 @@ def test_model_check_and_index_start_return_202() -> None:
         )
         assert index.status == 202
         assert index.json() == {"job_id": backend.start_index_job_id}
+
+
+def test_reindex_start_returns_202_with_flags_and_needs_token() -> None:
+    with running_server() as (server, backend):
+        token = fetch_token(server)
+        default = request(
+            server, "POST", "/api/reindex", headers=json_headers(token), body=b"{}"
+        )
+        assert default.status == 202
+        assert default.json() == {"job_id": backend.start_reindex_job_id}
+        assert backend.calls[-1] == ("start_reindex", {"force": False, "allow_empty": False})
+        job = request(
+            server,
+            "GET",
+            f"/api/jobs/{backend.start_reindex_job_id}",
+            headers={"X-Seekr-Token": token},
+        )
+        assert job.json()["operation"] == "index"
+
+        flagged = request(
+            server,
+            "POST",
+            "/api/reindex",
+            headers=json_headers(token),
+            body=json.dumps({"force": True, "allow_empty": True}).encode(),
+        )
+        assert flagged.status == 202
+        assert backend.calls[-1] == ("start_reindex", {"force": True, "allow_empty": True})
+
+        for payload in ({"force": "yes"}, {"extra": 1}):
+            bad = request(
+                server,
+                "POST",
+                "/api/reindex",
+                headers=json_headers(token),
+                body=json.dumps(payload).encode(),
+            )
+            assert bad.status == 400, payload
+            assert bad.json()["error"]["code"] == "invalid_request"
+
+        calls = len(backend.calls)
+        no_token = request(
+            server,
+            "POST",
+            "/api/reindex",
+            headers={"Content-Type": "application/json"},
+            body=b"{}",
+        )
+        assert no_token.status == 403
+        assert len(backend.calls) == calls
 
 
 def test_job_endpoint_and_not_found() -> None:
@@ -2092,17 +2158,27 @@ def test_signal_handlers_stay_installed_through_backend_shutdown() -> None:
             ready.set()
 
 
+        def interrupt():
+            # Aim SIGINT at the main thread, as a terminal Ctrl-C does:
+            # os.kill() lets macOS hand it to this thread instead, and on
+            # Windows it terminates the process.
+            if hasattr(signal, "pthread_kill"):
+                signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+            else:
+                signal.raise_signal(signal.SIGINT)
+
+
         def coordinator():
             try:
                 if not ready.wait(5):
                     return
-                os.kill(os.getpid(), signal.SIGINT)
+                interrupt()
                 if not backend.shutdown_entered.wait(5):
                     return
                 state["during_default"] = (
                     signal.getsignal(signal.SIGINT) is signal.default_int_handler
                 )
-                os.kill(os.getpid(), signal.SIGINT)
+                interrupt()
                 second_warning.wait(5)
             finally:
                 backend.release.set()
@@ -2492,3 +2568,267 @@ def test_docs_web_api_documents_new_routes() -> None:
         "download",
     ):
         assert needle in doc, needle
+
+
+# -- service-client routes: similar, shutdown, path indexing, rerank/explain --
+
+
+def _post(server: Any, path: str, payload: Any, token: str | None = None) -> HttpResponse:
+    tok = token if token is not None else server.token
+    return request(
+        server,
+        "POST",
+        path,
+        headers=json_headers(tok),
+        body=json.dumps(payload).encode(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/api/similar", b'{"path": "/tmp/a.md"}'),
+        ("/api/shutdown", b"{}"),
+        ("/api/index/paths", b'{"paths": ["/tmp/a"]}'),
+    ],
+)
+def test_new_service_routes_require_token_and_post(path: str, body: bytes) -> None:
+    with running_server() as (server, backend):
+        missing = request(
+            server,
+            "POST",
+            path,
+            headers={"Content-Type": "application/json"},
+            body=body,
+        )
+        assert missing.status == 403
+        assert missing.json()["error"]["code"] == "forbidden"
+
+        wrong_method = request(
+            server, "GET", path, headers={"X-Seekr-Token": server.token}
+        )
+        assert wrong_method.status == 405
+        assert wrong_method.json()["error"]["code"] == "method_not_allowed"
+        assert backend.calls == []
+
+
+def test_token_only_request_without_origin_is_allowed_for_service_routes() -> None:
+    with running_server() as (server, backend):
+        response = _post(server, "/api/similar", {"path": _abs("a.md")})
+        assert response.status == 200
+        assert backend.calls[-1][0] == "similar"
+
+
+def test_run_web_injected_token_is_returned_by_session() -> None:
+    stop = threading.Event()
+    urls: list[str] = []
+    ready = threading.Event()
+
+    def on_listen(url: str) -> None:
+        urls.append(url)
+        ready.set()
+
+    thread = threading.Thread(
+        target=run_web,
+        args=(FakeWebBackend(),),
+        kwargs={
+            "port": 0,
+            "token": "injected-token-value",
+            "stop_event": stop,
+            "install_signal_handlers": False,
+            "on_listen": on_listen,
+        },
+        daemon=True,
+    )
+    thread.start()
+    try:
+        assert ready.wait(5.0)
+        port = int(urls[0].rsplit(":", 1)[1])
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5.0)
+        connection.request(
+            "GET",
+            "/api/session",
+            headers={"Origin": urls[0], "X-Seekr-Client": "1"},
+        )
+        payload = json.loads(connection.getresponse().read())
+        connection.close()
+        assert payload["token"] == "injected-token-value"
+    finally:
+        stop.set()
+        thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+
+def test_similar_happy_path_maps_request_and_response() -> None:
+    with running_server() as (server, backend):
+        default = _post(server, "/api/similar", {"path": _abs("opencode", "a.md")})
+        assert default.status == 200
+        assert default.json() == SEARCH_RESULT.to_dict()
+        sent = backend.calls[-1][1]["request"]
+        assert sent == SimilarRequest(path=_abs("opencode", "a.md"))
+
+        full = _post(
+            server,
+            "/api/similar",
+            {
+                "path": _abs("opencode", "a.md"),
+                "k": 4,
+                "per_file": 3,
+                "path_prefix": _abs("opencode"),
+                "kind": "markdown",
+                "since": "7d",
+                "module": "ml",
+                "week": "2-3",
+            },
+        )
+        assert full.status == 200
+        assert backend.calls[-1][1]["request"] == SimilarRequest(
+            path=_abs("opencode", "a.md"),
+            k=4,
+            per_file=3,
+            path_prefix=_abs("opencode"),
+            kind="markdown",
+            since="7d",
+            module="ml",
+            week="2-3",
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"path": 5},
+        {"path": None},
+        {"path": "/tmp/a", "k": 0},
+        {"path": "/tmp/a", "k": 51},
+        {"path": "/tmp/a", "k": True},
+        {"path": "/tmp/a", "per_file": 0},
+        {"path": "/tmp/a", "per_file": 11},
+        {"path": "/tmp/a", "kind": 3},
+        {"path": "/tmp/a", "since": 3},
+        {"path": "/tmp/a", "module": 3},
+        {"path": "/tmp/a", "week": 3},
+        {"path": "/tmp/a", "path_prefix": 3},
+        {"path": "/tmp/a", "query": "nope"},
+    ],
+)
+def test_similar_validation_errors(payload: dict[str, Any]) -> None:
+    with running_server() as (server, backend):
+        response = _post(server, "/api/similar", payload)
+        assert response.status == 400, payload
+        assert response.json()["error"]["code"] == "invalid_request"
+        assert backend.calls == []
+
+
+def test_similar_backend_error_is_enveloped() -> None:
+    backend = FakeWebBackend(errors={"similar": ApiError(409, "busy", "busy now")})
+    with running_server(backend) as (server, _):
+        response = _post(server, "/api/similar", {"path": _abs("a")})
+        assert response.status == 409
+        assert response.json()["error"]["code"] == "busy"
+
+
+def test_shutdown_route_calls_backend_and_returns_202() -> None:
+    with running_server() as (server, backend):
+        response = _post(server, "/api/shutdown", {})
+        assert response.status == 202
+        assert response.json() == {"stopping": True}
+        assert [name for name, _ in backend.calls] == ["request_shutdown"]
+
+        bad = _post(server, "/api/shutdown", {"now": True})
+        assert bad.status == 400
+        assert len(backend.calls) == 1
+
+
+def test_index_paths_route_maps_request_and_returns_job() -> None:
+    with running_server() as (server, backend):
+        response = _post(server, "/api/index/paths", {"paths": [_abs("a"), _abs("b.md")]})
+        assert response.status == 202
+        assert response.json() == {"job_id": "job-index-paths-fixture"}
+        assert backend.calls[-1] == ("start_index_paths", {"paths": [_abs("a"), _abs("b.md")]})
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"paths": []},
+        {"paths": "/tmp/a"},
+        {"paths": [5]},
+        {"paths": [""]},
+        {"paths": ["/tmp/a", None]},
+        {"paths": ["/tmp/a"], "extra": 1},
+        {"paths": ["/" + "a" * LIMITS["root_path_bytes"]]},
+        {"paths": ["/tmp/a"] * (LIMITS["roots_max"] + 1)},
+    ],
+)
+def test_index_paths_validation_errors(payload: dict[str, Any]) -> None:
+    with running_server() as (server, backend):
+        response = _post(server, "/api/index/paths", payload)
+        assert response.status == 400, payload
+        assert response.json()["error"]["code"] == "invalid_request"
+        assert backend.calls == []
+
+
+@pytest.mark.parametrize("flag", ["rerank", "explain"])
+def test_search_rerank_and_explain_are_strict_booleans(flag: str) -> None:
+    with running_server() as (server, backend):
+        ok = _post(server, "/api/search", {"query": "x", flag: True})
+        assert ok.status == 200
+        assert getattr(backend.calls[-1][1]["request"], flag) is True
+
+        for bad in ("true", 1, None, []):
+            response = _post(server, "/api/search", {"query": "x", flag: bad})
+            assert response.status == 400, (flag, bad)
+            assert response.json()["error"]["code"] == "invalid_request"
+        assert len(backend.calls) == 1
+
+
+def test_search_defaults_leave_rerank_and_explain_false() -> None:
+    with running_server() as (server, backend):
+        _post(server, "/api/search", {"query": "x"})
+        sent = backend.calls[-1][1]["request"]
+        assert sent.rerank is False
+        assert sent.explain is False
+
+
+def test_hit_dto_explain_only_when_present_and_json_safe() -> None:
+    plain = HitDTO(1, "/p", "L1", 1.0, "s", 0.5, "text")
+    assert "explain" not in plain.to_dict()
+    explained = HitDTO(
+        1, "/p", "L1", 1.0, "s", 0.5, "text", explain={"keyword_rank": 1, "rrf_score": 0.02}
+    )
+    assert explained.to_dict()["explain"] == {"keyword_rank": 1, "rrf_score": 0.02}
+
+    hit = HitDTO(
+        2, "/p", "L1", 1.0, "s", 0.5, "text", explain={"vector_distance": 0.25}
+    )
+    backend = FakeWebBackend(search_result=SearchResult(hits=(hit,), took_ms=1.0))
+    with running_server(backend) as (server, _):
+        response = _post(server, "/api/search", {"query": "x", "explain": True})
+        assert response.json()["hits"][0]["explain"] == {"vector_distance": 0.25}
+
+
+def test_relative_paths_and_keyword_rerank_are_rejected() -> None:
+    with running_server() as (server, backend):
+        for path, payload in (
+            ("/api/similar", {"path": "rel/a.md"}),
+            ("/api/index/paths", {"paths": ["/tmp/a", "rel/b"]}),
+            ("/api/search", {"query": "x", "mode": "keyword", "rerank": True}),
+        ):
+            response = _post(server, path, payload)
+            assert response.status == 400, path
+            assert response.json()["error"]["code"] == "invalid_request"
+        assert backend.calls == []
+        ok = _post(server, "/api/search", {"query": "x", "mode": "vector", "rerank": True})
+        assert ok.status == 200
+
+
+def test_address_reuse_is_posix_only() -> None:
+    # On Windows SO_REUSEADDR lets a second socket bind a busy port, so an
+    # occupied port would not fail with "address in use".
+    assert web_server.reuses_address("linux")
+    assert web_server.reuses_address("darwin")
+    assert not web_server.reuses_address("win32")
+    assert web_server.SeekrHTTPServer.allow_reuse_address is web_server.reuses_address()

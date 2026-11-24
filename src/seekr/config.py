@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from seekr import paths
 from seekr.course import DEFAULT_WEEK_PATTERN, compile_week_pattern
 
 DEFAULT_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
@@ -34,28 +35,21 @@ class ConfigError(ValueError):
     """Raised when a config file is malformed or contains invalid values."""
 
 
-def _xdg_path(env_var: str, fallback: Path) -> Path:
-    value = os.environ.get(env_var)
-    if value:
-        return Path(value).expanduser()
-    return Path.home() / fallback
-
-
 def default_config_path() -> Path:
-    """Return $SEEKR_CONFIG or $XDG_CONFIG_HOME/seekr/config.toml (fallback ~/.config)."""
+    """Return $SEEKR_CONFIG or the platform config dir's config.toml."""
     raw = os.environ.get("SEEKR_CONFIG")
     if raw is not None and raw.strip():
         return Path(raw.strip()).expanduser()
-    return _xdg_path("XDG_CONFIG_HOME", Path(".config")) / "seekr" / "config.toml"
+    return paths.config_dir() / "config.toml"
 
 
 def default_data_dir() -> Path:
-    """Return $XDG_DATA_HOME/seekr, falling back to ~/.local/share/seekr."""
-    return _xdg_path("XDG_DATA_HOME", Path(".local") / "share") / "seekr"
+    """Return the platform data directory for seekr."""
+    return paths.data_dir()
 
 
 def default_db_path() -> Path:
-    """Return $XDG_DATA_HOME/seekr/index.db, falling back to ~/.local/share."""
+    """Return index.db inside the platform data directory."""
     return default_data_dir() / "index.db"
 
 

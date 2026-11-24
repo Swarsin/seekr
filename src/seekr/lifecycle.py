@@ -21,7 +21,6 @@ swap instead of having their database replaced underneath them.
 
 from __future__ import annotations
 
-import errno
 import os
 import sqlite3
 import stat
@@ -35,12 +34,8 @@ from typing import Self
 from .config import Config
 from .embed import Embedder, build_embedder
 from .indexer import Indexer, SyncReport
+from .locks import FileLock, LockTimeout
 from .store import Store
-
-try:  # pragma: no cover - the target platform is Linux, but import stays safe.
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None  # type: ignore[assignment]
 
 __all__ = [
     "LifecycleError",
@@ -72,7 +67,7 @@ def lock_path_for(db_path: Path) -> Path:
 
 
 class LifecycleLock:
-    """A Linux ``flock`` advisory lock held on a sibling lock file."""
+    """A shared/exclusive advisory lock held on a sibling lock file."""
 
     def __init__(
         self, db_path: Path, shared: bool = True, blocking: bool = True
@@ -81,96 +76,63 @@ class LifecycleLock:
         self.lock_path = lock_path_for(self.db_path)
         self.shared = bool(shared)
         self.blocking = bool(blocking)
-        self._fd: int | None = None
+        self._lock = FileLock(self.lock_path)
 
     @property
     def acquired(self) -> bool:
-        return self._fd is not None
+        return self._lock.held
 
     def acquire(self) -> LifecycleLock:
         """Acquire the lock, raising :class:`LifecycleLockError` when busy."""
-        if self._fd is not None:
+        if self._lock.held:
             return self
-        if fcntl is None:  # pragma: no cover
-            raise LifecycleLockError(
-                "lifecycle locks require Linux advisory file locking (fcntl)"
-            )
-
         try:
-            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(str(self.lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+            got = self._lock.acquire(shared=self.shared, blocking=self.blocking)
         except OSError as exc:
-            raise LifecycleLockError(
-                f"cannot open lifecycle lock {self.lock_path}: {exc}"
-            ) from exc
-
-        operation = fcntl.LOCK_SH if self.shared else fcntl.LOCK_EX
-        if not self.blocking:
-            operation |= fcntl.LOCK_NB
-        try:
-            fcntl.flock(fd, operation)
-        except OSError as exc:
-            os.close(fd)
-            if exc.errno in (errno.EACCES, errno.EAGAIN):
-                raise LifecycleLockError(self._busy_message()) from exc
             raise LifecycleLockError(
                 f"cannot lock {self.lock_path}: {exc}"
             ) from exc
-
-        self._fd = fd
+        if not got:
+            raise LifecycleLockError(self._busy_message())
         return self
 
     def upgrade(self, timeout: float = 0.0) -> None:
-        """Atomically upgrade an acquired shared lock to an exclusive lock."""
-        if self._fd is None:
+        """Upgrade an acquired shared lock to an exclusive lock.
+
+        Polls until *timeout* seconds have passed.  On Windows the upgrade
+        releases the shared lock before taking the exclusive one, so it is not
+        atomic there.
+        """
+        if not self._lock.held:
             raise LifecycleLockError("lifecycle lock is not acquired")
         if not self.shared:
             return
-        if fcntl is None:  # pragma: no cover
-            raise LifecycleLockError(
-                "lifecycle locks require Linux advisory file locking (fcntl)"
-            )
 
         deadline = time.monotonic() + max(0.0, float(timeout))
         while True:
             try:
-                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc:
-                if exc.errno not in (errno.EACCES, errno.EAGAIN):
-                    raise LifecycleLockError(
-                        f"cannot upgrade lifecycle lock {self.lock_path}: {exc}"
-                    ) from exc
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise LifecycleLockError(
-                        self._busy_message(mode="exclusive")
-                    ) from exc
-                time.sleep(min(0.05, remaining))
-            else:
+                upgraded = self._lock.upgrade(blocking=False)
+            except (OSError, LockTimeout) as exc:
+                raise LifecycleLockError(
+                    f"cannot upgrade lifecycle lock {self.lock_path}: {exc}"
+                ) from exc
+            if upgraded:
                 self.shared = False
                 return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LifecycleLockError(self._busy_message(mode="exclusive"))
+            time.sleep(min(0.05, remaining))
 
     def release(self) -> None:
         """Release the lock; safe to call more than once."""
-        fd = self._fd
-        self._fd = None
-        if fd is None:
-            return
-        if fcntl is not None:  # pragma: no branch
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        self._lock.release()
 
     def _busy_message(self, mode: str | None = None) -> str:
         mode = mode or ("shared" if self.shared else "exclusive")
         return (
             f"index database is in use; could not take a {mode} lifecycle lock on "
-            f"{self.lock_path}. Stop the seekr daemon or wait for other seekr "
+            f"{self.lock_path}. Stop the seekr service or daemon, or wait for other seekr "
             "processes, then retry."
         )
 
@@ -325,6 +287,26 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+# Windows refuses to replace a file another process has open (antivirus,
+# indexers, a non-cooperating reader); such locks are usually brief.
+_REPLACE_RETRIES = 10
+_REPLACE_RETRY_DELAY = 0.1
+_sleep = time.sleep
+
+
+def _replace_with_retry(temp_path: Path, live_path: Path) -> None:
+    for attempt in range(_REPLACE_RETRIES + 1):
+        try:
+            os.replace(str(temp_path), str(live_path))
+            return
+        except PermissionError as exc:
+            if attempt == _REPLACE_RETRIES:
+                raise RebuildError(
+                    "index is in use; close other seekr windows and retry"
+                ) from exc
+            _sleep(_REPLACE_RETRY_DELAY)
+
+
 def _replace_database(temp_path: Path, live_path: Path) -> None:
     _checkpoint_database(temp_path)
     if live_path.exists():
@@ -335,7 +317,7 @@ def _replace_database(temp_path: Path, live_path: Path) -> None:
         _checkpoint_database(live_path, allow_invalid=True)
     _fsync_file(temp_path)
     try:
-        os.replace(str(temp_path), str(live_path))
+        _replace_with_retry(temp_path, live_path)
     except OSError as exc:
         raise RebuildError(
             f"cannot atomically replace live index {live_path}: {_error_text(exc)}"

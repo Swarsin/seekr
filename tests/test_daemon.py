@@ -20,6 +20,7 @@ from typing import Any
 from unittest import mock
 
 from _cli_output import strip_ansi
+from _platform import requires_legacy_daemon
 from seekr import cli_daemon, cli_search, client, daemon
 from seekr.config import Config
 from seekr.embed import FakeEmbedder
@@ -214,6 +215,7 @@ def _request(sock_path: Path, payload: dict[str, Any], timeout: float = 2.0) -> 
         return _read_json(sock)
 
 
+@requires_legacy_daemon
 class ProtocolTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -485,6 +487,7 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(_request(sock_path, {"op": "ping"}), {"ok": True})
 
 
+@requires_legacy_daemon
 class PeerIdentityTests(unittest.TestCase):
     def test_same_uid_socketpair_credentials_are_accepted(self) -> None:
         left, right = socket.socketpair()
@@ -516,6 +519,7 @@ class PeerIdentityTests(unittest.TestCase):
         self.assertEqual(right.recv(1), b"")
 
 
+@requires_legacy_daemon
 class SocketLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -627,6 +631,7 @@ class SocketLifecycleTests(unittest.TestCase):
             )
 
 
+@requires_legacy_daemon
 class CliFastPathTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -792,6 +797,7 @@ class CliFastPathTests(unittest.TestCase):
         build_searcher.assert_not_called()
 
 
+@requires_legacy_daemon
 class DaemonRunnerTests(unittest.TestCase):
     def test_run_daemon_holds_the_shared_lock_for_store_and_watcher(self) -> None:
         events: list[object] = []
@@ -1021,13 +1027,13 @@ class DaemonRunnerTests(unittest.TestCase):
 
 
 class ServiceUnitTests(unittest.TestCase):
-    def test_service_unit_runs_seekr_daemon_as_a_user_unit(self) -> None:
+    def test_service_unit_runs_seekr_service_as_a_user_unit(self) -> None:
         service = (
             Path(__file__).resolve().parents[1] / "contrib" / "seekr.service"
         ).read_text(encoding="utf-8")
 
         self.assertIn("ExecStart=", service)
-        self.assertIn("seekr daemon", service)
+        self.assertIn("seekr service start --port 8000", service)
         self.assertIn("WantedBy=default.target", service)
 
 
@@ -1047,6 +1053,7 @@ class DaemonCommandRegistrationTests(unittest.TestCase):
         self.assertIn("--debounce", output)
 
 
+@requires_legacy_daemon
 @unittest.skipUnless(
     _NEEDS_REAL_STORE, "numpy, sqlite-vec and FTS5 are required"
 )
@@ -1237,6 +1244,40 @@ class SocketPathLimitTests(unittest.TestCase):
         searcher.store.close.assert_called_once_with()
 
 
+class LegacyDaemonSupportTests(unittest.TestCase):
+    def test_daemon_is_unavailable_without_peer_credential_checks(self) -> None:
+        # macOS has AF_UNIX but no SO_PEERCRED: clients could never verify
+        # the daemon, so it must not start there.
+        with (
+            mock.patch.object(daemon, "socket", mock.Mock(spec=["AF_UNIX"])),
+            mock.patch.object(daemon.os, "name", "posix"),
+        ):
+            self.assertFalse(daemon.legacy_daemon_supported())
+
+    def test_daemon_is_available_with_unix_sockets_and_peer_credentials(self) -> None:
+        fake = mock.Mock(spec=["AF_UNIX", "SO_PEERCRED"])
+        with (
+            mock.patch.object(daemon, "socket", fake),
+            mock.patch.object(daemon.os, "name", "posix"),
+        ):
+            self.assertTrue(daemon.legacy_daemon_supported())
+
+
+def _highlighted_hit() -> Hit:
+    return Hit(
+        chunk_id=42,
+        path="/course/machine-learning/week4/trees.md",
+        locator="§Trees",
+        loc_start=12.0,
+        snippet="decision trees",
+        score=0.8125,
+        kind="markdown",
+        module="machine-learning",
+        week=4,
+        highlights=((9, 14),),
+    )
+
+
 class ModuleWeekDaemonTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -1255,6 +1296,8 @@ class ModuleWeekDaemonTests(unittest.TestCase):
         self.assertEqual(args["module"], "machine-learning")
         self.assertEqual(args["week_range"], (2, 3))
 
+    @requires_legacy_daemon
+    def test_daemon_search_forwards_module_and_week_range(self) -> None:
         class _LabelFilterSearcher(_FakeSearcher):
             def search(
                 self,
@@ -1318,6 +1361,7 @@ class ModuleWeekDaemonTests(unittest.TestCase):
         self.assertEqual(searcher.calls[0]["module"], "ml")
         self.assertEqual(searcher.calls[0]["week_range"], (2, 3))
 
+    @requires_legacy_daemon
     def test_week_range_must_be_two_ints(self) -> None:
         searcher = _FakeSearcher()
         with _running_server(searcher, self.tmp) as (sock_path, *_):
@@ -1355,18 +1399,7 @@ class ModuleWeekDaemonTests(unittest.TestCase):
         self.assertEqual(client._hit_from_dict(daemon._hit_to_dict(unlabelled)), unlabelled)
 
     def test_daemon_hit_roundtrip_keeps_highlights(self) -> None:
-        hit = Hit(
-            chunk_id=42,
-            path="/course/machine-learning/week4/trees.md",
-            locator="§Trees",
-            loc_start=12.0,
-            snippet="decision trees",
-            score=0.8125,
-            kind="markdown",
-            module="machine-learning",
-            week=4,
-            highlights=((9, 14),),
-        )
+        hit = _highlighted_hit()
         wire = daemon._hit_to_dict(hit)
         self.assertEqual(wire["highlights"], [[9, 14]])
         self.assertEqual(client._hit_from_dict(wire), hit)
@@ -1387,6 +1420,10 @@ class ModuleWeekDaemonTests(unittest.TestCase):
                 self.assertRaises(client.DaemonError),
             ):
                 client._hit_from_dict(bad_wire)
+
+    @requires_legacy_daemon
+    def test_daemon_search_keeps_highlights_over_the_socket(self) -> None:
+        hit = _highlighted_hit()
 
         class _HighlightSearcher(_FakeSearcher):
             def search(self, *args: Any, **kwargs: Any) -> list[Hit]:

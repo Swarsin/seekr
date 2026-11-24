@@ -19,7 +19,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .daemon import MAX_RESPONSE_BYTES, socket_path, socket_path_problem
+from .daemon import (
+    MAX_RESPONSE_BYTES,
+    legacy_daemon_supported,
+    socket_path,
+    socket_path_problem,
+)
 from .models import Hit, HitExplain
 
 __all__ = [
@@ -244,6 +249,8 @@ def _send_request(
     sock_path: Path | None,
     timeout: float,
 ) -> dict[str, Any] | None:
+    if not legacy_daemon_supported():
+        return None
     path = socket_path() if sock_path is None else Path(sock_path)
     try:
         encoded = (

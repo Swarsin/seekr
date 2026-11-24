@@ -14,17 +14,17 @@ import signal
 import sqlite3
 import threading
 from collections.abc import Callable
-from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .config import Config, load_config
-from .daemon import serve, socket_path
+from .daemon import DaemonError, legacy_daemon_supported, serve, socket_path
 from .embed import Embedder, build_embedder
 from .indexer import Indexer
 from .lifecycle import lifecycle_lock
 from .logging_config import log_event
 from .search import Searcher
+from .service import start_prewarm, stored_dim
 from .store import Store
 from .watcher import Watcher
 
@@ -34,6 +34,12 @@ if TYPE_CHECKING:
     import typer
 
 __all__ = ["register", "run_daemon"]
+
+
+_DEPRECATION_WARNING = (
+    'warning: "seekr daemon" is deprecated and will be removed in 0.4.0; '
+    'use "seekr service start"'
+)
 
 
 def _noop() -> None:
@@ -75,23 +81,6 @@ def _reranker_factory(cfg: Config) -> Callable[[], object]:
     return build
 
 
-def _stored_meta(cfg: Config) -> dict[str, str] | None:
-    db_path = Path(cfg.db_path)
-    if not db_path.exists():
-        return None
-    try:
-        conn = sqlite3.connect(str(db_path), timeout=1.0)
-    except sqlite3.Error:
-        return None
-    try:
-        rows = conn.execute("SELECT key, value FROM meta").fetchall()
-    except sqlite3.Error:
-        return None
-    finally:
-        conn.close()
-    return {str(key): str(value) for key, value in rows}
-
-
 def run_daemon(
     *,
     cfg: Config | None = None,
@@ -103,6 +92,8 @@ def run_daemon(
 ) -> None:
     """Run the watcher and query daemon until *stop_event* is set."""
     selected_cfg = cfg if cfg is not None else load_config()
+    if not legacy_daemon_supported():
+        raise DaemonError("the legacy daemon is not supported on this platform")
     selected_socket = Path(sock_path) if sock_path is not None else socket_path()
     event = stop_event if stop_event is not None else threading.Event()
     restore_signals = (
@@ -119,16 +110,7 @@ def run_daemon(
             active_embedder = (
                 embedder if embedder is not None else build_embedder(selected_cfg)
             )
-            dim: int | None = None
-            if embedder is None:
-                stored_meta = _stored_meta(selected_cfg)
-                if stored_meta is not None:
-                    try:
-                        candidate_dim = int(stored_meta.get("dim", "0"))
-                    except (TypeError, ValueError):
-                        candidate_dim = 0
-                    if candidate_dim > 0:
-                        dim = candidate_dim
+            dim = stored_dim(selected_cfg) if embedder is None else None
             if dim is None:
                 dim = int(active_embedder.dim)
 
@@ -195,18 +177,7 @@ def run_daemon(
                 watcher.resume()
 
                 if embedder is None:
-
-                    def _prewarm() -> None:
-                        if event.is_set():
-                            return
-                        with suppress(ImportError, OSError, RuntimeError, ValueError):
-                            _ = active_embedder.dim
-
-                    threading.Thread(
-                        target=_prewarm,
-                        name="seekr-embed-prewarm",
-                        daemon=True,
-                    ).start()
+                    start_prewarm(active_embedder, event)
 
                 serve(
                     searcher,
@@ -229,23 +200,26 @@ def run_daemon(
 def _build_daemon_command(typer_module: Any) -> Any:
     def daemon(
         socket_file: str | None = typer_module.Option(
-            None, "--socket", help="Unix socket path to serve on."
+            None, "--socket", help="Ignored; kept for compatibility."
         ),
-        debounce_s: float = typer_module.Option(
-            1.0, "--debounce", min=0.0, help="Per-path debounce in seconds."
+        debounce_s: float | None = typer_module.Option(
+            None, "--debounce", min=0.0, help="Ignored; kept for compatibility."
         ),
     ) -> None:
-        """Watch configured roots and serve warm searches until interrupted."""
-        target = Path(socket_file).expanduser() if socket_file else None
-        try:
-            run_daemon(sock_path=target, debounce_s=debounce_s)
-        except KeyboardInterrupt:
-            return
-        except Exception as exc:
-            typer_module.echo(f"seekr daemon: {exc}", err=True)
-            raise typer_module.Exit(code=1) from exc
+        """Deprecated alias for `seekr service start`."""
+        from .cli_service import _build_start
 
-    daemon.__doc__ = "Watch configured roots and serve warm searches until interrupted."
+        typer_module.echo(_DEPRECATION_WARNING, err=True)
+        if socket_file is not None or debounce_s is not None:
+            typer_module.echo(
+                "note: --socket and --debounce are ignored by the service",
+                err=True,
+            )
+        _build_start(typer_module)(
+            port=0, model_dir=None, handshake_stdout=False, watch_stdin=False
+        )
+
+    daemon.__doc__ = "Deprecated alias for `seekr service start`."
     return daemon
 
 

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from .client import DaemonError, DaemonMismatchError, try_daemon_search
-from .config import Config, load_config
+from .config import Config, default_config_path, load_config
 from .course import display_module
 from .embed import build_embedder
 from .filters import normalise_kind, parse_since, parse_week
@@ -27,6 +27,7 @@ from .lifecycle import LifecycleError, lifecycle_lock
 from .logging_config import log_event
 from .models import Hit, HitExplain
 from .search import SEARCH_MODES, Searcher, SearchMode
+from .service_client import ServiceClient, ServiceError, ServiceUnavailable
 from .spread import (
     SPREAD_CANDIDATES,
     SpreadGroup,
@@ -41,6 +42,7 @@ from .store import (
     Store,
     validate_schema_version,
 )
+from .web_contract import LIMITS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -220,12 +222,14 @@ def _build_searcher(
     rerank: bool,
     *,
     embedder: Embedder | None = None,
+    reranker: Reranker | None = None,
 ) -> Searcher | None:
     """Open exactly the backends this query needs.
 
     ``embedder`` is an optional injection point for a caller that already owns
     a warm model.  It must belong to the active ``cfg.embed_model``; the
-    keyword path never reads ``.dim`` from it.
+    keyword path never reads ``.dim`` from it.  ``reranker`` likewise reuses a
+    warm cross-encoder for ``cfg.rerank_model`` instead of building one.
     """
     if embedder is not None and embedder.model_name != cfg.embed_model:
         raise SearchError(
@@ -248,7 +252,10 @@ def _build_searcher(
                 "run `seekr reindex` to rebuild it"
             )
 
-    reranker = _build_reranker(cfg) if rerank else None
+    if not rerank:
+        reranker = None
+    elif reranker is None:
+        reranker = _build_reranker(cfg)
     store = Store(db_path, cfg.embed_model, stored_dim, vector_quant=stored_quant)
     return Searcher(store, active_embedder, reranker)
 
@@ -275,6 +282,10 @@ def _daemon_search(
     falls back to the local configured index; timeouts and other server errors
     propagate so a broken daemon is never silently ignored.
     """
+    from .daemon import legacy_daemon_supported
+
+    if not legacy_daemon_supported():
+        return None
     expected = {
         "db_path": str(
             Path(cfg.db_path).expanduser().resolve(strict=False)
@@ -361,6 +372,87 @@ def _validate_query(
     )
 
 
+def _service_hits(
+    call: str, request: dict[str, Any], cfg: Config
+) -> list[Hit] | None:
+    """Send ``request`` to a running service, or return ``None`` to go local.
+
+    An unreachable service (or none at all), or one serving another config
+    file or index than ``cfg``, returns ``None``; any error the service
+    reports surfaces as :class:`SearchError` with its message.
+    """
+    client = ServiceClient.from_discovery(
+        config_path=default_config_path(), db_path=Path(cfg.db_path)
+    )
+    if client is None:
+        return None
+    try:
+        return client.search(request) if call == "search" else client.similar(request)
+    except ServiceUnavailable as exc:
+        log_event(_LOGGER, logging.DEBUG, "cli_search.service_unavailable", error=exc)
+        return None
+    except ServiceError as exc:
+        raise SearchError(str(exc)) from exc
+
+
+def _wire_search_request(
+    query: str,
+    k: int,
+    mode: SearchMode,
+    per_file: int,
+    rerank: bool,
+    path_prefix: str | None,
+    *,
+    explain: bool,
+    kind: str | None,
+    since: str | None,
+    module: str | None,
+    week: str | None,
+) -> dict[str, Any] | None:
+    """Build a ``POST /api/search`` body, or ``None`` if the wire can't express it."""
+    if (
+        k > LIMITS["k_max"]
+        or per_file > LIMITS["per_file_max"]
+        or len(query) > LIMITS["query_chars"]
+        or (rerank and mode == "keyword")
+    ):
+        return None
+    request: dict[str, Any] = {
+        "query": query,
+        "k": k,
+        "mode": mode,
+        "per_file": per_file,
+        "rerank": rerank,
+        "explain": explain,
+    }
+    for name, value in (
+        ("path", path_prefix),
+        ("kind", kind),
+        ("since", since),
+        ("module", module),
+        ("week", week),
+    ):
+        if value is not None:
+            request[name] = value
+    return request
+
+
+_daemon_deprecation_logged = False
+
+
+def _log_daemon_deprecation() -> None:
+    global _daemon_deprecation_logged
+    if _daemon_deprecation_logged:
+        return
+    _daemon_deprecation_logged = True
+    log_event(
+        _LOGGER,
+        logging.INFO,
+        "cli_search.daemon_deprecated",
+        hint="`seekr daemon` is deprecated; use `seekr service start`",
+    )
+
+
 def get_hits(
     query: str,
     k: int = 10,
@@ -377,15 +469,21 @@ def get_hits(
     cfg: Config | None = None,
     searcher: Searcher | None = None,
     embedder: Embedder | None = None,
+    reranker: Reranker | None = None,
     use_daemon: bool = True,
+    use_service: bool = True,
 ) -> list[Hit]:
-    """Return hits for a standalone query, preferring a warm daemon.
+    """Return hits for a standalone query, preferring a running service.
 
-    This is the pure shared point for ``seekr search`` and ``seekr pick``.
-    ``cfg``, ``searcher`` and ``embedder`` are injection hooks for tests and
-    for a caller that already owns a live search stack.  ``searcher`` wins over
-    ``embedder``; ordinary CLI calls leave both unset.  ``use_daemon=False``
-    forces the local configured index even when a daemon is listening.
+    This is the pure shared point for ``seekr search``, ``seekr pick`` and MCP.
+    The order is: the local service, then the legacy daemon, then a local
+    search.  ``cfg``, ``searcher`` and ``embedder`` are injection hooks for
+    tests and for a caller that already owns a live search stack (the service
+    itself); any of them, ``use_service=False`` or ``use_daemon=False`` skips
+    the service.  ``reranker`` is a warm cross-encoder for a local
+    ``rerank=True`` search.  ``searcher`` wins over ``embedder``; ordinary CLI calls leave
+    all of them unset.  ``use_daemon=False`` forces the local configured index
+    even when a service or daemon is listening.
     """
     kind_val, since_mtime_ns, module_val, week_range = _validate_query(
         query, k, mode, per_file, kind, since, module, week
@@ -419,6 +517,31 @@ def get_hits(
         )
 
     selected_cfg = cfg if cfg is not None else load_config()
+    if (
+        use_service
+        and use_daemon
+        and cfg is None
+        and embedder is None
+        and reranker is None
+    ):
+        wire = _wire_search_request(
+            query,
+            k,
+            mode,
+            per_file,
+            rerank,
+            path_prefix,
+            explain=explain,
+            kind=kind,
+            since=since,
+            module=module,
+            week=week,
+        )
+        if wire is not None:
+            service_hits = _service_hits("search", wire, selected_cfg)
+            if service_hits is not None:
+                return service_hits
+
     if use_daemon:
         daemon_hits = _daemon_search(
             selected_cfg,
@@ -435,6 +558,7 @@ def get_hits(
             week_range=week_range,
         )
         if daemon_hits is not None:
+            _log_daemon_deprecation()
             return daemon_hits
 
     # The lock covers the whole Store lifetime, so a concurrent reindex cannot
@@ -447,11 +571,12 @@ def get_hits(
         mode=mode,
     )
     with lifecycle_lock(selected_cfg.db_path, shared=True):
-        selected = (
-            _build_searcher(selected_cfg, mode, rerank)
-            if embedder is None
-            else _build_searcher(selected_cfg, mode, rerank, embedder=embedder)
-        )
+        injected: dict[str, Any] = {}
+        if embedder is not None:
+            injected["embedder"] = embedder
+        if reranker is not None:
+            injected["reranker"] = reranker
+        selected = _build_searcher(selected_cfg, mode, rerank, **injected)
         if selected is None:
             return []
         try:
@@ -565,8 +690,13 @@ def get_similar_hits(
     week: str | None = None,
     cfg: Config | None = None,
     searcher: Searcher | None = None,
+    use_service: bool = True,
 ) -> list[Hit]:
-    """Return indexed hits semantically similar to ``target``."""
+    """Return indexed hits semantically similar to ``target``.
+
+    A running service answers first unless ``cfg`` or ``searcher`` is injected
+    or ``use_service`` is false; otherwise the configured index is read here.
+    """
     if k <= 0:
         raise SearchError("k must be a positive integer")
     if per_file <= 0:
@@ -582,6 +712,26 @@ def get_similar_hits(
         similar_kwargs["week_range"] = week_range
     target_path = Path(target).expanduser().resolve(strict=False)
     selected_cfg = cfg if cfg is not None else load_config()
+    if (
+        use_service
+        and cfg is None
+        and searcher is None
+        and k <= LIMITS["k_max"]
+        and per_file <= LIMITS["per_file_max"]
+    ):
+        wire: dict[str, Any] = {"path": str(target_path), "k": k, "per_file": per_file}
+        for name, value in (
+            ("path_prefix", path_prefix),
+            ("kind", kind),
+            ("since", since),
+            ("module", module),
+            ("week", week),
+        ):
+            if value is not None:
+                wire[name] = value
+        service_hits = _service_hits("similar", wire, selected_cfg)
+        if service_hits is not None:
+            return service_hits
 
     if searcher is not None:
         vectors = _vectors_for_target(

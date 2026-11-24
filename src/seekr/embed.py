@@ -15,6 +15,8 @@ from . import offline
 from .config import Config
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import numpy as np
 
 QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
@@ -190,12 +192,16 @@ class SentenceTransformerEmbedder:
         return self._encode([QUERY_PREFIX + text])[0]
 
 
-def build_embedder(cfg: Config) -> Embedder:
-    """Build the configured lazy embedding backend (``cfg.embed_backend``)."""
+def build_embedder(cfg: Config, *, model_dir: Path | None = None) -> Embedder:
+    """Build the configured lazy embedding backend (``cfg.embed_backend``).
+
+    ``model_dir`` points the ONNX backend at a bundled model directory; the
+    sentence-transformers backend ignores it.
+    """
     if cfg.embed_backend == "onnx":
         from .onnx_backend import OnnxEmbedder
 
-        return OnnxEmbedder(cfg.embed_model)
+        return OnnxEmbedder(cfg.embed_model, model_dir=model_dir)
     return SentenceTransformerEmbedder(cfg.embed_model)
 
 

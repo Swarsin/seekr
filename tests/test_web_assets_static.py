@@ -214,3 +214,23 @@ class WebAssetsStaticTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ServiceStatusCopyTests(unittest.TestCase):
+    """The status panel knows when the seekr service serves the page."""
+
+    def setUp(self) -> None:
+        self.source = APP_JS.read_text(encoding="utf-8")
+
+    def test_status_panel_reads_the_service_object(self) -> None:
+        self.assertIn("st.service", self.source)
+        self.assertIn("seekr service start", self.source)
+        self.assertIn("seekr web", self.source)
+
+    def test_no_advice_to_restart_or_run_seekr_daemon(self) -> None:
+        for advice in (
+            'Restart ", codeText("seekr daemon")',
+            "Restart seekr daemon",
+            "Restart it so it sees the new folder",
+        ):
+            self.assertNotIn(advice, self.source)

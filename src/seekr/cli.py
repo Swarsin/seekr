@@ -13,9 +13,11 @@ from . import (
     cli_models,
     cli_open,
     cli_search,
+    cli_service,
     cli_web,
 )
 from .logging_config import configure_logging
+from .stdio import configure_redirected_streams
 
 app = typer.Typer(
     help="Local semantic search over your own files.",
@@ -46,6 +48,7 @@ def main(
     ),
 ) -> None:
     """Local semantic search over your own files."""
+    configure_redirected_streams()
     configure_logging(verbose=verbose)
 
 
@@ -107,6 +110,7 @@ cli_init.register(app)
 cli_models.register(app)
 cli_open.register(app)
 cli_search.register(app)
+cli_service.register(app)
 cli_web.register(app)
 
 

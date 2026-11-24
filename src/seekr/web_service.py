@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import errno
 import logging
+import math
 import os
 import re
 import shutil
@@ -20,14 +21,14 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Sequence
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import platform_info
+from . import pathnorm, platform_info
 from .config import (
     DEFAULT_EMBED_MODEL,
     Config,
@@ -42,6 +43,7 @@ from .web_config import inspect_config, read_roots
 from .web_config import remove_root as config_remove_root
 from .web_contract import (
     LIMITS,
+    NO_SERVICE,
     ApiError,
     CourseModuleDTO,
     CourseView,
@@ -51,6 +53,7 @@ from .web_contract import (
     RootsView,
     SearchRequest,
     SearchResult,
+    SimilarRequest,
     StatusView,
 )
 
@@ -62,6 +65,8 @@ __all__ = ["WebService"]
 _LOGGER = logging.getLogger(__name__)
 _LOCK_WAIT_SECONDS = 2.0
 _READ_BUSY_TIMEOUT_SECONDS = 2.0
+# How long a reindex waits for in-flight searches before the exclusive swap.
+_REINDEX_SWAP_WAIT_SECONDS = 10.0
 _STATUS_BUSY_TIMEOUT_SECONDS = 5.0
 _DIAGNOSTIC_LIMIT = LIMITS["errors_retained"]
 _JOBS_RETAINED = LIMITS["jobs_retained"]
@@ -75,10 +80,23 @@ _OFFLINE_ENV_KEYS = (
     "TRANSFORMERS_OFFLINE",
     "HF_DATASETS_OFFLINE",
 )
-_DAEMON_WARNING = (
-    "a seekr daemon is running; restart it before relying on the new folder "
-    "in daemon-backed searches"
-)
+
+
+def _explain_payload(value: object) -> dict[str, object] | None:
+    """Map a ``HitExplain`` to a JSON-safe dict (non-finite numbers become ``None``)."""
+    if value is None:
+        return None
+    from dataclasses import fields, is_dataclass
+
+    if not is_dataclass(value):
+        return None
+    payload: dict[str, object] = {}
+    for item in fields(value):
+        raw = getattr(value, item.name)
+        if isinstance(raw, float) and not math.isfinite(raw):
+            raw = None
+        payload[item.name] = raw
+    return payload
 
 
 def _now_iso() -> str:
@@ -110,8 +128,10 @@ def _is_busy_error(exc: BaseException) -> bool:
 
 
 def _socket_is_live(path: Path) -> bool:
-    from .daemon import socket_path_problem
+    from .daemon import legacy_daemon_supported, socket_path_problem
 
+    if not legacy_daemon_supported():
+        return False
     if socket_path_problem(path) is not None:
         return False
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -172,6 +192,7 @@ class _IndexSnapshot:
     def as_dict(self) -> dict[str, object]:
         return {
             "state": self.state,
+            "db_path": str(self.db_path) if self.db_path.parts else None,
             "documents": self.documents,
             "chunks": self.chunks,
             "size_bytes": self.size_bytes,
@@ -236,7 +257,21 @@ class WebService:
         daemon_probe: Callable[[Path], bool] | None = None,
         lock_wait_seconds: float = _LOCK_WAIT_SECONDS,
         read_busy_timeout: float = _READ_BUSY_TIMEOUT_SECONDS,
+        on_shutdown: Callable[[], None] | None = None,
+        on_roots_changed: Callable[[], None] | None = None,
+        reindex_runner: Callable[[Callable[[], Any]], Any] | None = None,
+        service_identity: Mapping[str, object] | None = None,
     ) -> None:
+        """Configure the backend; heavy modules load only when used.
+
+        ``service_identity`` (``{"pid", "version"}``) is set by the background
+        service so status reports ``service.running``; a plain ``seekr web
+        --foreground`` backend leaves it unset.
+
+        ``reindex_runner`` wraps the rebuild of a reindex job (the job thread
+        already holds the engine lane); the service uses it to pause the
+        watcher and close its Store around the swap.
+        """
         configured = default_config_path() if config_path is None else Path(config_path)
         configured = configured.expanduser()
         if not configured.is_absolute():
@@ -254,8 +289,28 @@ class WebService:
         self._lock_wait_seconds = max(0.0, float(lock_wait_seconds))
         self._read_busy_timeout = max(0.0, float(read_busy_timeout))
 
+        self._on_shutdown = on_shutdown
+        self._on_roots_changed = on_roots_changed
+        self._reindex_runner = reindex_runner
+        self._service_status: dict[str, object] = (
+            dict(NO_SERVICE)
+            if service_identity is None
+            else {
+                "running": True,
+                "pid": service_identity.get("pid"),
+                "version": service_identity.get("version"),
+            }
+        )
+        self._shutdown_requested = False
         self._state_lock = threading.RLock()
+        # Signalled whenever the lane is released or shutdown begins.
+        self._lane_free = threading.Condition(self._state_lock)
         self._config_write_lock = threading.Lock()
+        # Serialises model construction; searches never wait on the lane.
+        self._model_load_lock = threading.Lock()
+        # One warm cross-encoder per (model, backend), built at most once.
+        self._reranker_lock = threading.Lock()
+        self._rerankers: dict[tuple[str, str], Any] = {}
         self._lane_kind: str | None = None
         self._lane_job_id: str | None = None
         self._root_writers = 0
@@ -277,6 +332,7 @@ class WebService:
         """Stop admitting new work without waiting for the active job."""
         with self._state_lock:
             self._shutting_down = True
+            self._lane_free.notify_all()
 
     def shutdown(self) -> None:
         """Stop accepting work and join the active background job."""
@@ -296,6 +352,28 @@ class WebService:
             self._shutdown_complete = True
 
     close = shutdown
+
+    def set_shutdown_callback(self, callback: Callable[[], None] | None) -> None:
+        """Set the hook :meth:`request_shutdown` invokes (replaces any earlier one)."""
+        self._on_shutdown = callback
+
+    def request_shutdown(self) -> None:
+        """Ask the hosting process to stop, without stopping it on this thread.
+
+        The callback must only signal (for example set an event); the host owns
+        the actual listener and backend teardown.  Repeated calls signal once.
+        """
+        with self._state_lock:
+            if self._shutdown_requested:
+                return
+            self._shutdown_requested = True
+            callback = self._on_shutdown
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:  # noqa: BLE001 - a signalling hook must not fail the request
+            _LOGGER.warning("event=web_shutdown_callback_failed")
 
     def _reject_if_shutting_down(self) -> None:
         with self._state_lock:
@@ -389,6 +467,10 @@ class WebService:
         return build_embedder(cfg)
 
     def _load_model_for_lane(self, cfg: Config) -> tuple[Embedder, int]:
+        with self._model_load_lock:
+            return self._load_model_locked(cfg)
+
+    def _load_model_locked(self, cfg: Config) -> tuple[Embedder, int]:
         cached = self._cached_embedder(cfg.embed_model)
         if cached is not None:
             dim = int(cached.dim)
@@ -429,6 +511,44 @@ class WebService:
         with self._state_lock:
             self._lane_kind = None
             self._lane_job_id = None
+            self._lane_free.notify_all()
+
+    def run_in_lane(
+        self,
+        kind: str,
+        fn: Callable[[], Any],
+        *,
+        wait: bool = True,
+        during_shutdown: bool = False,
+    ) -> Any:
+        """Run ``fn`` holding the engine lane, waiting for it when ``wait``.
+
+        Raises ``409 busy`` once shutdown has begun (also for waiters), unless
+        ``during_shutdown`` is set for final cleanup by the host.
+        """
+        with self.lane(kind, wait=wait, during_shutdown=during_shutdown):
+            return fn()
+
+    @contextmanager
+    def lane(
+        self, kind: str, *, wait: bool = True, during_shutdown: bool = False
+    ) -> Iterator[None]:
+        """Hold the engine lane for the ``with`` body (see :meth:`run_in_lane`)."""
+        with self._state_lock:
+            while (
+                wait
+                and (during_shutdown or not self._shutting_down)
+                and (self._lane_kind is not None or self._root_writers)
+            ):
+                self._lane_free.wait()
+            if during_shutdown and self._lane_kind is None and not self._root_writers:
+                self._lane_kind = kind
+            else:
+                self._begin_lane(kind)
+        try:
+            yield
+        finally:
+            self._end_lane()
 
     def _activity(self) -> dict[str, object]:
         with self._state_lock:
@@ -436,7 +556,11 @@ class WebService:
 
     # -- daemon ------------------------------------------------------------
 
-    def _daemon_socket(self) -> Path:
+    def _daemon_socket(self) -> Path | None:
+        from .daemon import legacy_daemon_supported
+
+        if not legacy_daemon_supported():
+            return None
         configured = self._daemon_socket_path
         if configured is None:
             from .daemon import socket_path
@@ -446,11 +570,13 @@ class WebService:
             return Path(configured())
         return Path(configured)
 
-    def _daemon_status(self) -> tuple[bool, Path]:
+    def _daemon_status(self) -> tuple[bool, Path | None]:
         try:
             path = self._daemon_socket()
         except Exception:  # noqa: BLE001 - status must stay usable
-            return False, Path("/unavailable")
+            return False, None
+        if path is None:
+            return False, None
         probe = self._daemon_probe or _socket_is_live
         try:
             return bool(probe(path)), path
@@ -517,6 +643,7 @@ class WebService:
                 self._active_job_thread = None
             self._lane_kind = None
             self._lane_job_id = None
+            self._lane_free.notify_all()
 
     def _job_view(self, record: _JobRecord, now: float) -> JobView:
         finished = record.finished_monotonic
@@ -592,6 +719,8 @@ class WebService:
     # -- status ------------------------------------------------------------
 
     def status(self) -> StatusView:
+        # A stopping service must not look live to a new service instance.
+        self._reject_if_shutting_down()
         inspection = inspect_config(self._config_path)
         cfg: Config | None = None
         if inspection.state == "ok":
@@ -637,7 +766,10 @@ class WebService:
         return StatusView(
             index=index.as_dict(),
             model=self._model_snapshot(model_name),
-            daemon={"present": present, "socket": str(socket_path)},
+            daemon={
+                "present": present,
+                "socket": None if socket_path is None else str(socket_path),
+            },
             config={
                 "state": config_state,
                 "path": str(inspection.path),
@@ -646,6 +778,7 @@ class WebService:
                 "message": inspection.message,
             },
             activity=self._activity(),
+            service=dict(self._service_status),
         )
 
     # -- index inspection --------------------------------------------------
@@ -949,14 +1082,15 @@ class WebService:
         finally:
             with self._state_lock:
                 self._root_writers = max(0, self._root_writers - 1)
+                self._lane_free.notify_all()
 
-        present = self.daemon_present()
+        self._notify_roots_changed()
         return RootsView(
             roots=snapshot.roots,
             config_path=str(snapshot.path),
             revision=snapshot.revision,
-            daemon_restart_required=present,
-            warning=_DAEMON_WARNING if present else None,
+            daemon_restart_required=False,
+            warning=None,
         )
 
     def remove_root(self, path: str, revision: str) -> RootsView:
@@ -1020,6 +1154,11 @@ class WebService:
                 if lock is not None:
                     with suppress(Exception):
                         lock.release()
+            # Still holding the lane: a watcher action waiting for it must see
+            # the new roots, or it could re-index a file under the removed
+            # folder.  The callback only swaps observers and never takes the
+            # lane, so this cannot deadlock.
+            self._notify_roots_changed()
         finally:
             self._end_lane()
 
@@ -1028,6 +1167,17 @@ class WebService:
             config_path=str(snapshot.path),
             revision=snapshot.revision,
         )
+
+    def _notify_roots_changed(self) -> None:
+        callback = self._on_roots_changed
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception as exc:  # noqa: BLE001 - the config change already succeeded
+            _LOGGER.warning(
+                "event=web_roots_changed_callback_failed error=%r", _safe_message(exc)
+            )
 
     @staticmethod
     def _removed_root_prefixes(path: str, configured_roots: Sequence[Path]) -> list[str]:
@@ -1049,7 +1199,7 @@ class WebService:
                     existing_resolved = str(existing.expanduser().resolve(strict=False))
                 except (OSError, RuntimeError, ValueError):
                     continue
-                if existing_resolved == canonical:
+                if pathnorm.same_path(existing_resolved, canonical):
                     exp = str(existing.expanduser())
                     if exp and exp != "/" and exp not in prefixes:
                         prefixes.append(exp)
@@ -1300,7 +1450,7 @@ class WebService:
             doc.close()
 
     def open_chunk(self, chunk_id: int) -> None:
-        from .opener import OPEN_SUCCESS_CODES, open_command
+        from .opener import Argv, open_target, run_open
 
         row = self._fetch_chunk(chunk_id)
         is_wsl = platform_info.is_wsl()
@@ -1312,42 +1462,33 @@ class WebService:
             ) or platform_info.wslpath_windows(path_value)
 
         try:
-            argv = open_command(
+            action = open_target(
                 str(row.path),
                 str(row.locator),
                 str(row.kind),
-                os.environ,
-                shutil.which,
+                env=os.environ,
+                which=shutil.which,
                 wsl=is_wsl,
                 to_windows=to_windows,
             )
         except ValueError as exc:
             raise ApiError(500, "internal_error", _safe_message(exc)) from exc
 
+        name = action.argv[0] if isinstance(action, Argv) else "startfile"
         try:
-            result = subprocess.run(argv, check=False)
+            run_open(action, wait=False)
         except FileNotFoundError as exc:
             raise ApiError(
                 500,
                 "internal_error",
-                f"cannot run {argv[0]!r}: executable not found",
+                f"cannot run {name!r}: executable not found",
             ) from exc
         except (OSError, ValueError) as exc:
             raise ApiError(
                 500,
                 "internal_error",
-                f"cannot run {argv[0]!r}: {_safe_message(exc)}",
+                f"cannot run {name!r}: {_safe_message(exc)}",
             ) from exc
-
-        success_codes = OPEN_SUCCESS_CODES.get(
-            Path(argv[0]).name.lower(), frozenset({0})
-        )
-        if result.returncode not in success_codes:
-            raise ApiError(
-                500,
-                "internal_error",
-                f"opener {argv[0]!r} exited with status {result.returncode}",
-            )
 
     # -- search ------------------------------------------------------------
 
@@ -1357,6 +1498,7 @@ class WebService:
         *,
         is_wsl: bool = False,
         mounts: Sequence[platform_info.Mount] = (),
+        explain: bool = False,
     ) -> HitDTO:
         raw_module = getattr(hit, "module", None)
         raw_week = getattr(hit, "week", None)
@@ -1377,6 +1519,7 @@ class WebService:
             highlights=tuple((int(a), int(b)) for a, b in raw_highlights),
             location=format_location(path, locator, windows_path=win),
             posix_location=format_location(path, locator, windows_path=None),
+            explain=_explain_payload(getattr(hit, "explain", None)) if explain else None,
         )
 
     def _search_result(
@@ -1385,6 +1528,7 @@ class WebService:
         started: float,
         *,
         spread_hits: list[object] | None = None,
+        explain: bool = False,
     ) -> SearchResult:
         took_ms = max(0.0, (time.monotonic() - started) * 1000.0)
         spread_payload: tuple[dict[str, object], ...] | None = None
@@ -1397,7 +1541,8 @@ class WebService:
         mounts = platform_info.read_mounts() if is_wsl else ()
         return SearchResult(
             hits=tuple(
-                self._hit_dto(hit, is_wsl=is_wsl, mounts=mounts) for hit in hits
+                self._hit_dto(hit, is_wsl=is_wsl, mounts=mounts, explain=explain)
+                for hit in hits
             ),
             took_ms=took_ms,
             spread=spread_payload,
@@ -1407,7 +1552,9 @@ class WebService:
     def _spread_request(request: SearchRequest) -> SearchRequest:
         from .spread import SPREAD_CANDIDATES
 
-        return replace(request, k=SPREAD_CANDIDATES, per_file=2)
+        return replace(
+            request, k=SPREAD_CANDIDATES, per_file=2, rerank=False, explain=False
+        )
 
     @staticmethod
     def _optional_filter_kwargs(request: SearchRequest) -> dict[str, object]:
@@ -1426,9 +1573,9 @@ class WebService:
                 k=request.k,
                 mode=request.mode,
                 per_file=request.per_file,
-                rerank=False,
+                rerank=request.rerank,
                 path_prefix=request.path,
-                explain=False,
+                explain=request.explain,
                 kind=request.kind,
                 since=request.since,
                 cfg=cfg,
@@ -1441,14 +1588,26 @@ class WebService:
             k=request.k,
             mode=request.mode,
             per_file=request.per_file,
-            rerank=False,
+            rerank=request.rerank,
             path_prefix=request.path,
-            explain=False,
+            explain=request.explain,
             kind=request.kind,
             since=request.since,
             cfg=cfg,
             **extra,
         )
+
+    def _reranker_for(self, cfg: Config) -> Any:
+        """Return the warm reranker for ``cfg``, building it once under a lock."""
+        key = (cfg.rerank_model, cfg.embed_backend)
+        with self._reranker_lock:
+            reranker = self._rerankers.get(key)
+            if reranker is None:
+                from .cli_search import _build_reranker
+
+                reranker = _build_reranker(cfg)
+                self._rerankers[key] = reranker
+            return reranker
 
     def _call_local_search(
         self, cfg: Config, request: SearchRequest, embedder: Embedder
@@ -1457,7 +1616,8 @@ class WebService:
             "k": request.k,
             "mode": request.mode,
             "per_file": request.per_file,
-            "rerank": False,
+            "rerank": request.rerank,
+            "explain": request.explain,
             "path_prefix": request.path,
             "kind": request.kind,
             "since": request.since,
@@ -1466,6 +1626,8 @@ class WebService:
             "use_daemon": False,
             **self._optional_filter_kwargs(request),
         }
+        if request.rerank and self._local_search is None:
+            kwargs["reranker"] = self._reranker_for(cfg)
         if self._local_search is not None:
             return self._local_search(request.query, **kwargs)
         from .cli_search import get_hits
@@ -1526,7 +1688,8 @@ class WebService:
                         k=req.k,
                         mode="keyword",
                         per_file=req.per_file,
-                        rerank=False,
+                        rerank=req.rerank,
+                        explain=req.explain,
                         path_prefix=req.path,
                         kind=req.kind,
                         since=req.since,
@@ -1545,23 +1708,45 @@ class WebService:
 
         return self._with_read_only_store(cfg, snapshot, run_with_store)
 
+    def _reject_if_downloading(self) -> None:
+        with self._state_lock:
+            if self._lane_kind == "download":
+                raise ApiError(409, "busy", "a model download is running")
+
+    def _search_embedder(self, cfg: Config) -> Embedder:
+        """Return the embedder for a search without waiting on index writes.
+
+        Searches read the index concurrently with index jobs and watcher
+        writes (SQLite WAL readers).  Only the first model load is exclusive:
+        it shows as the ``search`` lane when the lane is free, and otherwise
+        waits only for the model-load lock.
+        """
+        self._reject_if_downloading()
+        took_lane = False
+        if self._cached_embedder(cfg.embed_model) is None:
+            with self._state_lock:
+                if self._lane_kind is None and not self._root_writers:
+                    self._lane_kind = "search"
+                    took_lane = True
+        try:
+            return self._load_model_for_lane(cfg)[0]
+        finally:
+            if took_lane:
+                self._end_lane()
+
     def _hybrid_local_search(
         self, cfg: Config, request: SearchRequest
     ) -> tuple[list[object], list[object] | None]:
-        self._begin_lane("search")
-        try:
-            embedder = self._load_model_for_lane(cfg)[0]
-            hits = self._call_local_search(cfg, request, embedder)
-            spread_hits: list[object] | None = None
-            if request.spread:
-                spread_hits = (
-                    self._call_local_search(cfg, self._spread_request(request), embedder)
-                    if hits
-                    else []
-                )
-            return hits, spread_hits
-        finally:
-            self._end_lane()
+        embedder = self._search_embedder(cfg)
+        hits = self._call_local_search(cfg, request, embedder)
+        spread_hits: list[object] | None = None
+        if request.spread:
+            spread_hits = (
+                self._call_local_search(cfg, self._spread_request(request), embedder)
+                if hits
+                else []
+            )
+        return hits, spread_hits
 
     @staticmethod
     def _validate_search_filters(request: SearchRequest) -> None:
@@ -1632,6 +1817,21 @@ class WebService:
                 "spread must be a boolean",
                 {"spread": "spread must be a boolean"},
             )
+        for flag in ("rerank", "explain"):
+            if type(getattr(request, flag)) is not bool:
+                raise ApiError(
+                    400,
+                    "invalid_request",
+                    f"{flag} must be a boolean",
+                    {flag: f"{flag} must be a boolean"},
+                )
+        if request.rerank and request.mode == "keyword":
+            raise ApiError(
+                400,
+                "invalid_request",
+                "rerank is not available for keyword mode",
+                {"rerank": "rerank is not available for keyword mode"},
+            )
         cfg = self._load_config()
 
         empty_spread: list[object] | None = [] if request.spread else None
@@ -1668,7 +1868,10 @@ class WebService:
                     else:
                         daemon_spread = []
                 return self._search_result(
-                    list(daemon_hits), started, spread_hits=daemon_spread
+                    list(daemon_hits),
+                    started,
+                    spread_hits=daemon_spread,
+                    explain=request.explain,
                 )
 
         snapshot = self._preflight_search(cfg)
@@ -1680,7 +1883,9 @@ class WebService:
                 hits, spread_hits = self._keyword_search(cfg, request, snapshot)
             except Exception as exc:
                 raise self._map_search_error(exc) from exc
-            return self._search_result(hits, started, spread_hits=spread_hits)
+            return self._search_result(
+                hits, started, spread_hits=spread_hits, explain=request.explain
+            )
 
         if self._model_state_for(cfg.embed_model) == "unavailable":
             raise ApiError(
@@ -1692,7 +1897,50 @@ class WebService:
             hits, spread_hits = self._hybrid_local_search(cfg, request)
         except Exception as exc:
             raise self._map_search_error(exc) from exc
-        return self._search_result(hits, started, spread_hits=spread_hits)
+        return self._search_result(
+            hits, started, spread_hits=spread_hits, explain=request.explain
+        )
+
+    def similar(self, request: SimilarRequest) -> SearchResult:
+        self._reject_if_shutting_down()
+        started = time.monotonic()
+        if type(request.path) is not str or not pathnorm.is_absolute(request.path):
+            raise ApiError(
+                400, "invalid_request", "path must be an absolute path",
+                {"path": "path must be an absolute path"},
+            )
+        for name, low, high in (
+            ("k", LIMITS["k_min"], LIMITS["k_max"]),
+            ("per_file", LIMITS["per_file_min"], LIMITS["per_file_max"]),
+        ):
+            value = getattr(request, name)
+            if type(value) is not int or not low <= value <= high:
+                message = f"{name} must be an integer from {low} to {high}"
+                raise ApiError(400, "invalid_request", message, {name: message})
+        self._validate_search_filters(request)  # type: ignore[arg-type]
+        cfg = self._load_config()
+
+        from .cli_search import get_similar_hits
+
+        self._reject_if_downloading()
+        try:
+            hits = list(
+                get_similar_hits(
+                    request.path,
+                    k=request.k,
+                    per_file=request.per_file,
+                    path_prefix=request.path_prefix,
+                    kind=request.kind,
+                    since=request.since,
+                    module=request.module,
+                    week=request.week,
+                    cfg=cfg,
+                    use_service=False,
+                )
+            )
+        except Exception as exc:
+            raise self._map_search_error(exc) from exc
+        return self._search_result(hits, started)
 
     # -- jobs: model check -------------------------------------------------
 
@@ -1753,7 +2001,9 @@ class WebService:
             "warnings_truncated": len(warnings) > _DIAGNOSTIC_LIMIT,
         }
 
-    def _run_index_job(self, job_id: str, cfg: Config) -> None:
+    def _run_index_job(
+        self, job_id: str, cfg: Config, targets: Sequence[Path] | None = None
+    ) -> None:
         store: object | None = None
         lock: object | None = None
         state = "failed"
@@ -1777,7 +2027,7 @@ class WebService:
                 vector_quant=cfg.vector_quant,
             )
             indexer = indexer_factory(store, embedder, cfg)
-            report = indexer.sync(list(cfg.roots))
+            report = indexer.sync(list(cfg.roots if targets is None else targets))
             report_payload = self._serialise_report(report)
             state = "partial" if getattr(report, "errors", []) else "succeeded"
             error = None
@@ -1805,6 +2055,32 @@ class WebService:
         cfg = self._load_config()
         if not cfg.roots:
             raise ApiError(400, "no_roots", "no roots are configured; add a folder first")
+        return self._start_index_job(cfg, None)
+
+    def start_index_paths(self, paths: list[str]) -> str:
+        """Index specific files or directories (not necessarily configured roots)."""
+        self._reject_if_shutting_down()
+        if not isinstance(paths, list) or not paths:
+            raise ApiError(
+                400, "invalid_request", "paths must be a non-empty list",
+                {"paths": "paths must be a non-empty list"},
+            )
+        targets: list[Path] = []
+        for raw in paths:
+            if type(raw) is not str or not raw.strip():
+                message = "each path must be a non-empty string"
+                raise ApiError(400, "invalid_request", message, {"paths": message})
+            if not pathnorm.is_absolute(raw):
+                message = "each path must be an absolute path"
+                raise ApiError(400, "invalid_request", message, {"paths": message})
+            target = Path(raw)
+            if not target.exists():
+                message = f"path does not exist: {raw}"
+                raise ApiError(400, "invalid_request", message, {"paths": message})
+            targets.append(target)
+        return self._start_index_job(self._load_config(), targets)
+
+    def _start_index_job(self, cfg: Config, targets: list[Path] | None) -> str:
         if self.daemon_present():
             raise ApiError(
                 409,
@@ -1832,7 +2108,75 @@ class WebService:
                 "model_unavailable",
                 f"embedding model {cfg.embed_model!r} is unavailable; run an explicit model check",
             )
-        return self._start_job("index", lambda job_id: self._run_index_job(job_id, cfg))
+        return self._start_job(
+            "index", lambda job_id: self._run_index_job(job_id, cfg, targets)
+        )
+
+    # -- jobs: reindex -----------------------------------------------------
+
+    def start_reindex(self, force: bool = False, allow_empty: bool = False) -> str:
+        """Rebuild the index in a fresh database and swap it in, as a job.
+
+        The job is an ``index`` operation holding the engine lane.  The swap
+        itself runs inside ``reindex_runner`` (the service's pause), so no
+        Store of this process is open on the live database during it.
+        """
+        self._reject_if_shutting_down()
+        cfg = self._load_config()
+        if not cfg.roots:
+            raise ApiError(400, "no_roots", "no roots are configured; add a folder first")
+        if self.daemon_present():
+            raise ApiError(
+                409,
+                "daemon_active",
+                "a seekr daemon is running and maintains the index; stop the running "
+                "`seekr daemon` process before reindexing",
+            )
+        if self._model_state_for(cfg.embed_model) == "unavailable":
+            raise ApiError(
+                503,
+                "model_unavailable",
+                f"embedding model {cfg.embed_model!r} is unavailable; run an explicit model check",
+            )
+        return self._start_job(
+            "index",
+            lambda job_id: self._run_reindex_job(
+                job_id, cfg, force=bool(force), allow_empty=bool(allow_empty)
+            ),
+        )
+
+    def _run_reindex_job(
+        self, job_id: str, cfg: Config, *, force: bool, allow_empty: bool
+    ) -> None:
+        state = "failed"
+        report_payload: dict[str, object] | None = None
+        error: str | None = "reindex job stopped unexpectedly"
+        try:
+            embedder, _dim = self._load_model_for_lane(cfg)
+            from .lifecycle import rebuild_index
+
+            def rebuild() -> object:
+                return rebuild_index(
+                    cfg,
+                    embedder=embedder,
+                    lock_timeout=_REINDEX_SWAP_WAIT_SECONDS,
+                    force=force,
+                    allow_empty=allow_empty,
+                )
+
+            runner = self._reindex_runner
+            report = runner(rebuild) if runner is not None else rebuild()
+            report_payload = self._serialise_report(report)
+            state = "partial" if getattr(report, "errors", []) else "succeeded"
+            error = None
+        except ApiError as exc:
+            error = exc.message
+        except Exception as exc:  # noqa: BLE001 - report a safe job failure
+            error = _safe_message(exc)
+        finally:
+            self._finish_job_and_release_lane(
+                job_id, state, report=report_payload, error=error
+            )
 
     # -- jobs: download ----------------------------------------------------
 

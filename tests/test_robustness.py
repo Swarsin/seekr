@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import logging
 import os
 import sqlite3
@@ -21,6 +22,7 @@ from seekr.config import Config, ConfigError, load_config
 from seekr.embed import FakeEmbedder
 from seekr.indexer import Indexer
 from seekr.logging_config import LOGGER_NAME, configure_logging, log_event
+from seekr.opener import Argv
 from seekr.search import Searcher
 from seekr.store import Store
 
@@ -60,7 +62,7 @@ class StructuredLoggingTests(unittest.TestCase):
             added=3,
             ok=True,
             empty=None,
-            path=Path("/tmp/my notes/doc.md"),
+            path=Path("/tmp/my notes/doc.md"),  # rendered with the host's separators
             note='a=b "q"',
         )
         output = buf.getvalue()
@@ -71,7 +73,7 @@ class StructuredLoggingTests(unittest.TestCase):
         self.assertIn("added=3", output)
         self.assertIn("ok=true", output)
         self.assertIn("empty=null", output)
-        self.assertIn('path="/tmp/my notes/doc.md"', output)
+        self.assertIn(f"path={json.dumps(str(Path('/tmp/my notes/doc.md')))}", output)
         self.assertIn('note="a=b \\"q\\""', output)
 
     @unittest.skipUnless(_NEEDS_REAL_STORE, "numpy, sqlite-vec and FTS5 are required")
@@ -132,6 +134,8 @@ class SubprocessVerboseCliTests(unittest.TestCase):
                 "XDG_CONFIG_HOME": str(base / "config"),
                 "XDG_DATA_HOME": str(base / "data"),
                 "XDG_RUNTIME_DIR": str(base / "runtime"),
+                # Windows and macOS do not read XDG_CONFIG_HOME.
+                "SEEKR_CONFIG": str(cfg_dir / "config.toml"),
             }
 
             quiet = self._run_cli(env, "search", "alpha", "--mode", "keyword")
@@ -198,8 +202,8 @@ class ActionableErrorTests(unittest.TestCase):
 
             with (
                 mock.patch("seekr.cli_open.parse_pick_line", return_value=("/tmp/a.md", "L1")),
-                mock.patch("seekr.cli_open.open_command", return_value=["definitely-missing-bin", "/tmp/a.md"]),
-                mock.patch("seekr.cli_open.subprocess.run", side_effect=FileNotFoundError),
+                mock.patch("seekr.cli_open.open_target", return_value=Argv(["definitely-missing-bin", "/tmp/a.md"])),
+                mock.patch("seekr.opener.subprocess.run", side_effect=FileNotFoundError),
             ):
                 missing_exe = runner.invoke(app, ["open", "/tmp/a.md:L1"])
             self.assertEqual(missing_exe.exit_code, 1)

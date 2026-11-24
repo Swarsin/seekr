@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest import mock
 
+from seekr import paths
 from seekr.config import Config, ConfigError, default_config_path, load_config
 from seekr.models import ChunkSpec, ExtractedUnit, Hit, text_sha
+
+_LINUX = sys.platform.startswith("linux")
+
+
+def _home(path: str | Path) -> dict[str, str]:
+    """Environment that points ``~`` at *path* (``USERPROFILE`` on Windows)."""
+    return {"HOME": str(path), "USERPROFILE": str(path)}
 
 
 class ConfigLoadingTests(unittest.TestCase):
@@ -45,7 +54,7 @@ class ConfigLoadingTests(unittest.TestCase):
                 Path(tmp),
                 'roots = ["~/notes"]\nchunk_target_words = 200\n',
             )
-            with mock.patch.dict(os.environ, {"HOME": tmp}, clear=False):
+            with mock.patch.dict(os.environ, _home(tmp), clear=False):
                 cfg = load_config(cfg_path)
                 self.assertEqual(cfg.roots, (Path(tmp) / "notes",))
 
@@ -77,7 +86,7 @@ class ConfigLoadingTests(unittest.TestCase):
     def test_db_path_expands_tilde(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = self._write(Path(tmp), 'db_path = "~/data/index.db"\n')
-            with mock.patch.dict(os.environ, {"HOME": tmp}, clear=False):
+            with mock.patch.dict(os.environ, _home(tmp), clear=False):
                 cfg = load_config(cfg_path)
                 self.assertEqual(cfg.db_path, Path(tmp) / "data" / "index.db")
 
@@ -108,25 +117,28 @@ class ConfigLoadingTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 load_config(cfg_path)
 
+    @unittest.skipUnless(_LINUX, "XDG base directories apply only on Linux")
     def test_default_db_path_uses_xdg_data_home(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(
                 os.environ,
-                {"XDG_DATA_HOME": tmp, "HOME": tmp},
+                {"XDG_DATA_HOME": tmp, **_home(tmp)},
                 clear=False,
             ):
                 cfg = Config()
             self.assertEqual(cfg.db_path, Path(tmp) / "seekr" / "index.db")
 
+    @unittest.skipUnless(_LINUX, "~/.local/share is the Linux data directory")
     def test_default_db_path_falls_back_to_local_share(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.dict(os.environ, {"HOME": tmp}, clear=True):
+            with mock.patch.dict(os.environ, _home(tmp), clear=True):
                 cfg = Config()
             self.assertEqual(
                 cfg.db_path,
                 Path(tmp) / ".local" / "share" / "seekr" / "index.db",
             )
 
+    @unittest.skipUnless(_LINUX, "XDG base directories apply only on Linux")
     def test_default_path_uses_xdg_config_home(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp) / "seekr"
@@ -147,7 +159,7 @@ class ConfigLoadingTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
-                    "HOME": str(base),
+                    **_home(base),
                     "XDG_CONFIG_HOME": str(base / "xdg"),
                     "SEEKR_CONFIG": str(custom),
                 },
@@ -159,7 +171,7 @@ class ConfigLoadingTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
-                    "HOME": str(base),
+                    **_home(base),
                     "XDG_CONFIG_HOME": str(base / "xdg"),
                     "SEEKR_CONFIG": "~/tilde.toml",
                 },
@@ -170,16 +182,18 @@ class ConfigLoadingTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
-                    "HOME": str(base),
+                    **_home(base),
                     "XDG_CONFIG_HOME": str(base / "xdg"),
                     "SEEKR_CONFIG": "   ",
                 },
                 clear=True,
             ):
-                self.assertEqual(
-                    default_config_path(),
-                    base / "xdg" / "seekr" / "config.toml",
-                )
+                self.assertEqual(default_config_path(), paths.config_dir() / "config.toml")
+                if _LINUX:
+                    self.assertEqual(
+                        default_config_path(),
+                        base / "xdg" / "seekr" / "config.toml",
+                    )
 
     def test_wrong_value_types_raise(self) -> None:
         cases = [

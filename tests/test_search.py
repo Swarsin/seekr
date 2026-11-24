@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from _platform import requires_legacy_daemon, use_posix_stored_paths
 from seekr import cli_search
 from seekr.config import Config
 from seekr.embed import FakeEmbedder
@@ -1069,6 +1070,7 @@ class StdlibStoreSearchTests(unittest.TestCase):
     """Real SQLite FTS retrieval, with only the vec table stubbed for keyword."""
 
     def setUp(self) -> None:
+        use_posix_stored_paths(self)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.db_path = Path(self._tmp.name) / "index.db"
@@ -1153,6 +1155,7 @@ class StdlibStoreSearchTests(unittest.TestCase):
 @_NEEDS_REAL_STORE
 class RealStoreSearchTests(unittest.TestCase):
     def setUp(self) -> None:
+        use_posix_stored_paths(self)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.db_path = Path(self._tmp.name) / "index.db"
@@ -1394,6 +1397,7 @@ class SearchHookTests(unittest.TestCase):
         daemon.assert_not_called()
         build_searcher.assert_not_called()
 
+    @requires_legacy_daemon
     def test_try_daemon_hits_returns_list_none_and_propagates_errors(self) -> None:
         expected = [Hit(1, "/notes/a.md", "L1", 1.0, "alpha", 1.0, "text")]
         with mock.patch(

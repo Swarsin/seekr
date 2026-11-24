@@ -16,17 +16,20 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import typer
 
 from . import platform_info
-from .config import Config, load_config
+from .config import Config, default_config_path, load_config
 from .course import display_module
 from .embed import Embedder, build_embedder
-from .indexer import Indexer, SyncReport
+from .indexer import Indexer, SyncReport, _error_text
 from .lifecycle import LifecycleError, lifecycle_lock, rebuild_index
+from .service_client import ServiceClient, ServiceError, ServiceUnavailable
 from .store import Store
 
 __all__ = ["register"]
@@ -88,18 +91,149 @@ def _fatal(message: str) -> None:
     raise typer.Exit(code=1)
 
 
+_JOB_POLL_SECONDS = 0.5
+
+
+def _echo_report(
+    counts: Sequence[tuple[str, object]],
+    errors: Sequence[tuple[object, object]],
+    warnings: Sequence[tuple[object, object]],
+    error_total: int,
+    warning_total: int,
+) -> None:
+    for name, value in counts:
+        typer.echo(f"{name}: {value}")
+    typer.echo(f"errors: {error_total}")
+    typer.echo(f"warnings: {warning_total}")
+    for label, items, total in (
+        ("error", errors, error_total),
+        ("warning", warnings, warning_total),
+    ):
+        for path, message in items:
+            typer.echo(f"{label}: {path}: {message}")
+        if total > len(items):
+            typer.echo(f"{label}: ... {total - len(items)} more not shown")
+
+
+_COUNT_NAMES = ("added", "updated", "unchanged", "removed", "skipped")
+
+
 def _print_report(report: SyncReport) -> None:
-    typer.echo(f"added: {report.added}")
-    typer.echo(f"updated: {report.updated}")
-    typer.echo(f"unchanged: {report.unchanged}")
-    typer.echo(f"removed: {report.removed}")
-    typer.echo(f"skipped: {report.skipped}")
-    typer.echo(f"errors: {len(report.errors)}")
-    typer.echo(f"warnings: {len(report.warnings)}")
-    for path, message in report.errors:
-        typer.echo(f"error: {path}: {message}")
-    for path, message in report.warnings:
-        typer.echo(f"warning: {path}: {message}")
+    _echo_report(
+        [(name, getattr(report, name)) for name in _COUNT_NAMES],
+        report.errors,
+        report.warnings,
+        len(report.errors),
+        len(report.warnings),
+    )
+
+
+def _print_report_dict(report: dict[str, Any]) -> None:
+    """Print a service index-job report exactly like :func:`_print_report`."""
+
+    def diagnostics(key: str) -> list[tuple[object, object]]:
+        items = report.get(key) or []
+        return [(item.get("path"), item.get("message")) for item in items]
+
+    errors = diagnostics("errors")
+    warnings = diagnostics("warnings")
+    _echo_report(
+        [(name, report.get(name, 0)) for name in _COUNT_NAMES],
+        errors,
+        warnings,
+        int(report.get("error_total", len(errors))),
+        int(report.get("warning_total", len(warnings))),
+    )
+
+
+def _split_index_paths(paths: list[Path]) -> tuple[list[str], list[tuple[str, str]]]:
+    """Resolve ``paths`` and split off the ones the service would refuse.
+
+    Unusable paths get the same per-path error text a local ``Indexer.sync``
+    reports, so a delegated run prints the same report.
+    """
+    usable: list[str] = []
+    errors: list[tuple[str, str]] = []
+    for raw in paths:
+        resolved, issue = Indexer._resolve(Path(raw))
+        if resolved is None:
+            errors.append((str(raw), issue or "cannot resolve root"))
+            continue
+        try:
+            resolved.stat()
+        except FileNotFoundError as exc:
+            errors.append((str(resolved), f"root is missing or offline: {_error_text(exc)}"))
+            continue
+        except OSError as exc:
+            errors.append((str(resolved), f"cannot stat root: {_error_text(exc)}"))
+            continue
+        usable.append(str(resolved))
+    return usable, errors
+
+
+def _with_path_errors(
+    report: dict[str, Any], errors: list[tuple[str, str]]
+) -> dict[str, Any]:
+    if not errors:
+        return report
+    merged = dict(report)
+    merged["errors"] = [
+        {"path": path, "message": message} for path, message in errors
+    ] + list(report.get("errors") or [])
+    merged["error_total"] = int(report.get("error_total", 0)) + len(errors)
+    return merged
+
+
+def _service_client(cfg: Config) -> ServiceClient | None:
+    """Return a client for a service using this config and index, if any."""
+    return ServiceClient.from_discovery(
+        config_path=default_config_path(), db_path=Path(cfg.db_path)
+    )
+
+
+def _wait_for_job(client: ServiceClient, job_id: str, activity: str) -> dict[str, Any]:
+    """Poll a service job until it ends; return its report or raise."""
+    while True:
+        time.sleep(_JOB_POLL_SECONDS)
+        try:
+            job = client.job(job_id)
+        except ServiceUnavailable as exc:
+            raise ServiceError(
+                f"lost contact with the seekr service while {activity}: {exc}"
+            ) from exc
+        state = job.get("state")
+        if state == "running":
+            continue
+        report = job.get("report")
+        if state in ("succeeded", "partial") and isinstance(report, dict):
+            return report
+        raise ServiceError(str(job.get("error") or f"index job ended in state {state!r}"))
+
+
+def _index_via_service(client: ServiceClient, paths: list[Path] | None) -> dict[str, Any]:
+    """Run an index job in the service and return its report.
+
+    :class:`ServiceUnavailable` before the request is sent means "index
+    locally"; once the service may have started the job, any failure is an
+    error so two writers never run.
+    """
+    path_errors: list[tuple[str, str]] = []
+    if paths:
+        usable, path_errors = _split_index_paths(paths)
+        if not usable:
+            return _with_path_errors({name: 0 for name in _COUNT_NAMES}, path_errors)
+        job_id = client.index_paths(usable)
+    else:
+        job_id = client.index_roots()
+    return _with_path_errors(_wait_for_job(client, job_id, "indexing"), path_errors)
+
+
+def _reindex_via_service(
+    client: ServiceClient, *, force: bool, allow_empty: bool
+) -> dict[str, Any]:
+    """Run a reindex job in the service (same fallback rules as indexing)."""
+    job_id = client.reindex(force=force, allow_empty=allow_empty)
+    return _wait_for_job(client, job_id, "reindexing")
 
 
 def index(
@@ -119,6 +253,16 @@ def index(
                 "no index roots configured; add `roots = [...]` to config.toml "
                 "or pass PATH to `seekr index PATH`"
             )
+
+        client = _service_client(cfg)
+        if client is not None:
+            try:
+                service_report = _index_via_service(client, list(raw_paths or []))
+            except ServiceUnavailable:
+                pass
+            else:
+                _print_report_dict(service_report)
+                return
 
         embedder = _build_embedder(cfg)
         with lifecycle_lock(cfg.db_path, shared=True):
@@ -151,12 +295,24 @@ def reindex(
     """Rebuild the index in a fresh sibling database and swap it in safely.
 
     Per-file indexing errors and empty rebuilds are refused unless the matching
-    override flag is passed.
+    override flag is passed.  With a running service the rebuild runs there,
+    with the watcher paused and the service's index handles closed.
     """
     force_flag = force if isinstance(force, bool) else False
     allow_empty_flag = allow_empty if isinstance(allow_empty, bool) else False
     try:
         cfg = _load_config()
+        client = _service_client(cfg)
+        if client is not None:
+            try:
+                service_report = _reindex_via_service(
+                    client, force=force_flag, allow_empty=allow_empty_flag
+                )
+            except ServiceUnavailable:
+                pass
+            else:
+                _print_report_dict(service_report)
+                return
         report = rebuild_index(cfg, force=force_flag, allow_empty=allow_empty_flag)
     except typer.Exit:
         raise
@@ -168,9 +324,11 @@ def reindex(
     _print_report(report)
 
 
-def _daemon_status() -> tuple[bool, Path]:
-    from .daemon import _socket_is_active, socket_path
+def _daemon_status() -> tuple[bool, Path | None]:
+    from .daemon import _socket_is_active, legacy_daemon_supported, socket_path
 
+    if not legacy_daemon_supported():
+        return False, None
     sock = socket_path()
     try:
         return _socket_is_active(sock), sock
@@ -178,35 +336,52 @@ def _daemon_status() -> tuple[bool, Path]:
         return False, sock
 
 
-def _format_daemon_status(daemon_running: bool, sock: Path) -> str:
-    if daemon_running:
-        return f"daemon: running ({sock})"
-    from .daemon import socket_path_problem
-
-    if socket_path_problem(sock) is not None:
-        return f"daemon: stopped (socket path too long: {sock})"
-    return f"daemon: stopped ({sock})"
-
-
-def _resolve_root(root: Path) -> Path:
-    expanded = Path(root).expanduser()
+def _service_status() -> dict[str, Any]:
+    """Report the unified service (liveness-probed) for ``seekr status``."""
     try:
-        return expanded.resolve(strict=False)
-    except (OSError, RuntimeError):
-        return expanded
+        from .service import find_running_service
+
+        info = find_running_service(timeout=1.0)
+    except Exception:  # noqa: BLE001 - status must never fail on discovery
+        info = None
+    if info is None:
+        return {"running": False, "port": None, "pid": None, "version": None}
+    return {
+        "running": True,
+        "port": info.port,
+        "pid": info.pid,
+        "version": info.version,
+    }
+
+
+def _format_service_status(service: dict[str, Any]) -> str:
+    if service.get("running"):
+        return (
+            f"service: running at 127.0.0.1:{service['port']} "
+            f"(pid {service['pid']}, version {service['version']})"
+        )
+    return "service: not running"
 
 
 def _polled_watch_info(
-    daemon_running: bool, sock: Path, cfg: Config
+    daemon_running: bool,
+    sock: Path | None,
+    cfg: Config,
+    service_running: bool = False,
 ) -> tuple[list[Path], int]:
-    if not daemon_running:
-        return [], cfg.poll_interval_seconds
-    from .client import DaemonError, try_daemon_status
+    from .daemon import legacy_daemon_supported
 
-    try:
-        payload = try_daemon_status(sock_path=sock, timeout=0.5)
-    except DaemonError:
-        payload = None
+    daemon_running = daemon_running and legacy_daemon_supported()
+    if not daemon_running and not service_running:
+        return [], cfg.poll_interval_seconds
+    payload = None
+    if daemon_running:
+        from .client import DaemonError, try_daemon_status
+
+        try:
+            payload = try_daemon_status(sock_path=sock, timeout=0.5)
+        except DaemonError:
+            payload = None
 
     if payload is not None and "polled_roots" in payload:
         raw_roots = payload["polled_roots"]
@@ -226,19 +401,17 @@ def _polled_watch_info(
             return [Path(item) for item in raw_roots], interval
 
     mounts = platform_info.read_mounts()
-    polled: list[Path] = []
-    for root in cfg.roots:
-        resolved = _resolve_root(root)
-        if platform_info.is_slow_path(resolved, mounts) or (
-            platform_info.is_slow_path(Path(root).expanduser(), mounts)
-        ):
-            polled.append(resolved)
+    _, polled = platform_info.split_roots(cfg.roots, mounts)
     return polled, cfg.poll_interval_seconds
 
 
-def _echo_daemon_status(daemon_running: bool, sock: Path, cfg: Config) -> None:
-    typer.echo(_format_daemon_status(daemon_running, sock))
-    polled_roots, poll_interval = _polled_watch_info(daemon_running, sock, cfg)
+def _echo_daemon_status(
+    daemon_running: bool, sock: Path | None, cfg: Config, service: dict[str, Any]
+) -> None:
+    typer.echo(_format_service_status(service))
+    polled_roots, poll_interval = _polled_watch_info(
+        daemon_running, sock, cfg, bool(service.get("running"))
+    )
     for root in polled_roots:
         typer.echo(f"watch: {root} (polling every {poll_interval}s)")
 
@@ -282,10 +455,10 @@ def status(
     as_json: bool = typer.Option(
         False,
         "--json",
-        help="Emit index and daemon status as JSON.",
+        help="Emit index and service status as JSON.",
     ),
 ) -> None:
-    """Print index counts, model metadata, disk size and daemon status."""
+    """Print index counts, model metadata, disk size and service status."""
     json_flag = as_json if isinstance(as_json, bool) else False
     try:
         cfg = _load_config()
@@ -295,6 +468,7 @@ def status(
             if dim is None:
                 if not db_path.exists():
                     daemon_running, sock = _daemon_status()
+                    service = _service_status()
                     if json_flag:
                         typer.echo(
                             json.dumps(
@@ -314,8 +488,9 @@ def status(
                                     "schema_version": None,
                                     "daemon": {
                                         "running": daemon_running,
-                                        "socket": str(sock),
+                                        "socket": None if sock is None else str(sock),
                                     },
+                                    "service": service,
                                 },
                                 ensure_ascii=False,
                                 indent=2,
@@ -330,7 +505,7 @@ def status(
                         f"model: {cfg.embed_model} "
                         f"(quant={cfg.vector_quant}, backend={cfg.embed_backend})"
                     )
-                    _echo_daemon_status(daemon_running, sock, cfg)
+                    _echo_daemon_status(daemon_running, sock, cfg, service)
                     return
                 dim = _build_embedder(cfg).dim
 
@@ -353,6 +528,7 @@ def status(
 
     size_bytes = _db_size_bytes(db_path)
     daemon_running, sock = _daemon_status()
+    service = _service_status()
     if json_flag:
         typer.echo(
             json.dumps(
@@ -376,8 +552,9 @@ def status(
                     "embed_backend": cfg.embed_backend,
                     "daemon": {
                         "running": daemon_running,
-                        "socket": str(sock),
+                        "socket": None if sock is None else str(sock),
                     },
+                    "service": service,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -401,7 +578,7 @@ def status(
         typer.echo(f"by kind: {summary}")
     for line in _format_course_lines(course_rows):
         typer.echo(line)
-    _echo_daemon_status(daemon_running, sock, cfg)
+    _echo_daemon_status(daemon_running, sock, cfg, service)
 
 
 def register(app: typer.Typer) -> None:

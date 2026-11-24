@@ -27,7 +27,7 @@ from seekr.web_contract import ApiError
 
 def _write(path: Path, text: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    path.write_text(text, encoding="utf-8", newline="")  # keep CRLF exactly
     return path
 
 
@@ -156,15 +156,11 @@ def test_byte_preservation_outside_the_replaced_span(tmp_path: Path) -> None:
 
 
 def test_toml_safe_escaping_for_hostile_directory_names(tmp_path: Path) -> None:
-    names = [
-        'quote"dir',
-        "back\\slash",
-        "tab\tdir",
-        "new\nline",
-        "control\x01dir",
-        "hyphen-dir",
-        "unicodé",
-    ]
+    names = ["hyphen-dir", "unicodé", "apos'trophe", "semi;colon"]
+    if os.name == "posix":
+        # Windows forbids these characters in file names (and treats the
+        # backslash as a separator, which every Windows root already has).
+        names += ['quote"dir', "back\\slash", "tab\tdir", "new\nline", "control\x01dir"]
     config = _write(tmp_path / "config.toml", 'embed_model = "fake"\n')
     added: list[Path] = []
     for name in names:
@@ -176,7 +172,10 @@ def test_toml_safe_escaping_for_hostile_directory_names(tmp_path: Path) -> None:
     loaded = load_config(config)
     assert loaded.roots == tuple(added)
     text = config.read_text(encoding="utf-8")
-    assert "\\n" in text and "\\t" in text and "\\\\" in text and '\\"' in text
+    if os.name == "posix":
+        assert "\\n" in text and "\\t" in text and "\\\\" in text and '\\"' in text
+    else:
+        assert "\\\\" in text  # escaped path separators
 
 
 def test_unicode_line_separator_is_not_a_toml_newline(tmp_path: Path) -> None:
@@ -307,6 +306,20 @@ def test_atomic_replace_failure_preserves_existing_file(tmp_path: Path) -> None:
     assert list(tmp_path.glob(".config.toml.*.tmp")) == []
 
 
+def test_add_root_works_without_fchmod(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Windows Python before 3.13 has no os.fchmod.
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    root = _root(tmp_path, "docs")
+    config = _config_with_roots(tmp_path, [])
+
+    snapshot = add_root(config, str(root), config_revision(config))
+
+    assert snapshot.roots == (str(root),)
+    assert load_config(config).roots == (root,)
+    assert list(tmp_path.glob(".config.toml.*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes do not exist on Windows")
 def test_existing_mode_is_preserved_and_new_files_are_private(tmp_path: Path) -> None:
     root = _root(tmp_path, "docs")
     config = _config_with_roots(tmp_path, [])
@@ -324,6 +337,7 @@ def test_existing_mode_is_preserved_and_new_files_are_private(tmp_path: Path) ->
     assert load_config(nested).roots == (new_root,)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes do not exist on Windows")
 def test_existing_parent_mode_is_not_changed(tmp_path: Path) -> None:
     root = _root(tmp_path, "docs")
     parent = tmp_path / "existing"
@@ -609,3 +623,36 @@ def test_remove_root_refuses_symlink_and_unsupported_toml_shapes(tmp_path: Path)
     with pytest.raises(ApiError) as raised:
         remove_root(multiline, str(first), config_revision(multiline))
     assert _code(raised.value) == "config_invalid"
+
+
+NFC = "M\u00f3dulo"
+NFD = "Mo\u0301dulo"
+
+
+def test_darwin_case_and_unicode_variants_are_duplicate_roots(tmp_path: Path) -> None:
+    root = _root(tmp_path, NFC.lower())  # exists as "módulo" (NFC)
+    for spelling in (tmp_path / NFD.upper(), tmp_path / NFD.lower()):
+        config = _config_with_roots(tmp_path, [spelling])
+        with mock.patch("seekr.pathnorm._PLATFORM", "darwin"), pytest.raises(
+            ApiError
+        ) as raised:
+            add_root(config, str(root), config_revision(config))
+        assert _code(raised.value) == "duplicate_root"
+
+
+def test_linux_case_and_unicode_variants_stay_distinct_roots(tmp_path: Path) -> None:
+    root = _root(tmp_path, NFC.lower())
+    config = _config_with_roots(tmp_path, [tmp_path / NFD.upper()])
+    with mock.patch("seekr.pathnorm._PLATFORM", "linux"):
+        snapshot = add_root(config, str(root), config_revision(config))
+    assert len(snapshot.roots) == 2
+
+
+def test_darwin_remove_root_accepts_case_and_unicode_variants(tmp_path: Path) -> None:
+    configured = tmp_path / NFD.upper()
+    config = _config_with_roots(tmp_path, [configured])
+    with mock.patch("seekr.pathnorm._PLATFORM", "linux"), pytest.raises(ApiError):
+        remove_root(config, str(tmp_path / NFC.lower()), config_revision(config))
+    with mock.patch("seekr.pathnorm._PLATFORM", "darwin"):
+        snapshot = remove_root(config, str(tmp_path / NFC.lower()), config_revision(config))
+    assert snapshot.roots == ()

@@ -31,7 +31,7 @@ class _TemporaryDirectoryTestCase(unittest.TestCase):
 
     def write_text(self, name: str, text: str, encoding: str = "utf-8") -> Path:
         path = self.directory / name
-        path.write_text(text, encoding=encoding)
+        path.write_text(text, encoding=encoding, newline="")  # exact bytes, no CRLF
         return path
 
 
@@ -345,6 +345,10 @@ class PdfExtractionTests(_TemporaryDirectoryTestCase):
             extract(path, "pdf")
 
         self.assertIn("pdf", str(raised.exception).lower())
+        # A chained PyMuPDF error would pin the half-open document, keeping
+        # the file locked on Windows for as long as the error is held.
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
 
     def test_encrypted_pdf_raises(self) -> None:
         assert _fitz is not None
@@ -370,6 +374,49 @@ class PdfExtractionTests(_TemporaryDirectoryTestCase):
     def test_missing_pdf_keeps_file_not_found_error(self) -> None:
         with self.assertRaises(FileNotFoundError):
             extract(self.directory / "missing.pdf", "pdf")
+
+
+class LongPathOpenTests(_TemporaryDirectoryTestCase):
+    """Files are opened through ``pathnorm.os_path`` (the Windows long-path form)."""
+
+    def _redirect(self, real: Path):
+        requested: list[str] = []
+
+        def os_path(path: str, **_kwargs: object) -> str:
+            requested.append(path)
+            return str(real)
+
+        return requested, mock.patch("seekr.pathnorm.os_path", side_effect=os_path)
+
+    def test_text_and_transcript_open_via_os_path(self) -> None:
+        real = self.write_text("real.txt", "from the long-path form")
+        logical = self.directory / "logical.txt"
+        requested, patch = self._redirect(real)
+        with patch:
+            result = extract(logical, "text")
+        self.assertEqual(result.units[0].text, "from the long-path form")
+        self.assertEqual(requested, [str(logical)])
+
+    def test_notebook_opens_via_os_path(self) -> None:
+        from seekr.extract_documents import extract_notebook
+
+        notebook = (
+            '{"nbformat": 4, "nbformat_minor": 5, "metadata": {}, "cells": '
+            '[{"cell_type": "markdown", "metadata": {}, "source": ["hello cells"]}]}'
+        )
+        real = self.write_text("real.ipynb", notebook)
+        requested, patch = self._redirect(real)
+        with patch:
+            result = extract_notebook(self.directory / "logical.ipynb")
+        self.assertIn("hello cells", result.units[0].text)
+        self.assertEqual(requested, [str(self.directory / "logical.ipynb")])
+
+    def test_os_path_is_identity_off_windows(self) -> None:
+        from seekr import pathnorm
+
+        if sys.platform != "win32":
+            long_path = str(self.directory / ("d" * 200) / ("e" * 200))
+            self.assertEqual(pathnorm.os_path(long_path), long_path)
 
 
 class LazyImportTests(unittest.TestCase):

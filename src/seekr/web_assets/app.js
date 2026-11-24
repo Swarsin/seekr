@@ -810,15 +810,26 @@
     }
     setText(modelDetail, modelText);
 
-    if (st.daemon.present) {
+    var service = st.service && typeof st.service === "object" ? st.service : null;
+    clear(daemonDetail);
+    if (service && service.running) {
       setStatusValue(daemonState, "Running", "ok");
-      clear(daemonDetail);
-      append(daemonDetail, "A ", codeText("seekr daemon"), " process is running. Searches go through it, and it looks after the index itself.");
-      show(daemonDetail, true);
+      append(daemonDetail, "This page is served by the ", codeText("seekr service"),
+        (isCount(service.pid) ? " (process " + service.pid + ")" : ""),
+        ". It keeps the search model loaded, watches your folders and keeps the index up to date. Stop it with ",
+        codeText("seekr service stop"), ".");
+    } else if (st.daemon.present) {
+      setStatusValue(daemonState, "Older daemon running", "warn");
+      append(daemonDetail, "An older ", codeText("seekr daemon"),
+        " process is running. Searches go through it, and it looks after the index itself. Stop it and use ",
+        codeText("seekr service start"), " instead.");
     } else {
       setStatusValue(daemonState, "Not running", "off");
-      setText(daemonDetail, "");
+      append(daemonDetail, "This page runs in the terminal (", codeText("seekr web --foreground"),
+        "), so nothing watches your folders. Run ", codeText("seekr web"),
+        " instead to start the background service.");
     }
+    show(daemonDetail, true);
   }
 
   // ---------------------------------------------------------------- controls & first-run
@@ -836,7 +847,7 @@
     } else if (!st) {
       reason = ["Waiting for status."];
     } else if (st.daemon.present) {
-      reason = ["Turned off while the background service is running, because it maintains the index. To update from this page, stop the ", codeText("seekr daemon"), " process (Ctrl+C in its terminal), then choose Refresh."];
+      reason = ["Turned off while an older ", codeText("seekr daemon"), " process maintains the index. Stop it (Ctrl+C in its terminal), then choose Refresh. ", codeText("seekr service start"), " replaces it."];
     } else if (configInvalid()) {
       reason = ["Fix the settings file first."];
     } else if (state.job && state.job.operation === "index") {
@@ -1286,7 +1297,7 @@
         setView("folders", true);
       }));
     } else if (err.code === "daemon_active") {
-      bodies = [err.message, ["The background service maintains the index. Stop the ", codeText("seekr daemon"), " process to update from this page."]];
+      bodies = [err.message, ["An older ", codeText("seekr daemon"), " process maintains the index. Stop it to update from this page; ", codeText("seekr service start"), " replaces it."]];
     } else if (err.code === "busy") {
       bodies = ["Another task is already running. Try again when it finishes."];
     } else if (err.code === "config_invalid") {
@@ -1700,8 +1711,8 @@
       title = "The settings file can’t be read";
       bodies = [err.message, ["Fix this file by hand: ", el("span", "path-text", configPath())]];
     } else if (code === "daemon_failure") {
-      title = "The background service didn’t answer";
-      bodies = [err.message, ["Restart ", codeText("seekr daemon"), ", or stop it so this page searches the index directly."]];
+      title = "The older seekr daemon didn’t answer";
+      bodies = [err.message, ["Stop the older ", codeText("seekr daemon"), " process so this page searches the index directly; ", codeText("seekr service start"), " replaces it."]];
     } else if (!err.message) {
       bodies = ["The server reported an unexpected problem (" + (err.status || "no status") + "). Try again."];
     }
@@ -2369,7 +2380,7 @@
     } else if (idx.state === "missing" || idx.state === "empty") {
       var bodies = [idx.state === "missing" ? "Your folders are saved, but nothing has been indexed yet." : "The index exists but holds no documents yet."];
       if (st.daemon.present) {
-        bodies.push(["A ", codeText("seekr daemon"), " process is running and maintains the index."]);
+        bodies.push(["An older ", codeText("seekr daemon"), " process is running and maintains the index. Stop it and use ", codeText("seekr service start"), " instead."]);
       } else {
         bodies.push("Update index reads the files in your folders so you can search them.");
       }
@@ -2547,7 +2558,7 @@
       if (options.onSuccess) {
         options.onSuccess(added || path, data);
       }
-      announce("Folder added: " + (added || path) + (data.daemon_restart_required ? ". Restart the background service to use it." : "."));
+      announce("Folder added: " + (added || path) + ".");
       refreshStatus();
     } catch (err) {
       handleAddFolderError(err, options);
@@ -2566,16 +2577,11 @@
         clear(result);
         show(result, false);
       },
-      onSuccess: function (addedPath, data) {
+      onSuccess: function (addedPath) {
         append(result, notice("info", "Folder added", [
           ["Saved as ", el("span", "path-text", String(addedPath))],
           "Choose Update index to read its files.",
         ]));
-        if (data.daemon_restart_required) {
-          append(result, notice("caution", "Restart the background service", [
-            str(data.warning) || "A seekr daemon process is running. Restart it so it sees the new folder.",
-          ]));
-        }
         show(result, true);
         result.focus();
       },
@@ -2595,12 +2601,8 @@
       onClear: function () {
         setText(statusEl, "");
       },
-      onSuccess: function (addedPath, data) {
-        var msg = "Added " + addedPath + ". Choose Update index when ready.";
-        if (data.daemon_restart_required) {
-          msg += " Restart seekr daemon so it sees the new folder.";
-        }
-        setText(statusEl, msg);
+      onSuccess: function (addedPath) {
+        setText(statusEl, "Added " + addedPath + ". Choose Update index when ready.");
       },
       onOtherError: function (node, err) {
         setFieldError("first-run-folder-path", "first-run-folder-error", err.message || "Couldn’t add the folder.");
@@ -2695,9 +2697,9 @@
           "Reconnect, then choose Remove again.",
         ]);
       } else if (err.code === "daemon_active") {
-        state.rootsNotice = notice("error", "Stop the background service first", [
-          err.message || "A seekr daemon process is running and maintains the index.",
-          ["Stop ", codeText("seekr daemon"), ", then choose Refresh and try Remove again."],
+        state.rootsNotice = notice("error", "Stop the older seekr daemon first", [
+          err.message || "An older seekr daemon process is running and maintains the index.",
+          ["Stop the older ", codeText("seekr daemon"), " process, then choose Refresh and try Remove again. ", codeText("seekr service start"), " replaces it."],
         ]);
       } else if (err.code === "stale_config") {
         state.rootsNotice = notice("error", "Settings file changed", [

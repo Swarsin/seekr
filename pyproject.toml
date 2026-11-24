@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "seekr-search"
-version = "0.2.0"
+version = "0.3.0"
 description = "Offline hybrid semantic and keyword search over your own files"
 readme = "README.md"
 license = { text = "MIT" }
@@ -26,6 +26,8 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -48,6 +50,7 @@ dependencies = [
     "python-docx>=1.1",
     "python-pptx>=1.0",
     "snowballstemmer>=2.2",
+    "platformdirs>=4",
 ]
 
 [project.optional-dependencies]
@@ -102,4 +105,8 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
     "slow: tests that require downloaded models, network access, or benchmarks",
+]
+filterwarnings = [
+    # SWIG-built extension wheels (seen on macOS) warn on import on Python 3.12+.
+    "ignore:builtin type [Ss]wig\\w* has no __module__ attribute:DeprecationWarning",
 ]

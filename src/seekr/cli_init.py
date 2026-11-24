@@ -150,6 +150,21 @@ def _index_roots(cfg: Config, roots: list[Path], total_files: int) -> None:
     _print_index_report(report)
 
 
+def config_env_prefix(config_path: Path | str, *, platform: str = sys.platform) -> str:
+    """Return the shell prefix that sets ``SEEKR_CONFIG`` before a command.
+
+    POSIX shells get ``SEEKR_CONFIG=<path> cmd`` (shell-quoted, for that one
+    command).  Windows gets PowerShell, ``$env:SEEKR_CONFIG = '<path>'; cmd``
+    (set for the rest of the session), single-quoted with embedded quotes
+    doubled so backslashes stay literal.
+    """
+    value = str(config_path)
+    if platform == "win32":
+        quoted = value.replace("'", "''")
+        return f"$env:SEEKR_CONFIG = '{quoted}'; "
+    return f"SEEKR_CONFIG={shlex.quote(value)} "
+
+
 def _print_examples(commands: list[str], *, env_prefix: str = "") -> None:
     typer.echo("Try these commands:")
     for cmd in commands:
@@ -222,7 +237,7 @@ def _run_demo(*, yes: bool, no_download: bool) -> None:
     except (ConfigError, FileExistsError, OSError) as exc:
         _fatal(str(exc))
     _index_roots(active_cfg, [demo_dest], summary.total)
-    env_prefix = f"SEEKR_CONFIG={shlex.quote(str(demo_toml))} "
+    env_prefix = config_env_prefix(demo_toml)
     _print_examples(setup_flow.example_commands(summary), env_prefix=env_prefix)
 
 

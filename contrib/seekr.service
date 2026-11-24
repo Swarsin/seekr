@@ -1,5 +1,5 @@
 [Unit]
-Description=seekr local semantic search daemon
+Description=seekr local semantic search service
 Documentation=https://github.com/Swarsin/seekr
 After=default.target
 
@@ -7,11 +7,11 @@ After=default.target
 Type=simple
 WorkingDirectory=%h
 # pipx installs the CLI here.  Replace this path if seekr lives elsewhere.
-ExecStart=%h/.local/bin/seekr daemon
+ExecStart=%h/.local/bin/seekr service start --port 8000
 Restart=on-failure
 RestartSec=2
-# SIGTERM makes the daemon stop the watcher, close the index and remove its
-# runtime socket before exiting.
+# SIGTERM makes the service stop the watcher, close the index and remove its
+# discovery file before exiting.
 KillSignal=SIGTERM
 TimeoutStopSec=15
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import os
@@ -11,11 +12,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from _platform import requires_legacy_daemon
+from seekr import platform_info
 from seekr.cli import app
 from seekr.config import Config
 from seekr.embed import FakeEmbedder
 from seekr.indexer import Indexer
-from seekr.platform_info import Mount
+from seekr.platform_info import Mount, resolve_root
+from seekr.service_discovery import ServiceInfo
 from seekr.store import SCHEMA_VERSION, Store
 
 _HAS_TYPER = importlib.util.find_spec("typer") is not None
@@ -33,6 +37,14 @@ def _has_fts5() -> bool:
 
 
 _NEEDS_REAL_STORE = _HAS_NUMPY and _HAS_SQLITE_VEC and _HAS_TYPER and _has_fts5()
+
+
+def _linux_mount_rules():
+    """Judge polled roots by the (mocked) Linux mount table on any host."""
+    return mock.patch(
+        "seekr.platform_info.split_roots",
+        functools.partial(platform_info.split_roots, platform="linux"),
+    )
 
 
 @unittest.skipUnless(_HAS_TYPER, "typer is not installed")
@@ -84,6 +96,16 @@ class PolishedStatusTests(unittest.TestCase):
             with (
                 mock.patch("seekr.cli_index._load_config", return_value=cfg),
                 mock.patch("seekr.cli_index._daemon_status", return_value=(True, sock)),
+                mock.patch(
+                    "seekr.service.find_running_service",
+                    return_value=ServiceInfo(
+                        pid=4242,
+                        port=8123,
+                        token="t",
+                        version="9.9.9",
+                        started_at="2026-01-01T00:00:00+00:00",
+                    ),
+                ),
             ):
                 runner = CliRunner()
                 text_res = runner.invoke(app, ["status"])
@@ -100,7 +122,10 @@ class PolishedStatusTests(unittest.TestCase):
                 text_res.output,
             )
             self.assertIn("by kind: code=1, markdown=1", text_res.output)
-            self.assertIn(f"daemon: running ({sock})", text_res.output)
+            self.assertIn(
+                "service: running at 127.0.0.1:8123 (pid 4242, version 9.9.9)",
+                text_res.output,
+            )
 
             self.assertEqual(json_res.exit_code, 0, json_res.output)
             parsed = json.loads(json_res.stdout)
@@ -115,6 +140,10 @@ class PolishedStatusTests(unittest.TestCase):
             self.assertEqual(parsed["schema_version"], SCHEMA_VERSION)
             self.assertEqual(parsed["embed_backend"], cfg.embed_backend)
             self.assertEqual(parsed["daemon"], {"running": True, "socket": str(sock)})
+            self.assertEqual(
+                parsed["service"],
+                {"running": True, "port": 8123, "pid": 4242, "version": "9.9.9"},
+            )
             self.assertGreater(parsed["size_bytes"], 0)
 
     def test_status_json_on_missing_database(self) -> None:
@@ -179,9 +208,8 @@ class PolishedStatusTests(unittest.TestCase):
                 json_result = runner.invoke(app, ["status", "--json"])
 
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("daemon: stopped", result.output)
-        self.assertIn("socket path too long", result.output)
-        self.assertIn(str(runtime_dir / "seekr.sock"), result.output)
+        self.assertIn("service: not running", result.output)
+        self.assertNotIn("daemon:", result.output)
 
         self.assertEqual(json_result.exit_code, 0, json_result.output)
         parsed = json.loads(json_result.stdout)
@@ -217,9 +245,8 @@ class PolishedStatusTests(unittest.TestCase):
                 result = CliRunner().invoke(app, ["status"])
 
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("daemon: stopped", result.output)
-        self.assertIn("socket path too long", result.output)
-        self.assertIn(str(runtime_dir / "seekr.sock"), result.output)
+        self.assertIn("service: not running", result.output)
+        self.assertNotIn("daemon:", result.output)
 
     def _create_course_index(self, base: Path) -> Config:
         root = base / "course"
@@ -292,6 +319,58 @@ class PolishedStatusTests(unittest.TestCase):
             ],
         )
 
+    def test_status_prints_polled_roots_when_service_running(self) -> None:
+        from typer.testing import CliRunner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fast_root = base / "repo"
+            fast_root.mkdir()
+            slow_root = Path("/mnt/c/Users/alice/notes")
+            cfg = Config(
+                roots=(fast_root, slow_root),
+                db_path=base / "missing.db",
+                embed_model="fake",
+                poll_interval_seconds=25,
+            )
+            mounts = [
+                Mount(source="/dev/sdc", mount_point="/", fstype="ext4"),
+                Mount(source="C:\\", mount_point="/mnt/c", fstype="9p"),
+            ]
+            service = {"running": True, "port": 8000, "pid": 7, "version": "1"}
+            with (
+                mock.patch("seekr.cli_index._load_config", return_value=cfg),
+                mock.patch(
+                    "seekr.cli_index._daemon_status",
+                    return_value=(False, base / "seekr.sock"),
+                ),
+                mock.patch("seekr.cli_index._service_status", return_value=service),
+                mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
+                _linux_mount_rules(),
+            ):
+                running = CliRunner().invoke(app, ["status"])
+            with (
+                mock.patch("seekr.cli_index._load_config", return_value=cfg),
+                mock.patch(
+                    "seekr.cli_index._daemon_status",
+                    return_value=(False, base / "seekr.sock"),
+                ),
+                mock.patch(
+                    "seekr.cli_index._service_status",
+                    return_value={"running": False},
+                ),
+                mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
+                _linux_mount_rules(),
+            ):
+                stopped = CliRunner().invoke(app, ["status"])
+
+        self.assertEqual(running.exit_code, 0, running.output)
+        self.assertIn("service: running at 127.0.0.1:8000", running.output)
+        self.assertIn(f"watch: {resolve_root(slow_root)} (polling every 25s)", running.output)
+        self.assertNotIn(f"watch: {fast_root}", running.output)
+        self.assertNotIn("watch:", stopped.output)
+
+    @requires_legacy_daemon
     def test_status_prints_polled_roots_when_daemon_running(self) -> None:
         from typer.testing import CliRunner
 
@@ -361,6 +440,7 @@ class PolishedStatusTests(unittest.TestCase):
             self.assertEqual(res_stopped.exit_code, 0, res_stopped.output)
             self.assertNotIn("polling every", res_stopped.output)
 
+    @requires_legacy_daemon
     def test_status_uses_live_daemon_polling_metadata(self) -> None:
         import threading
         import time
@@ -409,6 +489,7 @@ class PolishedStatusTests(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_TYPER, "typer is not installed")
 class MissingDbWatchStatusTests(unittest.TestCase):
+    @requires_legacy_daemon
     def test_status_without_db_prints_polled_roots_when_daemon_running(self) -> None:
         from typer.testing import CliRunner
 
