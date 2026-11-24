@@ -24,7 +24,7 @@ from typing import Any
 import typer
 
 from . import platform_info
-from .config import Config, load_config
+from .config import Config, default_config_path, load_config
 from .course import display_module
 from .embed import Embedder, build_embedder
 from .indexer import Indexer, SyncReport, _error_text
@@ -184,6 +184,13 @@ def _with_path_errors(
     return merged
 
 
+def _service_client(cfg: Config) -> ServiceClient | None:
+    """Return a client for a service using this config and index, if any."""
+    return ServiceClient.from_discovery(
+        config_path=default_config_path(), db_path=Path(cfg.db_path)
+    )
+
+
 def _wait_for_job(client: ServiceClient, job_id: str, activity: str) -> dict[str, Any]:
     """Poll a service job until it ends; return its report or raise."""
     while True:
@@ -247,7 +254,7 @@ def index(
                 "or pass PATH to `seekr index PATH`"
             )
 
-        client = ServiceClient.from_discovery()
+        client = _service_client(cfg)
         if client is not None:
             try:
                 service_report = _index_via_service(client, list(raw_paths or []))
@@ -295,7 +302,7 @@ def reindex(
     allow_empty_flag = allow_empty if isinstance(allow_empty, bool) else False
     try:
         cfg = _load_config()
-        client = ServiceClient.from_discovery()
+        client = _service_client(cfg)
         if client is not None:
             try:
                 service_report = _reindex_via_service(

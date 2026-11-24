@@ -173,6 +173,15 @@ class _Spy:
 _STATUS_OK = {name: {} for name in ("index", "model", "daemon", "config", "activity")}
 
 
+def _status_for(env: Path) -> dict[str, dict[str, object]]:
+    """A valid status naming the ``env`` fixture's config file and database."""
+    return {
+        **_STATUS_OK,
+        "index": {"db_path": str(env / "index.db")},
+        "config": {"path": str(env / "config.toml")},
+    }
+
+
 class _StubHandler(BaseHTTPRequestHandler):
     """Replies from queued responses; ``/api/status`` has its own queue.
 
@@ -183,6 +192,7 @@ class _StubHandler(BaseHTTPRequestHandler):
     responses: ClassVar[list[tuple[int, object]]] = []
     status_responses: ClassVar[list[tuple[int, object]]] = []
     status_calls: ClassVar[list[str]] = []
+    status_default: ClassVar[dict[str, object]] = _STATUS_OK
     seen: ClassVar[list[tuple[str, str, object, str | None]]] = []
 
     def log_message(self, format: str, *args: object) -> None:
@@ -195,7 +205,7 @@ class _StubHandler(BaseHTTPRequestHandler):
         cls = type(self)
         if self.path == "/api/status":
             cls.status_calls.append(str(self.headers.get("X-Seekr-Token")))
-            queue, default = cls.status_responses, (200, _STATUS_OK)
+            queue, default = cls.status_responses, (200, cls.status_default)
         else:
             cls.seen.append((self.command, self.path, body, self.headers.get("X-Seekr-Token")))
             queue, default = cls.responses, (200, {})
@@ -220,7 +230,13 @@ def stub(env: Path, request: pytest.FixtureRequest) -> type[_StubHandler]:
     handler = type(
         "Handler",
         (_StubHandler,),
-        {"responses": [], "status_responses": [], "status_calls": [], "seen": []},
+        {
+            "responses": [],
+            "status_responses": [],
+            "status_calls": [],
+            "seen": [],
+            "status_default": _status_for(env),
+        },
     )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(
@@ -428,7 +444,7 @@ def test_shutting_down_service_falls_back(stub, env: Path) -> None:
     stub.responses.append((409, _error("busy", "index is being replaced")))
     # The first probe passes; the one after ``busy`` is refused (shutdown).
     stub.status_responses.extend(
-        [(200, _STATUS_OK), (409, _error("busy", "the web service is shutting down"))]
+        [(200, _status_for(env)), (409, _error("busy", "the web service is shutting down"))]
     )
 
     hits = get_hits("xylophones", mode="keyword")
@@ -801,3 +817,98 @@ def test_reindex_start_timeout_is_fatal_not_local(stub, monkeypatch) -> None:
 
     assert result.exit_code == 1
     assert "did not confirm POST /api/reindex" in result.output
+
+
+# -- config / index identity ---------------------------------------------------
+
+
+def _other_config(env: Path) -> Path:
+    """Write config B: its own root and database, beside the service's config A."""
+    root = env / "other-docs"
+    root.mkdir()
+    (root / "c.md").write_text("gamma notes about xylophones\n", encoding="utf-8")
+    config = env / "other.toml"
+    config.write_text(
+        'embed_model = "fake"\n'
+        f"db_path = {json.dumps(str(env / 'other.db'))}\n"
+        'vector_quant = "int8"\n'
+        f"roots = [{json.dumps(str(root))}]\n",
+        encoding="utf-8",
+    )
+    return config
+
+
+def test_status_reports_the_index_database(env: Path, request) -> None:
+    svc = _started_service(request)
+    status = svc.backend.status()
+    assert status.index["db_path"] == str(env / "index.db")
+    assert status.config["path"] == str(env / "config.toml")
+
+
+def test_search_with_another_config_goes_local(
+    env: Path, request, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _started_service(request)
+    monkeypatch.setenv("SEEKR_CONFIG", str(_other_config(env)))
+    _index_locally(env)
+    search_spy = _Spy(monkeypatch, "search")
+    similar_spy = _Spy(monkeypatch, "similar")
+    sent: list[str] = []
+    real_request = service_client.service_request
+    monkeypatch.setattr(
+        service_client,
+        "service_request",
+        lambda port, method, path, **kw: (sent.append(path), real_request(port, method, path, **kw))[1],
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="seekr"):
+        hits = get_hits("xylophones", mode="keyword")
+        similar = get_similar_hits(env / "other-docs" / "c.md")
+
+    assert [Path(hit.path).name for hit in hits] == ["c.md"]
+    assert similar == []
+    assert len(search_spy.calls) == len(similar_spy.calls) == 1
+    assert sent == ["/api/status", "/api/status"]
+    assert "service_client.config_mismatch" in caplog.text
+
+
+def test_search_with_the_same_config_spelled_differently_routes(
+    env: Path, request, monkeypatch
+) -> None:
+    _started_service(request)
+    monkeypatch.setenv("SEEKR_CONFIG", str(env / "docs" / ".." / "config.toml"))
+    spy = _Spy(monkeypatch, "search")
+
+    hits = get_hits("xylophones", mode="keyword")
+
+    assert {Path(hit.path).name for hit in hits} == {"a.md", "b.md"}
+    assert len(spy.calls) == 1
+
+
+def test_index_and_reindex_with_another_config_go_local(
+    env: Path, request, monkeypatch
+) -> None:
+    svc = _started_service(request)
+    monkeypatch.setenv("SEEKR_CONFIG", str(_other_config(env)))
+    monkeypatch.setattr(cli_index, "_build_embedder", lambda cfg: FakeEmbedder())
+    calls = _local_rebuild(monkeypatch)
+    runner = CliRunner()
+
+    indexed = runner.invoke(app, ["index"])
+    rebuilt = runner.invoke(app, ["reindex"])
+
+    assert indexed.exit_code == 0, indexed.output
+    assert indexed.output.splitlines()[0] == "added: 1"
+    assert rebuilt.exit_code == 0, rebuilt.output
+    assert calls == [{"force": False, "allow_empty": False}]
+    assert int(svc.backend.status().index["documents"] or 0) == 2
+
+
+def test_client_with_expected_paths_rejects_a_mismatched_service(stub, env: Path) -> None:
+    client = ServiceClient.from_discovery(
+        config_path=env / "config.toml", db_path=env / "elsewhere.db"
+    )
+    assert client is not None
+    with pytest.raises(ServiceUnavailable, match="index"):
+        client.search({"query": "a"})
+    assert stub.seen == []

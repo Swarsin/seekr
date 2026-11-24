@@ -191,6 +191,7 @@ class _IndexSnapshot:
     def as_dict(self) -> dict[str, object]:
         return {
             "state": self.state,
+            "db_path": str(self.db_path) if self.db_path.parts else None,
             "documents": self.documents,
             "chunks": self.chunks,
             "size_bytes": self.size_bytes,

@@ -180,6 +180,7 @@ Do not add undocumented keys to `limits`; the frontend may rely on these names.
 {
   "index": {
     "state": "missing | empty | ready | incompatible | error",
+    "db_path": "…/index.db",
     "documents": 0,
     "chunks": 0,
     "size_bytes": 0,
@@ -208,7 +209,11 @@ Do not add undocumented keys to `limits`; the frontend may rely on these names.
 }
 ```
 
-Counts and metadata are `null` when they cannot be read safely. `size_bytes` is
+Counts and metadata are `null` when they cannot be read safely. `index.db_path`
+is the configured database path, or `null` when the config is invalid. Clients
+compare `config.path` and `index.db_path` with their own resolved config file
+and database, and work locally when either differs, so a command run with
+another `SEEKR_CONFIG` never searches or writes the service's index. `size_bytes` is
 the main database plus `-wal`/`-shm` files when present. `daemon.present` is
 only a socket-liveness probe; no activity or indexing claim is attached.
 `config.state` is `ok` when the config is absent (defaults) or valid, and

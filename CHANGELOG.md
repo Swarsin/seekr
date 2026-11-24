@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `seekr web` starts the service (or reuses a running one), prints its address and returns; `--foreground` keeps the old serve-in-the-terminal behaviour.
 - CLI searches, `seekr similar`, indexing and `seekr mcp` route through the service when it is running and fall back to local work when it is not. The service API gained `/api/reindex`, `/api/similar`, `/api/shutdown`, path indexing and rerank/explain options, documented in `docs/web-api.md`.
 - `seekr status` reports the service state.
+- Commands route to the service only when it uses the same config file and index database as the command; with another `SEEKR_CONFIG` (or a config naming another `db_path`) searches, `seekr similar`, `seekr index` and `seekr reindex` run locally against that index. `/api/status` reports `index.db_path` for this check.
 
 ### Changed
 - Config, data and state directories follow the platform conventions through `platformdirs`: `~/Library/Application Support/seekr` on macOS and `%LOCALAPPDATA%\seekr` on Windows. Linux paths (`$XDG_CONFIG_HOME/seekr`, `$XDG_DATA_HOME/seekr`) are unchanged.

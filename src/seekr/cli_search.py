@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from .client import DaemonError, DaemonMismatchError, try_daemon_search
-from .config import Config, load_config
+from .config import Config, default_config_path, load_config
 from .course import display_module
 from .embed import build_embedder
 from .filters import normalise_kind, parse_since, parse_week
@@ -368,14 +368,17 @@ def _validate_query(
 
 
 def _service_hits(
-    call: str, request: dict[str, Any]
+    call: str, request: dict[str, Any], cfg: Config
 ) -> list[Hit] | None:
     """Send ``request`` to a running service, or return ``None`` to go local.
 
-    An unreachable service (or none at all) returns ``None``; any error the
-    service reports surfaces as :class:`SearchError` with its message.
+    An unreachable service (or none at all), or one serving another config
+    file or index than ``cfg``, returns ``None``; any error the service
+    reports surfaces as :class:`SearchError` with its message.
     """
-    client = ServiceClient.from_discovery()
+    client = ServiceClient.from_discovery(
+        config_path=default_config_path(), db_path=Path(cfg.db_path)
+    )
     if client is None:
         return None
     try:
@@ -506,6 +509,7 @@ def get_hits(
             **searcher_kwargs,
         )
 
+    selected_cfg = cfg if cfg is not None else load_config()
     if use_service and use_daemon and cfg is None and embedder is None:
         wire = _wire_search_request(
             query,
@@ -521,11 +525,10 @@ def get_hits(
             week=week,
         )
         if wire is not None:
-            service_hits = _service_hits("search", wire)
+            service_hits = _service_hits("search", wire, selected_cfg)
             if service_hits is not None:
                 return service_hits
 
-    selected_cfg = cfg if cfg is not None else load_config()
     if use_daemon:
         daemon_hits = _daemon_search(
             selected_cfg,
@@ -694,6 +697,7 @@ def get_similar_hits(
     if week_range is not None:
         similar_kwargs["week_range"] = week_range
     target_path = Path(target).expanduser().resolve(strict=False)
+    selected_cfg = cfg if cfg is not None else load_config()
     if (
         use_service
         and cfg is None
@@ -711,10 +715,9 @@ def get_similar_hits(
         ):
             if value is not None:
                 wire[name] = value
-        service_hits = _service_hits("similar", wire)
+        service_hits = _service_hits("similar", wire, selected_cfg)
         if service_hits is not None:
             return service_hits
-    selected_cfg = cfg if cfg is not None else load_config()
 
     if searcher is not None:
         vectors = _vectors_for_target(

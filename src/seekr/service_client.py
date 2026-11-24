@@ -9,7 +9,9 @@ Before its first real call a client checks, with a 1-second authenticated
 ``GET /api/status``, that a seekr service (not some other program that reused
 a stale port) answers.  A service that cannot be reached or verified, or that
 has begun shutting down, raises :class:`ServiceUnavailable`, which callers
-treat as "no service".  An error response in the seekr error envelope raises
+treat as "no service".  A client built with the caller's config and database
+paths also treats a service running another config or index as "no service",
+so ``SEEKR_CONFIG=other.toml seekr search`` searches that index locally.  An error response in the seekr error envelope raises
 :class:`ServiceError` carrying the server's code and message, and callers
 surface it rather than silently searching locally.
 """
@@ -22,7 +24,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from . import __version__, paths
+from . import __version__, pathnorm, paths
 from .models import Hit, HitExplain
 from .service_discovery import ServiceInfo, read_service_info
 
@@ -120,23 +122,55 @@ def service_request(
     return status, payload
 
 
+def _status_payload(
+    info: ServiceInfo, *, timeout: float = STATUS_TIMEOUT
+) -> dict[str, Any] | None:
+    """Return the live service's status object, or ``None`` if none answers."""
+    try:
+        status, payload = service_request(
+            info.port, "GET", "/api/status", token=info.token, timeout=timeout
+        )
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+    if (
+        status == 200
+        and isinstance(payload, dict)
+        and all(isinstance(payload.get(name), dict) for name in _STATUS_SECTIONS)
+    ):
+        return payload
+    return None
+
+
 def service_answers(info: ServiceInfo, *, timeout: float = STATUS_TIMEOUT) -> bool:
     """Return whether ``info`` names a live seekr service that accepts its token.
 
     The token-authenticated ``GET /api/status`` must return 200 with the
     status object's sections; a service that is shutting down refuses it.
     """
-    try:
-        status, payload = service_request(
-            info.port, "GET", "/api/status", token=info.token, timeout=timeout
-        )
-    except (OSError, ValueError, http.client.HTTPException):
-        return False
-    return (
-        status == 200
-        and isinstance(payload, dict)
-        and all(isinstance(payload.get(name), dict) for name in _STATUS_SECTIONS)
-    )
+    return _status_payload(info, timeout=timeout) is not None
+
+
+def _resolved(value: object) -> Path | None:
+    if not isinstance(value, (str, Path)) or not str(value):
+        return None
+    return Path(value).expanduser().resolve(strict=False)
+
+
+def _identity_mismatch(
+    payload: dict[str, Any], *, config_path: Path | None, db_path: Path | None
+) -> str | None:
+    """Say why the service at ``payload`` serves another config or index."""
+    for label, expected, reported in (
+        ("config", config_path, payload["config"].get("path")),
+        ("index", db_path, payload["index"].get("db_path")),
+    ):
+        if expected is None:
+            continue
+        actual = _resolved(reported)
+        wanted = _resolved(expected)
+        if actual is None or wanted is None or not pathnorm.same_path(actual, wanted):
+            return f"the seekr service uses {label} {reported!r}, not {str(wanted)!r}"
+    return None
 
 
 def _seekr_error(payload: object) -> tuple[str, str] | None:
@@ -193,18 +227,34 @@ def hit_from_wire(data: dict[str, Any]) -> Hit:
 class ServiceClient:
     """Authenticated calls to one running service."""
 
-    def __init__(self, info: ServiceInfo) -> None:
+    def __init__(
+        self,
+        info: ServiceInfo,
+        *,
+        config_path: Path | None = None,
+        db_path: Path | None = None,
+    ) -> None:
         self.info = info
+        self._config_path = config_path
+        self._db_path = db_path
         self._verified = False
 
     @classmethod
-    def from_discovery(cls, path: Path | None = None) -> ServiceClient | None:
+    def from_discovery(
+        cls,
+        path: Path | None = None,
+        *,
+        config_path: Path | None = None,
+        db_path: Path | None = None,
+    ) -> ServiceClient | None:
         """Return a client for the discovered service, or ``None``.
 
         ``None`` means no live discovery file, or a service of another seekr
         version (logged once per version at debug level).  Reachability is
         checked by the first call; a dead or foreign listener shows up as
-        :class:`ServiceUnavailable`.
+        :class:`ServiceUnavailable`.  When ``config_path`` or ``db_path`` is
+        given, a service using another config file or index database is also
+        :class:`ServiceUnavailable`, so the caller works locally.
         """
         info = read_service_info(path or paths.service_file())
         if info is None:
@@ -218,16 +268,27 @@ class ServiceClient:
                     __version__,
                 )
             return None
-        return cls(info)
+        return cls(info, config_path=config_path, db_path=db_path)
 
     def _verify(self) -> None:
         """Probe ``/api/status`` once per client before slower calls."""
         if self._verified:
             return
-        if not service_answers(self.info):
+        payload = _status_payload(self.info)
+        if payload is None:
             raise ServiceUnavailable(
                 f"no seekr service answers on port {self.info.port}"
             )
+        mismatch = _identity_mismatch(
+            payload, config_path=self._config_path, db_path=self._db_path
+        )
+        if mismatch is not None:
+            _LOGGER.debug(
+                "event=service_client.config_mismatch port=%s reason=%r",
+                self.info.port,
+                mismatch,
+            )
+            raise ServiceUnavailable(mismatch)
         self._verified = True
 
     def _call(
