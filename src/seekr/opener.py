@@ -19,6 +19,7 @@ import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .models import Hit
 
@@ -451,14 +452,40 @@ def open_target(
     return Argv(["open", "-t", safe_path])
 
 
-def run_open(action: OpenAction) -> None:
+def run_open(action: OpenAction, *, wait: bool = True) -> None:
     """Execute *action*.
 
-    Raises :class:`OpenFailed` on an unsuccessful exit status; ``OSError`` and
-    ``ValueError`` from launching propagate to the caller.
+    With ``wait=True`` (the default, used by ``seekr open``) an ``Argv`` runs in
+    the foreground until it exits, and :class:`OpenFailed` is raised on an
+    unsuccessful exit status (see ``OPEN_SUCCESS_CODES``).
+
+    With ``wait=False`` (used by the web service) an ``Argv`` is started
+    detached -- own session or process group, no shared console, stdio on
+    ``DEVNULL`` -- and this returns as soon as it has started, so a
+    long-lived editor never ties up the caller.  The exit status is never
+    seen, so ``OPEN_SUCCESS_CODES`` does not apply and :class:`OpenFailed` is
+    not raised.
+
+    ``OSError`` and ``ValueError`` from launching propagate to the caller in
+    both modes.
     """
     if isinstance(action, StartFile):
         getattr(os, "startfile")(action.path)  # noqa: B009 - Windows only
+        return
+    if not wait:
+        kwargs: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = getattr(
+                subprocess, "DETACHED_PROCESS", 0x00000008
+            ) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(action.argv, **kwargs)
         return
     result = subprocess.run(action.argv, check=False)
     success_codes = OPEN_SUCCESS_CODES.get(

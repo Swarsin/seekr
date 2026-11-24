@@ -10,6 +10,8 @@ import contextlib
 import json
 import socket
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1981,7 +1983,6 @@ def test_open_chunk_runs_opener_without_shell_and_maps_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import functools
-    import types
 
     from seekr import opener
 
@@ -2007,15 +2008,12 @@ def test_open_chunk_runs_opener_without_shell_and_maps_errors(
         with (
             mock.patch("seekr.platform_info.is_wsl", return_value=False),
             mock.patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}" if name == "zathura" else None),
-            mock.patch(
-                "subprocess.run",
-                return_value=types.SimpleNamespace(returncode=0),
-            ) as run_mock,
+            mock.patch("subprocess.Popen") as run_mock,
         ):
             service.open_chunk(pdf_chunk)
-        run_mock.assert_called_once_with(
-            ["zathura", "-P", "1", str(pdf_path)], check=False
-        )
+        assert run_mock.call_count == 1
+        assert run_mock.call_args.args == (["zathura", "-P", "1", str(pdf_path)],)
+        assert run_mock.call_args.kwargs["stdin"] == subprocess.DEVNULL
 
         mounts = [Mount(source="C:\\", mount_point="/mnt/c", fstype="9p")]
         store = Store(db_path, "fake", 64, vector_quant="int8")
@@ -2039,35 +2037,16 @@ def test_open_chunk_runs_opener_without_shell_and_maps_errors(
             mock.patch("seekr.platform_info.is_wsl", return_value=True),
             mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
             mock.patch("shutil.which", return_value=None),
-            mock.patch(
-                "subprocess.run",
-                return_value=types.SimpleNamespace(returncode=1),
-            ) as run_mock,
+            mock.patch("subprocess.Popen") as run_mock,
         ):
             service.open_chunk(wsl_chunk)
-        run_mock.assert_called_once_with(
-            ["explorer.exe", r"C:\course\wsl.pdf"], check=False
-        )
-
-        # Non-success exit code -> 500 internal_error
-        with (
-            mock.patch("seekr.platform_info.is_wsl", return_value=True),
-            mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
-            mock.patch("shutil.which", return_value=None),
-            mock.patch(
-                "subprocess.run",
-                return_value=types.SimpleNamespace(returncode=2),
-            ),
-            pytest.raises(ApiError) as raised,
-        ):
-            service.open_chunk(wsl_chunk)
-        assert _error_code(raised.value) == "internal_error"
+        assert run_mock.call_args.args == (["explorer.exe", r"C:\course\wsl.pdf"],)
 
         # Missing executable -> 500 internal_error
         with (
             mock.patch("seekr.platform_info.is_wsl", return_value=False),
             mock.patch("shutil.which", return_value=None),
-            mock.patch("subprocess.run", side_effect=FileNotFoundError("xdg-open")),
+            mock.patch("subprocess.Popen", side_effect=FileNotFoundError("xdg-open")),
             pytest.raises(ApiError) as raised,
         ):
             service.open_chunk(pdf_chunk)
@@ -2088,6 +2067,43 @@ def test_open_chunk_runs_opener_without_shell_and_maps_errors(
         with pytest.raises(ApiError) as raised:
             service.open_chunk(999999)
         assert _error_code(raised.value) == "not_found"
+
+
+def test_open_chunk_returns_while_opener_still_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+    import signal
+
+    pid_file = tmp_path / "opener.pid"
+    code = (
+        "import os,time;"
+        f"open({str(pid_file)!r},'w').write(str(os.getpid()));"
+        "time.sleep(5)"
+    )
+    monkeypatch.setenv("SEEKR_OPENER", subprocess.list2cmdline([sys.executable, "-c", code]))
+
+    docs = _root(tmp_path, "open-slow")
+    _write_docs(docs, {"notes.md": "# Title\n\nsome body text\n"})
+    db_path = tmp_path / "slow.db"
+    config_path = _write_config(tmp_path, roots=[docs], db_path=db_path)
+    try:
+        with _service(config_path, tmp_path) as service:
+            assert _wait_job(service, service.start_index()).state == "succeeded"
+            chunk = _chunk_id_for_path(db_path, str(docs / "notes.md"))
+            started = time.monotonic()
+            service.open_chunk(chunk)
+            elapsed = time.monotonic() - started
+            assert elapsed < 3
+            deadline = time.monotonic() + 5
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert pid_file.exists(), "opener never started"
+            os.kill(int(pid_file.read_text()), 0)  # still running after return
+    finally:
+        if pid_file.exists():
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
 
 
 def test_remove_root_purges_config_and_db_respects_prefix_lane_and_daemon(

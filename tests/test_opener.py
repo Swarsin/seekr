@@ -471,10 +471,13 @@ class CliTests(unittest.TestCase):
             mock.patch("seekr.platform_info.is_wsl", return_value=False),
             mock.patch.dict(os.environ, {"EDITOR": "nano"}),
             mock.patch.object(opener_module.subprocess, "run", return_value=completed) as run,
+            mock.patch.object(opener_module.subprocess, "Popen") as popen,
         ):
             app.commands["open"](target=f"{py_file}:L10-12")
 
+        # The CLI waits for the editor: blocking run, never a detached Popen.
         run.assert_called_once_with(["nano", "+10", str(py_file)], check=False)
+        popen.assert_not_called()
         self.assertNotIn("shell", run.call_args.kwargs)
 
     def test_open_never_runs_a_script_hit_on_windows_or_macos(self) -> None:
@@ -732,6 +735,26 @@ class RunOpenTests(unittest.TestCase):
         ) as run:
             run_open(Argv(["open", "/a"]))
         run.assert_called_once_with(["open", "/a"], check=False)
+
+    def test_nowait_launches_detached_and_ignores_exit_code(self) -> None:
+        with (
+            mock.patch.object(opener_module.subprocess, "Popen") as popen,
+            mock.patch.object(opener_module.subprocess, "run") as run,
+        ):
+            run_open(Argv(["xdg-open", "x"]), wait=False)
+        run.assert_not_called()
+        self.assertEqual(popen.call_args.args, (["xdg-open", "x"],))
+        kwargs = popen.call_args.kwargs
+        self.assertNotIn("shell", kwargs)
+        for stream in ("stdin", "stdout", "stderr"):
+            self.assertEqual(kwargs[stream], opener_module.subprocess.DEVNULL)
+        self.assertTrue(kwargs.get("start_new_session") or kwargs.get("creationflags"))
+
+    def test_nowait_launch_failure_propagates(self) -> None:
+        with mock.patch.object(
+            opener_module.subprocess, "Popen", side_effect=FileNotFoundError("x")
+        ), self.assertRaises(FileNotFoundError):
+            run_open(Argv(["nope", "x"]), wait=False)
 
     def test_explorer_one_ok_and_other_codes_raise(self) -> None:
         with mock.patch.object(

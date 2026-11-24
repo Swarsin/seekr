@@ -1476,7 +1476,7 @@ class WebService:
 
         name = action.argv[0] if isinstance(action, Argv) else "startfile"
         try:
-            run_open(action)
+            run_open(action, wait=False)
         except FileNotFoundError as exc:
             raise ApiError(
                 500,
