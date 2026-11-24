@@ -529,7 +529,37 @@ class InitCliTests(unittest.TestCase):
         finally:
             store.close()
 
-        self.assertIn(f'SEEKR_CONFIG={demo_toml} seekr search "bias variance"', result.output)
+        from seekr.cli_init import config_env_prefix
+
+        self.assertIn(f'{config_env_prefix(demo_toml)}seekr search "bias variance"', result.output)
+
+
+class ConfigEnvPrefixTests(unittest.TestCase):
+    def test_posix_shells_get_a_quoted_assignment(self) -> None:
+        from seekr.cli_init import config_env_prefix
+
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform):
+                self.assertEqual(
+                    config_env_prefix("/home/me/demo.toml", platform=platform),
+                    "SEEKR_CONFIG=/home/me/demo.toml ",
+                )
+                self.assertEqual(
+                    config_env_prefix("/home/me/my demo's.toml", platform=platform),
+                    "SEEKR_CONFIG='/home/me/my demo'\"'\"'s.toml' ",
+                )
+
+    def test_windows_gets_powershell_with_doubled_single_quotes(self) -> None:
+        from seekr.cli_init import config_env_prefix
+
+        self.assertEqual(
+            config_env_prefix(r"C:\Users\me\demo.toml", platform="win32"),
+            "$env:SEEKR_CONFIG = 'C:\\Users\\me\\demo.toml'; ",
+        )
+        self.assertEqual(
+            config_env_prefix(r"C:\Users\O'Neil\demo.toml", platform="win32"),
+            "$env:SEEKR_CONFIG = 'C:\\Users\\O''Neil\\demo.toml'; ",
+        )
 
 
 if __name__ == "__main__":
