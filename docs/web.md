@@ -151,13 +151,13 @@ The web interface is served by the Seekr service, one background process that al
 - `seekr service status` shows the service's pid, port, version, and uptime; `seekr status` also prints a one-line `service:` summary.
 - `seekr service stop` asks it to stop and waits for it to exit. Closing the browser tab does not stop it.
 - `seekr service start` runs it in the terminal (Ctrl+C stops it), which is also how to see start-up errors.
-- To run it at login, install the [`contrib/seekr.service`](../contrib/seekr.service) systemd user unit, which runs `seekr service start`; stop it with `systemctl --user stop seekr.service`.
+- To run it at login, use the examples in [`contrib/`](../contrib/) and the [install guide](install-windows-macos.md#start-the-service-at-login): a systemd user unit on Linux (stop it with `systemctl --user stop seekr.service`), a Task Scheduler script on Windows, and a launchd agent on macOS.
 
-Index updates from the page and folder changes go through the service, so they never race with its watcher. `seekr daemon` is a deprecated alias for `seekr service start` and will be removed in 0.4.0. See [What it does](../README.md#what-it-does).
+Index updates from the page and folder changes go through the service, so they never race with its watcher. `seekr daemon` is a deprecated alias for `seekr service start` and will be removed in 0.4.0; its Unix-socket fast path is Linux-only and is disabled on Windows and macOS. See [What it does](../README.md#what-it-does).
 
 ## Settings file
 
-Seekr reads `$XDG_CONFIG_HOME/seekr/config.toml`, usually `~/.config/seekr/config.toml`. The **Folders** tab shows the path in use under **Saved in**. A missing `roots` key means no folders; Seekr does not use the README example paths as defaults.
+Seekr reads `config.toml` from the platform config directory: `$XDG_CONFIG_HOME/seekr` (usually `~/.config/seekr`) on Linux, `~/Library/Application Support/seekr` on macOS, and `%LOCALAPPDATA%\seekr` on Windows. The **Folders** tab shows the path in use under **Saved in**. A missing `roots` key means no folders; Seekr does not use the README example paths as defaults.
 
 Adding or removing a folder edits the TOML file. For supported layouts, Seekr changes only the top-level `roots` array value and preserves comments, spacing, line endings, and unrelated settings. It supports a file with no table headers and no top-level `roots` key (Seekr appends the key), or one top-level single-line `roots = [...]` value, optionally with a trailing comment (Seekr edits only the array). The page can display roots from any valid TOML array shape, but editing folders from the UI supports only the two layouts described above: a flat file with no table headers and an absent top-level `roots` key, or a top-level single-line `roots = [...]` array; other valid shapes must be edited by hand and will be refused with the config path.
 

@@ -11,7 +11,7 @@ Private, offline hybrid keyword and semantic search for your notes, PDFs, Word d
 
 ## Quickstart
 
-Requires Python 3.11+ on Linux or WSL2 with SQLite loadable extension support. Note that the PyPI distribution name is `seekr-search`, while the command, Python import name, and config/data directories stay `seekr`.
+Requires Python 3.11+ on Linux, Windows, or macOS with SQLite loadable extension support (on macOS use Homebrew or a uv-managed Python; see [Install on Windows and macOS](https://github.com/Swarsin/seekr/blob/main/docs/install-windows-macos.md)). Note that the PyPI distribution name is `seekr-search`, while the command, Python import name, and config/data directories stay `seekr`.
 
 ```bash
 pipx install seekr-search
@@ -19,7 +19,7 @@ seekr init ~/Documents/ai-course
 seekr search "bias variance tradeoff" --module machine-learning
 ```
 
-`seekr init` writes `~/.config/seekr/config.toml`, explicitly prompts to download `BAAI/bge-small-en-v1.5` (~130 MB of ONNX model files) and tree-sitter code grammars (via `seekr models pull`), and builds your initial index. The default install runs the models with ONNX Runtime on the CPU and is about 350 MB on disk — no PyTorch required. Want to try it before pointing at your own folders? Run `seekr init --demo` to copy and index the packaged sample course, or use `seekr models pull --rerank` / `--all`, `seekr models status`, and `seekr doctor` to inspect local readiness.
+`seekr init` writes `config.toml` to your config directory (`~/.config/seekr` on Linux; see [where files live](https://github.com/Swarsin/seekr/blob/main/docs/install-windows-macos.md#where-files-live) for Windows and macOS), explicitly prompts to download `BAAI/bge-small-en-v1.5` (~130 MB of ONNX model files) and tree-sitter code grammars (via `seekr models pull`), and builds your initial index. The default install runs the models with ONNX Runtime on the CPU and is about 350 MB on disk — no PyTorch required. Want to try it before pointing at your own folders? Run `seekr init --demo` to copy and index the packaged sample course, or use `seekr models pull --rerank` / `--all`, `seekr models status`, and `seekr doctor` to inspect local readiness.
 
 ### GPU / PyTorch backend
 
@@ -35,7 +35,7 @@ seekr models pull
 
 - **CLI (`seekr`)** — one-command setup (`seekr init`, `seekr init --demo`), explicit offline asset provisioning (`seekr models pull`, `seekr models status`), incremental indexing (`seekr index`, `seekr reindex`, `seekr status`), hybrid/keyword/vector queries with `--module`, `--week`, `--kind`, `--since`, `--path`, `--rerank`, `--spread` (cross-module/week appearance summary), `--json`, `--explain`, and stemmed term highlights, related-file lookup (`seekr similar`), interactive opening (`seekr pick`, `seekr open` with Windows app launch via `wslview` / `explorer.exe` under WSL), and shell completions (`seekr completion bash|zsh|fish`).
 - **Web UI (`seekr web`)** — starts (or reuses) the background service and prints its address; local-only browser workspace (`http://127.0.0.1:8000` by default; `--foreground` serves in the terminal, `--open-browser` opens it) with first-run setup and one-click model download, folder add/remove management, **Module** / **Week** / file-type / date filters, **Appears in** cross-course spread chips, highlighted snippets, inline passage and PDF page preview, and one-click file opening or location copying (with WSL Windows/POSIX path toggle). See [`docs/web.md`](https://github.com/Swarsin/seekr/blob/main/docs/web.md) and [`docs/web-api.md`](https://github.com/Swarsin/seekr/blob/main/docs/web-api.md).
-- **Service (`seekr service start|stop|status`)** — one loopback service that keeps the embedding model warm, serves the web UI and CLI/MCP queries (falling back automatically to local search when stopped), and watches configured roots for file changes—automatically switching to polling (`poll_interval_seconds`, default `15`s) on Windows drives (`9p`/`drvfs`) and network mounts (`cifs`, `smb3`, `nfs`, `fuse.sshfs`); includes [`contrib/seekr.service`](https://github.com/Swarsin/seekr/blob/main/contrib/seekr.service) (systemd user unit) and [`contrib/seekr-popup.sh`](https://github.com/Swarsin/seekr/blob/main/contrib/seekr-popup.sh) (Hyprland/rofi launcher). `seekr daemon` is a deprecated alias for `seekr service start`; `seekr status` reports the service state.
+- **Service (`seekr service start|stop|status`)** — one loopback service that keeps the embedding model warm, serves the web UI and CLI/MCP queries (falling back automatically to local search when stopped), and watches configured roots for file changes—automatically switching to polling (`poll_interval_seconds`, default `15`s) on Windows drives (`9p`/`drvfs`) and network mounts (`cifs`, `smb3`, `nfs`, `fuse.sshfs`); includes start-at-login examples for [systemd](https://github.com/Swarsin/seekr/blob/main/contrib/seekr.service), [Task Scheduler](https://github.com/Swarsin/seekr/blob/main/contrib/seekr-task.ps1) and [launchd](https://github.com/Swarsin/seekr/blob/main/contrib/com.seekr.service.plist), and [`contrib/seekr-popup.sh`](https://github.com/Swarsin/seekr/blob/main/contrib/seekr-popup.sh) (Hyprland/rofi launcher) [`contrib/seekr-popup.sh`](https://github.com/Swarsin/seekr/blob/main/contrib/seekr-popup.sh) (Hyprland/rofi launcher). `seekr daemon` is a deprecated alias for `seekr service start` and will be removed in 0.4.0; its old Unix-socket fast path is Linux-only; `seekr status` reports the service state.
 - **MCP (`seekr mcp`)** — newline-delimited JSON-RPC 2.0 stdio server exposing `search` and `similar` tools (including `module`, `week`, and `spread` support) for coding agents with zero implicit network calls and stderr-only diagnostics.
 
 ![seekr web UI](https://raw.githubusercontent.com/Swarsin/seekr/main/docs/img/web.png)
@@ -61,7 +61,7 @@ Or add the stdio MCP server block to Claude Desktop, Cursor, or any MCP host con
 }
 ```
 
-If `seekr` is installed inside a dedicated virtualenv (such as `pipx`), set `"command"` to `~/.local/bin/seekr` or that environment's `seekr` binary. The server exposes `search` (`query`, `k`, `mode`, `per_file`, `rerank`, `path`, `kind`, `since`, `module`, `week`, `explain`, `spread`) and `similar` (`path`, `k`, `per_file`, `path_prefix`, `kind`, `since`, `module`, `week`).
+If `seekr` is installed inside a dedicated virtualenv (such as `pipx`), set `"command"` to the full path of that environment's `seekr` binary (`~/.local/bin/seekr` for `pipx` on Linux and macOS; `where seekr` on Windows). Each client's documentation says where its configuration file lives. The server exposes `search` (`query`, `k`, `mode`, `per_file`, `rerank`, `path`, `kind`, `since`, `module`, `week`, `explain`, `spread`) and `similar` (`path`, `k`, `per_file`, `path_prefix`, `kind`, `since`, `module`, `week`).
 
 ## How it works
 
@@ -114,7 +114,7 @@ See [`docs/benchmarks.md`](https://github.com/Swarsin/seekr/blob/main/docs/bench
 ## Limitations
 
 - No OCR for scanned image PDFs (extracts embedded text only).
-- Linux and WSL2 only (`AF_UNIX`, `SO_PEERCRED`, and `fcntl.flock` lifecycle locks); native Windows and macOS are not supported.
+- Runs natively on Linux, Windows and macOS (and WSL2). On macOS, Python must support loadable SQLite extensions (python.org builds do not); run `seekr doctor` to check. The legacy `seekr daemon` Unix-socket fast path is Linux-only and disabled on Windows and macOS.
 - Legacy binary Office files (`.doc`, `.ppt`) are skipped with a warning; convert them to `.docx` or `.pptx` to index them.
 - No LLM answer generation — seekr retrieves and locates source passages rather than synthesizing prose answers.
 - `OR`-joined multi-term FTS5 queries scan long posting lists on large conversational corpora (e.g., FiQA `keyword p50 = 72.13 ms`).
@@ -130,7 +130,7 @@ pytest -m "not slow"
 pytest -m slow          # real cached models, sqlite-vec int8, and 100k scale test
 ```
 
-CI ([`.github/workflows/ci.yml`](https://github.com/Swarsin/seekr/blob/main/.github/workflows/ci.yml)) runs `ruff check .` and `pytest -m "not slow"` on Python 3.11–3.13 on Ubuntu, the default suite again in a wheel install without PyTorch, and wheel installation checks.
+CI ([`.github/workflows/ci.yml`](https://github.com/Swarsin/seekr/blob/main/.github/workflows/ci.yml)) runs `ruff check .` and `pytest -m "not slow"` on Python 3.11–3.13 on Ubuntu, Windows and macOS, the default suite again in a wheel install without PyTorch, and wheel installation checks.
 
 ## License
 
