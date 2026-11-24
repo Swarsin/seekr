@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `seekr daemon` is a deprecated alias for `seekr service start` and will be removed in 0.4.0. The old Unix-socket query fast path remains Linux-only and is disabled on Windows and macOS.
 
 ### Fixed
+- On Windows, output redirected to a file or pipe (for example `seekr search --json > out.json`) is written as UTF-8, and redirected input is read as UTF-8, instead of failing on characters the ANSI code page lacks, such as the `ﬀ` ligature. Terminals and POSIX are unchanged; `seekr mcp` stdio is UTF-8 too.
 - Adding or removing folders from the web UI or service no longer fails on Windows with Python before 3.13 (`os.fchmod` is missing there).
 - `seekr web` reports a busy port as "already in use" on Windows instead of an access-permission error; the local server no longer sets `SO_REUSEADDR` there, where it lets a second socket bind a port in use.
 - A corrupt PDF is no longer kept locked on Windows after indexing it fails.

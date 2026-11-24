@@ -17,6 +17,7 @@ from . import (
     cli_web,
 )
 from .logging_config import configure_logging
+from .stdio import configure_redirected_streams
 
 app = typer.Typer(
     help="Local semantic search over your own files.",
@@ -47,6 +48,7 @@ def main(
     ),
 ) -> None:
     """Local semantic search over your own files."""
+    configure_redirected_streams()
     configure_logging(verbose=verbose)
 
 
