@@ -1449,8 +1449,13 @@ def test_toml_root_flows_over_http(tmp_path: Path) -> None:
             second.resolve(),
         )
 
-    # -- TOML-safe escaping of quotes, backslashes, Unicode and tabs
-    weird = tmp_path / 'we"ird\\dir-café\tswirl'
+    # -- TOML-safe escaping of quotes, backslashes, Unicode and tabs.  Windows
+    # forbids `"` and tabs in names; there the backslash separators, an
+    # apostrophe, spaces, non-ASCII letters and `#` carry the coverage.
+    if os.name == "posix":
+        weird = tmp_path / 'we"ird\\dir-café\tswirl'
+    else:
+        weird = tmp_path / "we'ird dir" / "café #swirl"
     weird.mkdir(parents=True, exist_ok=True)
     config_path = _write_config(tmp_path)
     with _running(_make_service(tmp_path, config_path)) as server:
@@ -1464,7 +1469,10 @@ def test_toml_root_flows_over_http(tmp_path: Path) -> None:
         view = response.json()
         canonical = view["roots"][0]
         assert canonical == str(weird.resolve())
-        assert tomllib.loads(config_path.read_text())["roots"] == [canonical]
+        written = config_path.read_text(encoding="utf-8")
+        assert toml_string(canonical) in written  # escaped, not raw
+        assert "\\\\" in written  # backslashes are written escaped
+        assert tomllib.loads(written)["roots"] == [canonical]
         assert load_config(config_path).roots == (weird.resolve(),)
 
     # -- duplicate detection, also through a symlink alias
