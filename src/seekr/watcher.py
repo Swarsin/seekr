@@ -444,13 +444,15 @@ class Watcher:
             if dst is not None and kind in ("move", "move_dir"):
                 src = self._merge_pending_move(kind, src, dst)
             if kind == "move":
-                # The move reconciles the old path.  A pending index of it
-                # (macOS FSEvents reports a just-written file as modified
-                # before its rename) would find it gone and drop its vectors
-                # first, so the move would re-embed the destination.
-                for old_path in {moved_from, src}:
-                    self._pending.pop(("index", str(old_path)), None)
-                    self._pending.pop(("remove", str(old_path)), None)
+                # This move reconciles the path it left.  A pending index of
+                # that path (macOS FSEvents reports a just-written file as
+                # modified before its rename) would find it gone and drop its
+                # vectors first, so the move would re-embed the destination.
+                # Only the path this event moved from: in a merged A->B->C
+                # chain, work pending for A came after A was vacated (a new
+                # file there) and must still run.
+                self._pending.pop(("index", str(moved_from)), None)
+                self._pending.pop(("remove", str(moved_from)), None)
             # Move entries are keyed by (source, destination): keying only by
             # the destination lets a later move with the same target discard an
             # earlier move before its source is reconciled.

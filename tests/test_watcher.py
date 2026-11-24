@@ -341,6 +341,25 @@ class _FakeObserverTests(unittest.TestCase):
         time.sleep(0.3)
         self.assertEqual(self.indexer.calls, [("move", src.resolve(), dst.resolve())])
 
+    def test_new_file_at_a_vacated_source_survives_a_merged_move(self) -> None:
+        # A -> B is pending, a new file appears at A, then B -> C arrives.  The
+        # chain merges into A -> C, but the new file at A must still be indexed.
+        a = self.root / "a.md"
+        b = self.root / "b.md"
+        c = self.root / "c.md"
+        self.watcher.start()
+
+        self._dispatch("moved", a, b)
+        self._dispatch("created", a)
+        self._dispatch("moved", b, c)
+
+        self.assertTrue(_wait_for(lambda: len(self.indexer.calls) >= 2))
+        time.sleep(0.3)
+        self.assertCountEqual(
+            self.indexer.calls,
+            [("index", a.resolve()), ("move", a.resolve(), c.resolve())],
+        )
+
     def test_moves_to_the_same_destination_keep_each_source_pending(self) -> None:
         first = self.root / "first.md"
         second = self.root / "second.md"
