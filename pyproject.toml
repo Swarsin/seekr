@@ -104,3 +104,7 @@ pythonpath = ["src"]
 markers = [
     "slow: tests that require downloaded models, network access, or benchmarks",
 ]
+filterwarnings = [
+    # SWIG-built extension wheels (seen on macOS) warn on import on Python 3.12+.
+    "ignore:builtin type [Ss]wig\\w* has no __module__ attribute:DeprecationWarning",
+]
