@@ -78,13 +78,16 @@ diagnosable security rule, not a missing-token accident.
 | `GET /api/session` | No body; no query; `X-Seekr-Client: 1`; exact Host; valid Origin/Sec-Fetch as above | `200 {token: string, limits: object}`; no config contents | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `500 internal_error` |
 | `GET /api/status` | Token; no body; no query | `200` status object; never loads a model or takes the lifecycle lock | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `500 internal_error` |
 | `GET /api/roots` | Token; no body; no query | `200 {roots: string[], config_path: string, revision: string}`; roots in stored order and form | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 config_invalid`, `500 internal_error` |
-| `POST /api/roots` | Token; no query; JSON `{path: string, revision: string}` | `200 {roots, config_path, revision, daemon_restart_required: boolean, warning: string or null}` | `400 invalid_request`, `400 invalid_root`, `400 roots_limit`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 stale_config`, `409 duplicate_root`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `500 config_write_failed` |
-| `POST /api/roots/remove` | Token; no query; JSON `{path: string, revision: string}` | `200 {roots, config_path, revision, daemon_restart_required: boolean, warning: string or null}` | `400 invalid_request`, `400 invalid_root`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 stale_config`, `409 daemon_active`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `500 config_write_failed` |
+| `POST /api/roots` | Token; no query; JSON `{path: string, revision: string}` | `200 {roots, config_path, revision, daemon_restart_required: false (deprecated), warning: null}` | `400 invalid_request`, `400 invalid_root`, `400 roots_limit`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 stale_config`, `409 duplicate_root`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `500 config_write_failed` |
+| `POST /api/roots/remove` | Token; no query; JSON `{path: string, revision: string}` | `200 {roots, config_path, revision, daemon_restart_required: false (deprecated), warning: null}` | `400 invalid_request`, `400 invalid_root`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 stale_config`, `409 daemon_active`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `500 config_write_failed` |
 | `GET /api/course` | Token; no body; no query | `200 {modules: [{name, display, weeks, files}]}` | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `409 incompatible_index`, `500 internal_error`, `503 index_unavailable` |
 | `GET /api/preview?chunk=<id>` | Token; no body; exact query `chunk=<^[1-9]\d{0,18}$>` | `200 {chunk, kind, path, locator, location, text, page_image}` | `400 invalid_request`, `403 forbidden`, `404 not_found`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `409 incompatible_index`, `500 internal_error`, `503 index_unavailable` |
 | `GET /api/preview/page?chunk=<id>` | Token; no body; exact query `chunk=<^[1-9]\d{0,18}$>` | `200` raw `image/png` bytes (`Content-Type: image/png`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, no CORS) | `400 invalid_request`, `403 forbidden`, `404 not_found`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `409 incompatible_index`, `500 internal_error`, `503 index_unavailable` |
 | `POST /api/open` | Token; no query; JSON `{chunk: int}` (`> 0`, strict integer, no unknown keys) | `200 {opened: true}` | `400 invalid_request`, `403 forbidden`, `404 not_found`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `409 incompatible_index`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable` |
-| `POST /api/search` | Token; no query; JSON `{query, mode?, k?, per_file?, path?, kind?, since?, module?, week?, spread?}` | `200 {hits: Hit[], took_ms: number, spread?: SpreadGroup[]}` | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable`, `503 model_unavailable`, `503 daemon_failure` |
+| `POST /api/search` | Token; no query; JSON `{query, mode?, k?, per_file?, path?, kind?, since?, module?, week?, spread?, rerank?, explain?}`; `rerank` and `explain` are strict booleans (default `false`) | `200 {hits: Hit[], took_ms: number, spread?: SpreadGroup[]}`; each hit carries an `explain` object only when `explain` was requested | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable`, `503 model_unavailable`, `503 daemon_failure` |
+| `POST /api/similar` | Token; no query; JSON `{path: string, k?, per_file?, path_prefix?, kind?, since?, module?, week?}`; `k` 1-50 (default 10), `per_file` 1-10 (default 1), filters as for search | `200 {hits: Hit[], took_ms: number}`; hits similar to the file at `path` (the file itself is excluded) | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable` |
+| `POST /api/shutdown` | Token; no query; JSON exactly `{}` | `202 {stopping: true}`; the process stops after the response is sent | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error` |
+| `POST /api/index/paths` | Token; no query; JSON `{paths: string[]}`; 1-50 non-empty strings of at most 4,096 UTF-8 bytes each; every path must exist | `202 {job_id: string}`; an `index` job that indexes only those files/directories | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 daemon_active`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable`, `503 model_unavailable` |
 | `POST /api/model/check` | Token; no query; JSON exactly `{}` | `202 {job_id: string}`; job result arrives through the job endpoint | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error` |
 | `POST /api/index` | Token; no query; JSON exactly `{}`; targets come only from validated config | `202 {job_id: string}` | `400 invalid_request`, `400 no_roots`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 daemon_active`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable`, `503 model_unavailable` |
 | `POST /api/setup/download` | Token; no query; JSON `{}` or `{rerank?: boolean}` | `202 {job_id: string}`; runs model/grammar download job | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error` |
@@ -112,7 +115,9 @@ directory. `/` and `/index.html` serve the same packaged entry document.
 includes `daemon_restart_required` and `warning`; for GET those are the defaults
 `false` and `null`. The GET row above names the information-bearing fields; a
 client must tolerate the two default-valued write-metadata fields.
-`POST /api/roots` sets them when a live daemon requires a restart.
+`daemon_restart_required` is deprecated: it is always `false` and `warning` is
+always `null` on both write routes. The fields remain only so older clients keep
+parsing the response.
 
 ## State sets
 
@@ -255,8 +260,7 @@ not create tables.
   or ambiguous TOML shape is `409 config_invalid` with the config path. A write
   failure after validation is `500 config_write_failed`.
 - Adding a root while an engine operation is active is `409 busy`. Adding a
-  root while the daemon socket is live succeeds but returns
-  `daemon_restart_required: true` and a warning to restart the daemon.
+  root while the daemon socket is live succeeds; the deprecated `daemon_restart_required` field is `false`.
 - Saving a root never indexes, deletes, or modifies source files.
 
 Config-write safety details are part of the contract:
@@ -810,3 +814,20 @@ there are safe field strings. `LIMITS`, `ERROR_STATUS`, the state/operation tupl
 executable copies of the frozen lists in this document. The contract module
 imports only the standard library; it must not import `http.server`, numpy,
 torch, sentence-transformers, sqlite-vec, or any backend module.
+
+## Non-browser clients
+
+The CLI, MCP server and desktop app call the same loopback API without a
+browser. They send `X-Seekr-Token` (obtained from the service's discovery file
+or `GET /api/session`) and the exact loopback `Host`; `Origin` and
+`Sec-Fetch-Site` are not required on token routes, but when present they must
+still match. The token can be supplied at start-up so a service can persist the
+same value that `GET /api/session` returns.
+
+`Hit.explain`, present only when a search asked for `explain`, has the keys
+`keyword_rank`, `keyword_bm25`, `vector_rank`, `vector_distance`, `rrf_score`,
+`rerank_rank` and `rerank_score`; each is a number or `null`.
+
+`POST /api/shutdown` only requests a stop. The `202` is sent first, then the
+process shuts down on a separate thread; clients should poll or reconnect to
+confirm the service has exited.

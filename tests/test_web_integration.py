@@ -849,9 +849,8 @@ def test_status_config_model_and_daemon_states_over_http(tmp_path: Path) -> None
         response = _request(server, "POST", "/api/roots", headers=headers, body=raw)
         assert response.status == 200, response.text
         view = response.json()
-        assert view["daemon_restart_required"] is True
-        assert view["warning"]
-        assert "restart" in view["warning"].lower()
+        assert view["daemon_restart_required"] is False
+        assert view["warning"] is None
         assert len(view["roots"]) == 2
         assert Path(view["roots"][0]).resolve() == (tmp_path / "daemon-root").resolve()
         assert Path(view["roots"][1]).resolve() == extra.resolve()

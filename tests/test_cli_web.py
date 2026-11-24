@@ -296,3 +296,26 @@ def test_importing_cli_is_lightweight() -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == ""
+
+
+def test_web_wires_service_shutdown_request_to_stop_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks: list[object] = []
+
+    class SignalBackend(CleanupBackend):
+        def set_shutdown_callback(self, callback: object) -> None:
+            callbacks.append(callback)
+
+    recording = RecordingRun()
+    monkeypatch.setattr(cli_web, "_create_backend", SignalBackend)
+    monkeypatch.setattr(cli_web, "_run_server", recording)
+
+    result = _invoke(["web"])
+
+    assert result.exit_code == 0, result.output
+    stop_event = recording.calls[0]["stop_event"]
+    assert len(callbacks) == 1
+    assert not stop_event.is_set()
+    callbacks[0]()
+    assert stop_event.is_set()

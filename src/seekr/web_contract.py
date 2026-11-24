@@ -31,6 +31,7 @@ __all__ = [
     "SearchMode",
     "SearchRequest",
     "SearchResult",
+    "SimilarRequest",
     "StatusView",
     "WebBackend",
 ]
@@ -132,7 +133,7 @@ class ApiError(Exception):
 
 @dataclass(frozen=True)
 class HitDTO:
-    """One search hit; ``Hit.explain`` is deliberately not part of the wire shape."""
+    """One search hit; ``explain`` is present on the wire only when requested."""
 
     chunk_id: int
     path: str
@@ -146,9 +147,10 @@ class HitDTO:
     highlights: tuple[tuple[int, int], ...] = ()
     location: str = ""
     posix_location: str = ""
+    explain: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "chunk_id": self.chunk_id,
             "path": self.path,
             "locator": self.locator,
@@ -162,6 +164,9 @@ class HitDTO:
             "location": self.location,
             "posix_location": self.posix_location,
         }
+        if self.explain is not None:
+            payload["explain"] = dict(self.explain)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -178,12 +183,15 @@ class SearchRequest:
     module: str | None = None
     week: str | None = None
     spread: bool = False
+    rerank: bool = False
+    explain: bool = False
 
     def to_query_kwargs(self) -> dict[str, object]:
         """Map the wire field ``path`` to ``get_hits``'s ``path_prefix``.
 
-        The caller chooses ``use_daemon`` and the read-only keyword path; this
-        helper never enables reranking or explanation.
+        The caller chooses ``use_daemon`` and the read-only keyword path, and
+        passes ``rerank`` and ``explain`` explicitly from the request fields;
+        this helper never adds them.
         """
         return {
             "query": self.query,
@@ -196,6 +204,20 @@ class SearchRequest:
             "module": self.module,
             "week": self.week,
         }
+
+
+@dataclass(frozen=True)
+class SimilarRequest:
+    """A validated ``POST /api/similar`` request body."""
+
+    path: str
+    k: int = 10
+    per_file: int = 1
+    path_prefix: str | None = None
+    kind: str | None = None
+    since: str | None = None
+    module: str | None = None
+    week: str | None = None
 
 
 @dataclass(frozen=True)
@@ -223,7 +245,7 @@ class RootsView:
     roots: tuple[str, ...]
     config_path: str
     revision: str
-    daemon_restart_required: bool = False
+    daemon_restart_required: bool = False  # deprecated: always false
     warning: str | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -383,6 +405,18 @@ class WebBackend(Protocol):
 
     def search(self, request: SearchRequest) -> SearchResult:
         """Run a validated search with the frozen daemon/read-only/lane policy."""
+        ...
+
+    def similar(self, request: SimilarRequest) -> SearchResult:
+        """Return indexed hits similar to ``request.path`` under the lane policy."""
+        ...
+
+    def request_shutdown(self) -> None:
+        """Ask the hosting process to stop; return without waiting for it."""
+        ...
+
+    def start_index_paths(self, paths: list[str]) -> str:
+        """Start an async index job for specific files/directories; return its job ID."""
         ...
 
     def start_model_check(self) -> str:

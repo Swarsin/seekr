@@ -90,6 +90,10 @@ def _build_web_command(typer_module: Any) -> Any:
             )
             raise typer.Exit(code=1) from None
 
+        set_callback = getattr(backend, "set_shutdown_callback", None)
+        if callable(set_callback):
+            set_callback(stop_event.set)
+
         try:
             exit_code = _run_server(
                 backend,

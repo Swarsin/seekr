@@ -23,7 +23,7 @@ from seekr.embed import FakeEmbedder
 from seekr.indexer import Indexer, SyncReport
 from seekr.lifecycle import LifecycleLock
 from seekr.locations import format_location
-from seekr.models import ChunkSpec, Hit, text_sha
+from seekr.models import ChunkSpec, Hit, HitExplain, text_sha
 from seekr.platform_info import Mount
 from seekr.store import SCHEMA_VERSION, Store, StoredChunk
 from seekr.web_contract import (
@@ -33,6 +33,7 @@ from seekr.web_contract import (
     HitDTO,
     PreviewView,
     SearchRequest,
+    SimilarRequest,
 )
 from seekr.web_service import WebService, _socket_is_live
 
@@ -962,8 +963,8 @@ def test_daemon_failure_and_live_index_refusal_and_root_warning(tmp_path: Path) 
         assert _error_code(raised.value) == "daemon_active"
 
         added = service.add_root(str(_root(tmp_path, "second")), service.roots().revision)
-        assert added.daemon_restart_required is True
-        assert added.warning
+        assert added.daemon_restart_required is False
+        assert added.warning is None
 
 
 def test_daemon_socket_liveness_is_a_real_unix_probe(tmp_path: Path) -> None:
@@ -2312,3 +2313,210 @@ def test_preview_page_png_locator_variants_and_encrypted_pdf(tmp_path: Path) -> 
             service.preview_page_png(empty_id)
         assert _error_code(raised.value) == "not_found"
         assert closed == [True]
+
+
+# -- service-client surface: rerank/explain, similar, shutdown, path indexing --
+
+
+def test_search_passes_rerank_and_explain_and_maps_explain(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    config_path = _write_config(tmp_path, roots=[root])
+    _add_indexed_document(tmp_path / "index.db")
+    seen: list[dict[str, object]] = []
+    explained = Hit(
+        chunk_id=1,
+        path="/notes/a.txt",
+        locator="L1",
+        loc_start=1.0,
+        snippet="alpha",
+        score=0.5,
+        kind="text",
+        explain=HitExplain(keyword_rank=1, keyword_bm25=-2.5, rrf_score=0.03),
+    )
+
+    def local(query, **kwargs):
+        seen.append(kwargs)
+        return [explained]
+
+    with _service(config_path, tmp_path, local_search=local) as service:
+        plain = service.search(SearchRequest("alpha", mode="hybrid"))
+        assert seen[-1]["rerank"] is False
+        assert seen[-1]["explain"] is False
+        assert "explain" not in plain.to_dict()["hits"][0]
+
+        rich = service.search(
+            SearchRequest("alpha", mode="hybrid", rerank=True, explain=True)
+        )
+        assert seen[-1]["rerank"] is True
+        assert seen[-1]["explain"] is True
+        payload = rich.to_dict()["hits"][0]["explain"]
+        assert payload["keyword_rank"] == 1
+        assert payload["keyword_bm25"] == -2.5
+        assert payload["rrf_score"] == 0.03
+        assert payload["vector_rank"] is None
+        json.dumps(payload, allow_nan=False)
+
+
+def test_daemon_search_passes_rerank_and_explain(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    config_path = _write_config(tmp_path, roots=[root])
+    seen: list[dict[str, object]] = []
+
+    def daemon(query, **kwargs):
+        seen.append(kwargs)
+        return []
+
+    with _service(
+        config_path,
+        tmp_path,
+        daemon_probe=lambda path: True,
+        daemon_search=daemon,
+    ) as service:
+        service.search(SearchRequest("alpha", rerank=True, explain=True))
+        assert seen[-1]["rerank"] is True
+        assert seen[-1]["explain"] is True
+
+
+def test_search_rejects_non_boolean_rerank_and_explain(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, roots=[_root(tmp_path)])
+    with _service(config_path, tmp_path) as service:
+        for field in ("rerank", "explain"):
+            with pytest.raises(ApiError) as raised:
+                service.search(SearchRequest("alpha", **{field: "yes"}))
+            assert _error_code(raised.value) == "invalid_request"
+
+
+def test_similar_calls_shared_similarity_with_filters(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, roots=[_root(tmp_path)])
+    _add_indexed_document(tmp_path / "index.db")
+    seen: list[tuple[object, dict[str, object]]] = []
+    hit = Hit(
+        chunk_id=7,
+        path="/notes/b.txt",
+        locator="L2",
+        loc_start=2.0,
+        snippet="beta",
+        score=0.8,
+        kind="text",
+    )
+
+    def fake_similar(target, **kwargs):
+        seen.append((target, kwargs))
+        return [hit]
+
+    with _service(config_path, tmp_path) as service:
+        with mock.patch("seekr.cli_search.get_similar_hits", fake_similar):
+            result = service.similar(
+                SimilarRequest(
+                    path="/notes/a.txt",
+                    k=3,
+                    per_file=2,
+                    path_prefix="/notes",
+                    kind="text",
+                    since="7d",
+                    module="ml",
+                    week="1-2",
+                )
+            )
+        assert [h.chunk_id for h in result.hits] == [7]
+        assert result.took_ms >= 0.0
+        target, kwargs = seen[0]
+        assert str(target) == "/notes/a.txt"
+        assert kwargs["k"] == 3
+        assert kwargs["per_file"] == 2
+        assert kwargs["path_prefix"] == "/notes"
+        assert kwargs["kind"] == "text"
+        assert kwargs["since"] == "7d"
+        assert kwargs["module"] == "ml"
+        assert kwargs["week"] == "1-2"
+        assert service.status().activity["lane"] == "idle"
+
+
+def test_similar_validation_and_error_mapping(tmp_path: Path) -> None:
+    from seekr.cli_search import SearchError
+
+    config_path = _write_config(tmp_path, roots=[_root(tmp_path)])
+    with _service(config_path, tmp_path) as service:
+        for bad in (
+            SimilarRequest(path=""),
+            SimilarRequest(path="/a", k=0),
+            SimilarRequest(path="/a", k=51),
+            SimilarRequest(path="/a", per_file=11),
+            SimilarRequest(path="/a", kind="nonsense-kind"),
+            SimilarRequest(path="/a", since="not-a-date"),
+        ):
+            with pytest.raises(ApiError) as raised:
+                service.similar(bad)
+            assert _error_code(raised.value) == "invalid_request", bad
+
+        def failing(target, **kwargs):
+            raise SearchError("file not found and not in index")
+
+        with (
+            mock.patch("seekr.cli_search.get_similar_hits", failing),
+            pytest.raises(ApiError) as raised,
+        ):
+            service.similar(SimilarRequest(path="/missing"))
+        assert _error_code(raised.value) == "index_unavailable"
+
+        service.begin_shutdown()
+        with pytest.raises(ApiError):
+            service.similar(SimilarRequest(path="/a"))
+
+
+def test_similar_is_refused_while_another_lane_is_busy(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, roots=[_root(tmp_path)])
+    with _service(config_path, tmp_path) as service:
+        service._begin_lane("index")
+        try:
+            with (
+                mock.patch("seekr.cli_search.get_similar_hits", lambda *a, **k: []),
+                pytest.raises(ApiError) as raised,
+            ):
+                service.similar(SimilarRequest(path="/a"))
+            assert _error_code(raised.value) == "busy"
+        finally:
+            service._end_lane()
+
+
+def test_request_shutdown_invokes_callback_once_and_is_noop_without_one(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_config(tmp_path, roots=[_root(tmp_path)])
+    calls: list[str] = []
+    with _service(config_path, tmp_path, on_shutdown=lambda: calls.append("stop")) as service:
+        service.request_shutdown()
+        service.request_shutdown()
+        assert calls == ["stop"]
+    with _service(config_path, tmp_path) as service:
+        service.request_shutdown()
+
+
+def test_start_index_paths_indexes_only_given_paths(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    other = _root(tmp_path, "other")
+    _write_docs(root, {"keep.md": "# Keep\n\nzebra notes here.\n"})
+    _write_docs(other, {"extra.md": "# Extra\n\nokapi notes here.\n"})
+    config_path = _write_config(tmp_path, roots=[root])
+    embedder = FakeEmbedder(dim=64)
+    with _service(config_path, tmp_path, embedder_factory=lambda _cfg: embedder) as service:
+        job = _wait_job(service, service.start_index_paths([str(other)]))
+        assert job.operation == "index"
+        assert job.state == "succeeded", job
+        found = service.search(SearchRequest("okapi", mode="keyword"))
+        assert [Path(h.path).name for h in found.hits] == ["extra.md"]
+        assert service.search(SearchRequest("zebra", mode="keyword")).hits == ()
+
+
+def test_start_index_paths_validation_and_daemon_refusal(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    config_path = _write_config(tmp_path, roots=[root])
+    with _service(config_path, tmp_path) as service:
+        for bad in ([], [""], [str(tmp_path / "does-not-exist")]):
+            with pytest.raises(ApiError) as raised:
+                service.start_index_paths(bad)
+            assert _error_code(raised.value) == "invalid_request", bad
+    with _service(config_path, tmp_path, daemon_probe=lambda path: True) as service:
+        with pytest.raises(ApiError) as raised:
+            service.start_index_paths([str(root)])
+        assert _error_code(raised.value) == "daemon_active"

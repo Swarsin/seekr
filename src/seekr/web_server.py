@@ -34,6 +34,7 @@ from .web_contract import (
     LIMITS,
     ApiError,
     SearchRequest,
+    SimilarRequest,
     WebBackend,
 )
 
@@ -108,6 +109,9 @@ _API_ROUTES: dict[str, tuple[str, frozenset[str]]] = {
     "/api/preview/page": ("preview_page", frozenset({_GET_METHOD})),
     "/api/open": ("open", frozenset({_POST_METHOD})),
     "/api/search": ("search", frozenset({_POST_METHOD})),
+    "/api/similar": ("similar", frozenset({_POST_METHOD})),
+    "/api/shutdown": ("shutdown", frozenset({_POST_METHOD})),
+    "/api/index/paths": ("index_paths", frozenset({_POST_METHOD})),
     "/api/model/check": ("model_check", frozenset({_POST_METHOD})),
     "/api/index": ("index", frozenset({_POST_METHOD})),
     "/api/setup/download": ("setup_download", frozenset({_POST_METHOD})),
@@ -281,6 +285,8 @@ def _validate_search(body: dict[str, Any]) -> SearchRequest:
             "module",
             "week",
             "spread",
+            "rerank",
+            "explain",
         },
     )
     query = _require_string(body, "query")
@@ -306,6 +312,8 @@ def _validate_search(body: dict[str, Any]) -> SearchRequest:
     module = _optional_string(body, "module")
     week = _optional_string(body, "week")
     spread = _optional_bool(body, "spread", default=False)
+    rerank = _optional_bool(body, "rerank", default=False)
+    explain = _optional_bool(body, "explain", default=False)
     return SearchRequest(
         query=query,
         mode=mode,  # type: ignore[arg-type]
@@ -317,7 +325,53 @@ def _validate_search(body: dict[str, Any]) -> SearchRequest:
         module=module,
         week=week,
         spread=spread,
+        rerank=rerank,
+        explain=explain,
     )
+
+
+def _validate_similar(body: dict[str, Any]) -> SimilarRequest:
+    _reject_unknown_fields(
+        body,
+        {"path", "k", "per_file", "path_prefix", "kind", "since", "module", "week"},
+    )
+    path = _require_string(body, "path")
+    k = _optional_int(body, "k", 10, LIMITS["k_min"], LIMITS["k_max"])
+    per_file = _optional_int(
+        body, "per_file", 1, LIMITS["per_file_min"], LIMITS["per_file_max"]
+    )
+    return SimilarRequest(
+        path=path,
+        k=k,
+        per_file=per_file,
+        path_prefix=_optional_string(body, "path_prefix"),
+        kind=_optional_string(body, "kind"),
+        since=_optional_string(body, "since"),
+        module=_optional_string(body, "module"),
+        week=_optional_string(body, "week"),
+    )
+
+
+def _validate_index_paths(body: dict[str, Any]) -> list[str]:
+    _reject_unknown_fields(body, {"paths"})
+    value = body.get("paths")
+    if type(value) is not list or not value:
+        raise _invalid("paths must be a non-empty array of strings", field="paths")
+    if len(value) > LIMITS["roots_max"]:
+        raise _invalid(
+            f"paths must contain at most {LIMITS['roots_max']} entries", field="paths"
+        )
+    paths: list[str] = []
+    for item in value:
+        if type(item) is not str or not item:
+            raise _invalid("paths must be a non-empty array of strings", field="paths")
+        if len(item.encode("utf-8")) > LIMITS["root_path_bytes"]:
+            raise _invalid(
+                f"each path must be at most {LIMITS['root_path_bytes']} bytes",
+                field="paths",
+            )
+        paths.append(item)
+    return paths
 
 
 def _validate_roots(body: dict[str, Any]) -> tuple[str, str]:
@@ -1033,6 +1087,22 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             request = _validate_search(body)
             self._send_json(200, backend.search(request).to_dict())
             return route_label, 200
+        if name == "similar":
+            assert body is not None
+            similar_request = _validate_similar(body)
+            self._send_json(200, backend.similar(similar_request).to_dict())
+            return route_label, 200
+        if name == "shutdown":
+            assert body is not None
+            _validate_empty_body(body)
+            backend.request_shutdown()
+            self._send_json(202, {"stopping": True})
+            return route_label, 202
+        if name == "index_paths":
+            assert body is not None
+            job_id = backend.start_index_paths(_validate_index_paths(body))
+            self._send_json(202, {"job_id": job_id})
+            return route_label, 202
         if name == "model_check":
             assert body is not None
             _validate_empty_body(body)
@@ -1072,6 +1142,9 @@ def _route_label(name: str) -> str:
         "preview_page": "/api/preview/page",
         "open": "/api/open",
         "search": "/api/search",
+        "similar": "/api/similar",
+        "shutdown": "/api/shutdown",
+        "index_paths": "/api/index/paths",
         "model_check": "/api/model/check",
         "index": "/api/index",
         "setup_download": "/api/setup/download",
@@ -1213,6 +1286,7 @@ def run_web(
     backend: WebBackend,
     *,
     port: int = 8000,
+    token: str | None = None,
     stop_event: threading.Event | None = None,
     open_browser: bool = False,
     install_signal_handlers: bool = True,
@@ -1236,6 +1310,7 @@ def run_web(
         server = create_server(
             backend,
             port=port,
+            token=token,
             read_timeout=read_timeout,
             request_deadline=request_deadline,
             join_timeout=join_timeout,

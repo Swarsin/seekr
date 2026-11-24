@@ -17,6 +17,7 @@ from seekr.web_contract import (
     RootsView,
     SearchRequest,
     SearchResult,
+    SimilarRequest,
     StatusView,
 )
 
@@ -337,6 +338,7 @@ class FakeWebBackend:
     ``errors`` maps a backend method name (``"status"``, ``"roots"``,
     ``"add_root"``, ``"remove_root"``, ``"course"``, ``"preview"``,
     ``"preview_page_png"``, ``"open_chunk"``, ``"search"``,
+    ``"similar"``, ``"request_shutdown"``, ``"start_index_paths"``,
     ``"start_model_check"``, ``"start_index"``, ``"start_download"``,
     or ``"job"``) to an :class:`ApiError` that method raises instead of
     returning.  Every call is appended to ``calls`` as
@@ -361,6 +363,8 @@ class FakeWebBackend:
         start_model_check_job_id: str = "job-model-check-fixture",
         start_index_job_id: str = "job-index-fixture",
         start_download_job_id: str = "job-download-fixture",
+        similar_result: SearchResult | None = None,
+        start_index_paths_job_id: str = "job-index-paths-fixture",
         errors: dict[str, ApiError] | None = None,
     ) -> None:
         self.status_value = STATUS_READY if status is None else status
@@ -379,6 +383,8 @@ class FakeWebBackend:
         self.start_model_check_job_id = start_model_check_job_id
         self.start_index_job_id = start_index_job_id
         self.start_download_job_id = start_download_job_id
+        self.similar_result_value = SEARCH_RESULT if similar_result is None else similar_result
+        self.start_index_paths_job_id = start_index_paths_job_id
         self.errors = dict(errors or {})
         self.calls: list[tuple[str, dict[str, object]]] = []
 
@@ -447,6 +453,21 @@ class FakeWebBackend:
         self._record("search", request=request)
         self._raise_configured("search")
         return self.search_result_value
+
+    def similar(self, request: SimilarRequest) -> SearchResult:
+        self._record("similar", request=request)
+        self._raise_configured("similar")
+        return self.similar_result_value
+
+    def request_shutdown(self) -> None:
+        self._record("request_shutdown")
+        self._raise_configured("request_shutdown")
+
+    def start_index_paths(self, paths: list[str]) -> str:
+        self._record("start_index_paths", paths=list(paths))
+        self._raise_configured("start_index_paths")
+        self._ensure_running_job(self.start_index_paths_job_id, "index")
+        return self.start_index_paths_job_id
 
     def start_model_check(self) -> str:
         self._record("start_model_check")
