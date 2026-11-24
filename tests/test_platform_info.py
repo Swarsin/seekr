@@ -18,6 +18,7 @@ from seekr.platform_info import (
     parse_macos_mount,
     parse_mounts,
     read_mounts,
+    resolve_root,
     split_roots,
     windows_path,
     wslpath_windows,
@@ -344,3 +345,12 @@ class CrossPlatformSlowPathTests(unittest.TestCase):
         )
         self.assertEqual(polled, [Path("/Volumes/course/ml")])
         self.assertEqual(native, [Path("/Users/me/notes")])
+
+
+class ResolveRootTests(unittest.TestCase):
+    def test_darwin_roots_are_nfc_and_linux_roots_unchanged(self) -> None:
+        nfd = Path("/vol") / "Mo\u0301dulo"
+        with mock.patch("seekr.pathnorm._PLATFORM", "darwin"):
+            self.assertEqual(str(resolve_root(nfd)), "/vol/M\u00f3dulo")
+        with mock.patch("seekr.pathnorm._PLATFORM", "linux"):
+            self.assertEqual(str(resolve_root(nfd)), str(nfd))

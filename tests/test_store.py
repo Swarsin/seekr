@@ -607,6 +607,22 @@ class StorePathTests(_FakeBackendTestCase):
             store.list_paths(), ["/users/me/n_tes/c.md", "/users/me/notes2/b.md"]
         )
 
+    def test_prefix_with_literal_like_characters(self) -> None:
+        for insensitive in (True, False):
+            with self.subTest(case_insensitive=insensitive):
+                path = self.tmp_db_dir(insensitive)
+                store = Store(path, "test/model", 8, case_insensitive_paths=insensitive)
+                self._stores.append(store)
+                for doc in ("/a!b%c_d/x.md", "/a!b%cxd/y.md", "/aXb%c_d/z.md", "/a!!b/w.md"):
+                    _add_document(store, doc)
+                self.assertEqual(store.list_paths("/a!b%c_d"), ["/a!b%c_d/x.md"])
+                self.assertEqual(store.list_paths("/a!b"), [])
+                self.assertEqual(store.list_paths("/a!!b"), ["/a!!b/w.md"])
+                self.assertEqual(store.list_paths("/a%"), [])
+
+    def tmp_db_dir(self, insensitive: bool) -> Path:
+        return self.db_path.with_name(f"like-{int(insensitive)}.db")
+
     def test_case_sensitive_store_keeps_exact_prefixes(self) -> None:
         store = Store(self.db_path, "test/model", 8, case_insensitive_paths=False)
         self._stores.append(store)
@@ -889,6 +905,33 @@ class StdlibStoreTests(_FakeBackendTestCase):
         self.assertEqual(store.keyword_search("beforetoken", 10), [])
         self.assertEqual(len(store.keyword_search("aftertoken", 10)), 1)
         self.assertEqual(store.fetch_chunks([chunk_id])[chunk_id].text, "aftertoken")
+
+    def test_darwin_keyword_prefix_in_nfd_and_other_case_matches_nfc_paths(self) -> None:
+        with mock.patch("seekr.pathnorm._PLATFORM", "darwin"):
+            store = self.open_store()
+            self.assertTrue(store.case_insensitive_paths)
+            _add_document(
+                store,
+                "/notes/M\u00f3dulo/a.md",
+                self._bytes_chunk("sharedtoken alpha", fill=1),
+            )
+            _add_document(
+                store, "/notes/other/b.md", self._bytes_chunk("sharedtoken beta", fill=2)
+            )
+            nfd_prefix = "/NOTES/mo\u0301dulo"
+            hits = store.keyword_search('"sharedtoken"', 10, path_prefix=nfd_prefix)
+            self.assertEqual(
+                [store.fetch_chunks([hit[0]])[hit[0]].path for hit in hits],
+                ["/notes/M\u00f3dulo/a.md"],
+            )
+            self.assertEqual(store.list_paths(nfd_prefix), ["/notes/M\u00f3dulo/a.md"])
+
+    def test_linux_prefix_keeps_unicode_form_and_case(self) -> None:
+        with mock.patch("seekr.pathnorm._PLATFORM", "linux"):
+            store = self.open_store()
+            _add_document(store, "/notes/M\u00f3dulo/a.md")
+            self.assertEqual(store.list_paths("/notes/Mo\u0301dulo"), [])
+            self.assertEqual(store.list_paths("/notes/m\u00f3dulo"), [])
 
     def test_keyword_path_prefix_filters_before_limit(self) -> None:
         store = self.open_store()

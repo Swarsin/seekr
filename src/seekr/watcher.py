@@ -23,7 +23,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from . import platform_info
+from . import pathnorm, platform_info
 from .platform_info import Mount
 
 __all__ = ["Watcher", "WatcherError"]
@@ -482,17 +482,18 @@ class Watcher:
 
     def _inside_roots(self, raw_path: object) -> Path | None:
         try:
-            resolved = Path(_decode_path(raw_path)).expanduser().resolve(strict=False)
+            # Canonical form, as the indexer records it (NFC on macOS).
+            resolved = Path(
+                pathnorm.canonical_path(Path(_decode_path(raw_path)).expanduser())
+            )
         except (OSError, RuntimeError, TypeError, ValueError):
             return None
+        # Case- and Unicode-form-insensitive on macOS and Windows; exact,
+        # component-wise containment on Linux.
+        target = str(resolved)
         for root in self._resolved_roots:
-            if resolved == root:
+            if pathnorm.has_prefix(target, str(root)):
                 return resolved
-            try:
-                resolved.relative_to(root)
-            except ValueError:
-                continue
-            return resolved
         return None
 
     # -- worker ------------------------------------------------------------

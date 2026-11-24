@@ -609,3 +609,36 @@ def test_remove_root_refuses_symlink_and_unsupported_toml_shapes(tmp_path: Path)
     with pytest.raises(ApiError) as raised:
         remove_root(multiline, str(first), config_revision(multiline))
     assert _code(raised.value) == "config_invalid"
+
+
+NFC = "M\u00f3dulo"
+NFD = "Mo\u0301dulo"
+
+
+def test_darwin_case_and_unicode_variants_are_duplicate_roots(tmp_path: Path) -> None:
+    root = _root(tmp_path, NFC.lower())  # exists as "módulo" (NFC)
+    for spelling in (tmp_path / NFD.upper(), tmp_path / NFD.lower()):
+        config = _config_with_roots(tmp_path, [spelling])
+        with mock.patch("seekr.pathnorm._PLATFORM", "darwin"), pytest.raises(
+            ApiError
+        ) as raised:
+            add_root(config, str(root), config_revision(config))
+        assert _code(raised.value) == "duplicate_root"
+
+
+def test_linux_case_and_unicode_variants_stay_distinct_roots(tmp_path: Path) -> None:
+    root = _root(tmp_path, NFC.lower())
+    config = _config_with_roots(tmp_path, [tmp_path / NFD.upper()])
+    with mock.patch("seekr.pathnorm._PLATFORM", "linux"):
+        snapshot = add_root(config, str(root), config_revision(config))
+    assert len(snapshot.roots) == 2
+
+
+def test_darwin_remove_root_accepts_case_and_unicode_variants(tmp_path: Path) -> None:
+    configured = tmp_path / NFD.upper()
+    config = _config_with_roots(tmp_path, [configured])
+    with mock.patch("seekr.pathnorm._PLATFORM", "linux"), pytest.raises(ApiError):
+        remove_root(config, str(tmp_path / NFC.lower()), config_revision(config))
+    with mock.patch("seekr.pathnorm._PLATFORM", "darwin"):
+        snapshot = remove_root(config, str(tmp_path / NFC.lower()), config_revision(config))
+    assert snapshot.roots == ()

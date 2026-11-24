@@ -449,8 +449,13 @@ class Store:
             "separator": self._path_separator,
         }
 
+    @staticmethod
+    def _canonical_prefix(prefix: str | None) -> str | None:
+        """Bring a caller's prefix to the stored form (NFC on macOS)."""
+        return None if prefix is None else pathnorm.normalize_unicode(str(prefix))
+
     def _prefix_clause(self, prefix: str | None) -> tuple[str, tuple[object, ...]]:
-        return _path_prefix_clause(prefix, **self._path_options())
+        return _path_prefix_clause(self._canonical_prefix(prefix), **self._path_options())
 
     def _open_writable(self, dim: int) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1160,7 +1165,7 @@ class Store:
         if limit <= 0 or not isinstance(match_query, str) or not match_query.strip():
             return []
         clause, filter_params = _document_filter_clause(
-            path_prefix=path_prefix,
+            path_prefix=self._canonical_prefix(path_prefix),
             kind=kind,
             since_mtime_ns=since_mtime_ns,
             module=module,
@@ -1226,7 +1231,7 @@ class Store:
     ) -> list[tuple[object, ...]]:
         """Exact vector search using sqlite-vec's scalar L2 distance."""
         clause, filter_params = _document_filter_clause(
-            path_prefix=path_prefix,
+            path_prefix=self._canonical_prefix(path_prefix),
             kind=kind,
             since_mtime_ns=since_mtime_ns,
             exclude_path=exclude_path,

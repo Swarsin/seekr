@@ -629,29 +629,48 @@ def _reindex_via_api(svc: SeekrService, port: int, body: object = None) -> dict:
     return job
 
 
-def test_reindex_route_rebuilds_through_the_pause(env, request) -> None:
+def test_reindex_route_rebuilds_through_the_pause(env, request, monkeypatch) -> None:
+    from seekr import lifecycle
+
     svc = _service(request)
     port = svc.start()
     _wait_idle(svc)
     _open_watch_store(svc)
-    entered: list[tuple[object, object, str]] = []
-    original = svc.paused
+    db_path = env / "index.db"
+    real_rebuild = lifecycle.rebuild_index
+    during: dict[str, object] = {}
 
-    def spy(**kwargs):
-        entered.append(
-            (svc._watch_store, svc._watcher._paused, svc.backend._activity()["lane"])
+    def checked_rebuild(cfg, **kwargs):
+        # Observed while the rebuild runs, before any swap.
+        during.update(
+            watch_store=svc._watch_store,
+            watch_lock=svc._watch_lock,
+            exclusive_free=_exclusive_lock_available(db_path),
+            watcher_paused=svc._watcher._paused,
+            lane=svc.backend._activity()["lane"],
         )
-        return original(**kwargs)
+        if svc._watch_store is not None or not during["exclusive_free"]:
+            # Fail at once instead of waiting out the swap's upgrade timeout.
+            raise RuntimeError("rebuild started while the service held the index")
+        return real_rebuild(cfg, **kwargs)
 
-    svc.paused = spy  # type: ignore[method-assign]
+    monkeypatch.setattr(lifecycle, "rebuild_index", checked_rebuild)
     (env / "docs" / "b.md").write_text("beta notes about drums\n", encoding="utf-8")
 
+    started = time.monotonic()
     job = _reindex_via_api(svc, port)
 
+    assert time.monotonic() - started < 5.0
+    assert during == {
+        "watch_store": None,
+        "watch_lock": None,
+        "exclusive_free": True,
+        "watcher_paused": True,
+        "lane": "index",
+    }
     assert job["operation"] == "index"
     assert job["state"] == "succeeded", job
     assert job["report"]["added"] == 2
-    assert len(entered) == 1 and entered[0][2] == "index"
     assert _documents(svc) == 2
     assert svc._watch_store is not None  # reopened on the new database
     assert svc._watcher._paused is False

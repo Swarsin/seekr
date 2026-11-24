@@ -2563,3 +2563,13 @@ def test_keyword_rerank_and_relative_paths_are_invalid_requests(tmp_path: Path) 
             with pytest.raises(ApiError) as raised:
                 call()
             assert _error_code(raised.value) == "invalid_request"
+
+
+def test_removed_root_prefixes_match_case_and_unicode_variants_on_darwin() -> None:
+    configured = [Path("/vol/MO\u0301DULO")]
+    with mock.patch("seekr.pathnorm._PLATFORM", "darwin"):
+        prefixes = WebService._removed_root_prefixes("/vol/m\u00f3dulo", configured)
+    assert prefixes == ["/vol/m\u00f3dulo", "/vol/MO\u0301DULO"]
+    with mock.patch("seekr.pathnorm._PLATFORM", "linux"):
+        prefixes = WebService._removed_root_prefixes("/vol/m\u00f3dulo", configured)
+    assert prefixes == ["/vol/m\u00f3dulo"]

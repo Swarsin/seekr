@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from seekr.config import Config
 from seekr.embed import FakeEmbedder
@@ -977,3 +978,33 @@ class _RealStoreWatchdogIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CanonicalContainmentTests(unittest.TestCase):
+    NFC = "M\u00f3dulo"
+    NFD = "Mo\u0301dulo"
+
+    def _watcher(self, root: Path) -> Watcher:
+        return Watcher(_RecordingIndexer(), [root], 0.0, mounts=())
+
+    def test_darwin_event_paths_match_roots_across_case_and_unicode_form(self) -> None:
+        with mock.patch("seekr.pathnorm._PLATFORM", "darwin"):
+            watcher = self._watcher(Path("/vol") / self.NFD.upper())
+            self.assertEqual(watcher._resolved_roots, (Path("/vol") / "M\u00d3DULO",))
+            inside = watcher._inside_roots(f"/vol/{self.NFC.lower()}/a.md")
+            self.assertEqual(inside, Path(f"/vol/{self.NFC.lower()}/a.md"))
+            nfd_event = watcher._inside_roots(f"/vol/{self.NFD}/b.md")
+            self.assertEqual(nfd_event, Path(f"/vol/{self.NFC}/b.md"))
+            self.assertIsNone(watcher._inside_roots(f"/vol/{self.NFC}2/a.md"))
+
+    def test_linux_containment_is_exact(self) -> None:
+        with mock.patch("seekr.pathnorm._PLATFORM", "linux"):
+            watcher = self._watcher(Path("/vol") / self.NFD)
+            self.assertEqual(watcher._resolved_roots, (Path("/vol") / self.NFD,))
+            self.assertIsNone(watcher._inside_roots(f"/vol/{self.NFC}/a.md"))
+            self.assertIsNone(watcher._inside_roots(f"/vol/{self.NFD.lower()}/a.md"))
+            self.assertEqual(
+                watcher._inside_roots(f"/vol/{self.NFD}/a.md"), Path(f"/vol/{self.NFD}/a.md")
+            )
+            whole = Watcher(_RecordingIndexer(), [Path("/")], 0.0, mounts=())
+            self.assertEqual(whole._inside_roots("/x/y.md"), Path("/x/y.md"))

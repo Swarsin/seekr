@@ -14,7 +14,6 @@ import hashlib
 import logging
 import os
 import stat as stat_module
-import sys
 import time
 import warnings
 from collections.abc import Callable, Iterable, Sequence
@@ -149,15 +148,11 @@ def language_for(path: Path) -> str | None:
     return _extract_module.language_for(path)
 
 
-# The platform whose path rules apply; a module attribute so tests can patch it.
-_PLATFORM = sys.platform
-
-
 def _canonical_walked(path: Path) -> Path:
     """Return a walked file path in canonical (NFC on macOS) form."""
-    if _PLATFORM != "darwin":
-        return path
-    return Path(pathnorm.normalize_unicode(str(path), platform=_PLATFORM))
+    text = str(path)
+    normalized = pathnorm.normalize_unicode(text)
+    return path if normalized == text else Path(normalized)
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -1458,7 +1453,7 @@ class Indexer:
             return None, f"cannot expand path: {_error_text(exc)}"
         try:
             # On Linux this is exactly Path.resolve(); macOS also applies NFC.
-            return Path(pathnorm.canonical_path(expanded, platform=_PLATFORM)), None
+            return Path(pathnorm.canonical_path(expanded)), None
         except (OSError, RuntimeError) as exc:
             return None, f"cannot resolve path: {_error_text(exc)}"
 

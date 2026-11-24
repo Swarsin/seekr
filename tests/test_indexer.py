@@ -1592,7 +1592,7 @@ class CanonicalPathTests(_IndexerTestCase):
         # only the recorded strings are checked.
         self.write(f"{self.NFD}/a.txt", "alpha beta gamma")
         expected = self.root.resolve() / self.NFC / "a.txt"
-        with mock.patch.object(indexer_module, "_PLATFORM", "darwin"):
+        with mock.patch("seekr.pathnorm._PLATFORM", "darwin"):
             resolved, issue = Indexer._resolve(self.root / self.NFD / "a.txt")
             files, ok = self.indexer._walk_root(self.root.resolve(), indexer_module.SyncReport())
         self.assertIsNone(issue)

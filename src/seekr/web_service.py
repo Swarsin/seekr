@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import platform_info
+from . import pathnorm, platform_info
 from .config import (
     DEFAULT_EMBED_MODEL,
     Config,
@@ -1162,7 +1162,7 @@ class WebService:
                     existing_resolved = str(existing.expanduser().resolve(strict=False))
                 except (OSError, RuntimeError, ValueError):
                     continue
-                if existing_resolved == canonical:
+                if pathnorm.same_path(existing_resolved, canonical):
                     exp = str(existing.expanduser())
                     if exp and exp != "/" and exp not in prefixes:
                         prefixes.append(exp)

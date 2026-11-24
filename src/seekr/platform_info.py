@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import pathnorm
+
 __all__ = [
     "SLOW_FSTYPES",
     "Mount",
@@ -227,12 +229,18 @@ def is_slow_path(
 
 
 def resolve_root(path: Path | str) -> Path:
-    """Expand and resolve a watch root without requiring it to exist."""
+    """Expand and resolve a watch root without requiring it to exist.
+
+    The result is in canonical form (NFC on macOS, as the indexer stores it).
+    """
     expanded = Path(path).expanduser()
     try:
-        return expanded.resolve(strict=False)
+        resolved = expanded.resolve(strict=False)
     except (OSError, RuntimeError):
-        return expanded
+        resolved = expanded
+    text = str(resolved)
+    normalized = pathnorm.normalize_unicode(text)
+    return resolved if normalized == text else Path(normalized)
 
 
 def is_polled_root(
