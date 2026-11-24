@@ -7,13 +7,13 @@ import json
 import os
 import socket
 import sqlite3
-import tempfile
 import threading
 import time
 import unittest
 from collections.abc import Callable
 from pathlib import Path
 
+from _platform import requires_legacy_daemon, short_tempdir
 from seekr import cli_daemon, client
 from seekr.config import Config
 from seekr.embed import FakeEmbedder
@@ -88,13 +88,14 @@ def _search_paths(sock_path: Path, query: str, *, mode: str = "hybrid") -> list[
     return [hit.path for hit in hits]
 
 
+@requires_legacy_daemon
 @unittest.skipUnless(
     _NEEDS_STACK,
     "numpy, sqlite-vec, watchdog and FTS5 are required",
 )
 class DaemonWatcherIndexerConcurrencyTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(dir="/tmp", prefix="seekr-c-")
+        self._tmp = short_tempdir("seekr-c-")
         self.addCleanup(self._tmp.cleanup)
         self.base = Path(self._tmp.name)
         self.root = self.base / "docs"

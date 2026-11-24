@@ -6,7 +6,6 @@ import importlib.util
 import json
 import os
 import sqlite3
-import tempfile
 import threading
 import time
 import unittest
@@ -16,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
+from _platform import LEGACY_DAEMON, requires_legacy_daemon, short_tempdir
 from seekr import cli_search, client, daemon
 from seekr.cli import app
 from seekr.config import Config
@@ -130,6 +130,7 @@ class SearchExplainTests(unittest.TestCase):
         self.assertEqual(top_explain.rerank_score, 2.0)
 
 
+@requires_legacy_daemon
 @unittest.skipUnless(_NEEDS_REAL_STORE, "numpy, sqlite-vec and FTS5 are required")
 class DaemonExplainRoundtripTests(unittest.TestCase):
     @staticmethod
@@ -159,7 +160,7 @@ class DaemonExplainRoundtripTests(unittest.TestCase):
                 raise AssertionError(f"daemon raised: {errors}")
 
     def test_daemon_search_preserves_explain_payload(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp", prefix="seekr-exp-") as tmp:
+        with short_tempdir("seekr-exp-") as tmp:
             base = Path(tmp)
             root = base / "docs"
             root.mkdir()
@@ -289,7 +290,7 @@ class RealStoreFilterTests(unittest.TestCase):
         recent_mtime = now - 600
         old_mtime = now - 30 * 86400
 
-        with tempfile.TemporaryDirectory(dir="/tmp", prefix="seekr-flt-") as tmp:
+        with short_tempdir("seekr-flt-") as tmp:
             base = Path(tmp)
             root = base / "repo"
             root.mkdir()
@@ -341,23 +342,24 @@ class RealStoreFilterTests(unittest.TestCase):
                             {str(code_recent.resolve()), str(code_old.resolve())},
                         )
 
-                with DaemonExplainRoundtripTests._running(searcher, base) as sock_path:
-                    daemon_hits = client.try_daemon_search(
-                        {
-                            "op": "search",
-                            "query": "zephyr",
-                            "k": 5,
-                            "mode": "hybrid",
-                            "per_file": 2,
-                            "rerank": False,
-                            "path_prefix": None,
-                            "kind": "code",
-                            "since_mtime_ns": recent_ns,
-                        },
-                        sock_path=sock_path,
-                    )
-                assert daemon_hits is not None
-                self.assertEqual([hit.path for hit in daemon_hits], [str(code_recent.resolve())])
+                if LEGACY_DAEMON:  # the daemon only exists on Linux
+                    with DaemonExplainRoundtripTests._running(searcher, base) as sock_path:
+                        daemon_hits = client.try_daemon_search(
+                            {
+                                "op": "search",
+                                "query": "zephyr",
+                                "k": 5,
+                                "mode": "hybrid",
+                                "per_file": 2,
+                                "rerank": False,
+                                "path_prefix": None,
+                                "kind": "code",
+                                "since_mtime_ns": recent_ns,
+                            },
+                            sock_path=sock_path,
+                        )
+                    assert daemon_hits is not None
+                    self.assertEqual([hit.path for hit in daemon_hits], [str(code_recent.resolve())])
 
                 with (
                     mock.patch("seekr.cli_search._daemon_search", return_value=None),
@@ -414,7 +416,7 @@ class RealStoreSimilarTests(unittest.TestCase):
         recent_mtime = now - 300
         old_mtime = now - 30 * 86400
 
-        with tempfile.TemporaryDirectory(dir="/tmp", prefix="seekr-sim-") as tmp:
+        with short_tempdir("seekr-sim-") as tmp:
             base = Path(tmp)
             root = base / "docs"
             root.mkdir()
@@ -460,6 +462,7 @@ class RealStoreSimilarTests(unittest.TestCase):
 
 
 class DaemonHelperFeatureTests(unittest.TestCase):
+    @requires_legacy_daemon
     def test_try_daemon_hits_forwards_explain_and_normalised_filters(self) -> None:
         hit = Hit(
             chunk_id=1,
@@ -613,7 +616,7 @@ class ModuleWeekFilterTests(unittest.TestCase):
 
     @unittest.skipUnless(_NEEDS_REAL_STORE, "numpy, sqlite-vec and FTS5 are required")
     def test_searcher_filters_and_hit_labels(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/tmp", prefix="seekr-mw-") as tmp:
+        with short_tempdir("seekr-mw-") as tmp:
             base = Path(tmp)
             root = base / "course"
             (root / "ml" / "week1").mkdir(parents=True)

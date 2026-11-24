@@ -9,11 +9,11 @@ import os
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 
+from _platform import short_tempdir
 from seekr.config import Config
 from seekr.embed import FakeEmbedder
 from seekr.indexer import Indexer
@@ -212,7 +212,7 @@ class McpProtocolTests(unittest.TestCase):
 class SubprocessMcpRoundtripTests(unittest.TestCase):
     def test_seekr_mcp_subprocess_stdio_search_roundtrip(self) -> None:
         src = Path(__file__).resolve().parents[1] / "src"
-        with tempfile.TemporaryDirectory(dir="/tmp", prefix="seekr-mcp-") as tmp:
+        with short_tempdir("seekr-mcp-") as tmp:
             base = Path(tmp)
             root = base / "repo"
             root.mkdir()
@@ -246,6 +246,8 @@ class SubprocessMcpRoundtripTests(unittest.TestCase):
             env["XDG_CONFIG_HOME"] = str(base / "config")
             env["XDG_DATA_HOME"] = str(base / "data")
             env["XDG_RUNTIME_DIR"] = str(base / "runtime")
+            # Windows and macOS do not read XDG_CONFIG_HOME.
+            env["SEEKR_CONFIG"] = str(cfg_dir / "config.toml")
             env["PYTHONPATH"] = os.pathsep.join(
                 [str(src), env.get("PYTHONPATH", "")]
             ).rstrip(os.pathsep)

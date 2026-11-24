@@ -58,8 +58,17 @@ class DaemonError(RuntimeError):
 
 
 def legacy_daemon_supported() -> bool:
-    """Return whether the deprecated Unix-socket daemon can exist here."""
-    return hasattr(socket, "AF_UNIX") and os.name == "posix"
+    """Return whether the deprecated Unix-socket daemon can exist here.
+
+    Clients refuse a daemon whose owner they cannot check, and they check it
+    with ``SO_PEERCRED``, which only Linux offers.  Elsewhere (macOS included)
+    the daemon would start but no client could use it.
+    """
+    return (
+        os.name == "posix"
+        and hasattr(socket, "AF_UNIX")
+        and hasattr(socket, "SO_PEERCRED")
+    )
 
 
 def socket_path() -> Path:

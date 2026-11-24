@@ -20,6 +20,7 @@ from typing import Any
 from unittest import mock
 
 from _cli_output import strip_ansi
+from _platform import requires_legacy_daemon
 from seekr import cli_daemon, cli_search, client, daemon
 from seekr.config import Config
 from seekr.embed import FakeEmbedder
@@ -214,6 +215,7 @@ def _request(sock_path: Path, payload: dict[str, Any], timeout: float = 2.0) -> 
         return _read_json(sock)
 
 
+@requires_legacy_daemon
 class ProtocolTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -485,6 +487,7 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(_request(sock_path, {"op": "ping"}), {"ok": True})
 
 
+@requires_legacy_daemon
 class PeerIdentityTests(unittest.TestCase):
     def test_same_uid_socketpair_credentials_are_accepted(self) -> None:
         left, right = socket.socketpair()
@@ -516,6 +519,7 @@ class PeerIdentityTests(unittest.TestCase):
         self.assertEqual(right.recv(1), b"")
 
 
+@requires_legacy_daemon
 class SocketLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -627,6 +631,7 @@ class SocketLifecycleTests(unittest.TestCase):
             )
 
 
+@requires_legacy_daemon
 class CliFastPathTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -792,6 +797,7 @@ class CliFastPathTests(unittest.TestCase):
         build_searcher.assert_not_called()
 
 
+@requires_legacy_daemon
 class DaemonRunnerTests(unittest.TestCase):
     def test_run_daemon_holds_the_shared_lock_for_store_and_watcher(self) -> None:
         events: list[object] = []
@@ -1047,6 +1053,7 @@ class DaemonCommandRegistrationTests(unittest.TestCase):
         self.assertIn("--debounce", output)
 
 
+@requires_legacy_daemon
 @unittest.skipUnless(
     _NEEDS_REAL_STORE, "numpy, sqlite-vec and FTS5 are required"
 )
@@ -1237,12 +1244,32 @@ class SocketPathLimitTests(unittest.TestCase):
         searcher.store.close.assert_called_once_with()
 
 
+class LegacyDaemonSupportTests(unittest.TestCase):
+    def test_daemon_is_unavailable_without_peer_credential_checks(self) -> None:
+        # macOS has AF_UNIX but no SO_PEERCRED: clients could never verify
+        # the daemon, so it must not start there.
+        with (
+            mock.patch.object(daemon, "socket", mock.Mock(spec=["AF_UNIX"])),
+            mock.patch.object(daemon.os, "name", "posix"),
+        ):
+            self.assertFalse(daemon.legacy_daemon_supported())
+
+    def test_daemon_is_available_with_unix_sockets_and_peer_credentials(self) -> None:
+        fake = mock.Mock(spec=["AF_UNIX", "SO_PEERCRED"])
+        with (
+            mock.patch.object(daemon, "socket", fake),
+            mock.patch.object(daemon.os, "name", "posix"),
+        ):
+            self.assertTrue(daemon.legacy_daemon_supported())
+
+
 class ModuleWeekDaemonTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
 
+    @requires_legacy_daemon
     def test_search_arguments_accept_module_and_week_range(self) -> None:
         args = daemon._search_arguments(
             {
@@ -1318,6 +1345,7 @@ class ModuleWeekDaemonTests(unittest.TestCase):
         self.assertEqual(searcher.calls[0]["module"], "ml")
         self.assertEqual(searcher.calls[0]["week_range"], (2, 3))
 
+    @requires_legacy_daemon
     def test_week_range_must_be_two_ints(self) -> None:
         searcher = _FakeSearcher()
         with _running_server(searcher, self.tmp) as (sock_path, *_):
@@ -1354,6 +1382,7 @@ class ModuleWeekDaemonTests(unittest.TestCase):
         unlabelled = _hit()
         self.assertEqual(client._hit_from_dict(daemon._hit_to_dict(unlabelled)), unlabelled)
 
+    @requires_legacy_daemon
     def test_daemon_hit_roundtrip_keeps_highlights(self) -> None:
         hit = Hit(
             chunk_id=42,

@@ -13,8 +13,10 @@ _SCRIPT = textwrap.dedent(
     import os
     import socket
 
-    del socket.AF_UNIX
-    del os.getuid
+    # Simulate a platform without Unix sockets (Windows already is one).
+    for module, name in ((socket, "AF_UNIX"), (socket, "SO_PEERCRED"), (os, "getuid")):
+        if hasattr(module, name):
+            delattr(module, name)
 
     import pytest  # noqa: F401  (only to prove the environment is intact)
 
@@ -117,7 +119,12 @@ def test_cli_imports_and_help_without_af_unix(tmp_path: Path) -> None:
         (tmp_path / name).mkdir()
         env[f"XDG_{name.upper()}_HOME"] = str(tmp_path / name)
     env["XDG_RUNTIME_DIR"] = str(tmp_path / "runtime")
-    env["HOME"] = str(tmp_path)
+    env["HOME"] = env["USERPROFILE"] = str(tmp_path)
+    # Windows and macOS ignore the XDG folders above; name the config and
+    # index explicitly so the subprocess never reads the real user's.
+    config_file = tmp_path / "config" / "config.toml"
+    config_file.write_text(f"db_path = '{tmp_path / 'data' / 'index.db'}'\n", encoding="utf-8")
+    env["SEEKR_CONFIG"] = str(config_file)
     result = subprocess.run(
         [sys.executable, "-c", _SCRIPT],
         env=env,
