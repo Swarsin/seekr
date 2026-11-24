@@ -2733,3 +2733,18 @@ def test_hit_dto_explain_only_when_present_and_json_safe() -> None:
     with running_server(backend) as (server, _):
         response = _post(server, "/api/search", {"query": "x", "explain": True})
         assert response.json()["hits"][0]["explain"] == {"vector_distance": 0.25}
+
+
+def test_relative_paths_and_keyword_rerank_are_rejected() -> None:
+    with running_server() as (server, backend):
+        for path, payload in (
+            ("/api/similar", {"path": "rel/a.md"}),
+            ("/api/index/paths", {"paths": ["/tmp/a", "rel/b"]}),
+            ("/api/search", {"query": "x", "mode": "keyword", "rerank": True}),
+        ):
+            response = _post(server, path, payload)
+            assert response.status == 400, path
+            assert response.json()["error"]["code"] == "invalid_request"
+        assert backend.calls == []
+        ok = _post(server, "/api/search", {"query": "x", "mode": "vector", "rerank": True})
+        assert ok.status == 200

@@ -2520,3 +2520,16 @@ def test_start_index_paths_validation_and_daemon_refusal(tmp_path: Path) -> None
         with pytest.raises(ApiError) as raised:
             service.start_index_paths([str(root)])
         assert _error_code(raised.value) == "daemon_active"
+
+
+def test_keyword_rerank_and_relative_paths_are_invalid_requests(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, roots=[_root(tmp_path)])
+    with _service(config_path, tmp_path) as service:
+        for call in (
+            lambda: service.search(SearchRequest("alpha", mode="keyword", rerank=True)),
+            lambda: service.similar(SimilarRequest(path="rel/a.md")),
+            lambda: service.start_index_paths(["rel"]),
+        ):
+            with pytest.raises(ApiError) as raised:
+                call()
+            assert _error_code(raised.value) == "invalid_request"

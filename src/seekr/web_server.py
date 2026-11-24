@@ -15,6 +15,7 @@ import hmac
 import importlib.resources
 import json
 import logging
+import os
 import re
 import secrets
 import signal
@@ -314,6 +315,8 @@ def _validate_search(body: dict[str, Any]) -> SearchRequest:
     spread = _optional_bool(body, "spread", default=False)
     rerank = _optional_bool(body, "rerank", default=False)
     explain = _optional_bool(body, "explain", default=False)
+    if rerank and mode == "keyword":
+        raise _invalid("rerank is not available for keyword mode", field="rerank")
     return SearchRequest(
         query=query,
         mode=mode,  # type: ignore[arg-type]
@@ -336,6 +339,8 @@ def _validate_similar(body: dict[str, Any]) -> SimilarRequest:
         {"path", "k", "per_file", "path_prefix", "kind", "since", "module", "week"},
     )
     path = _require_string(body, "path")
+    if not os.path.isabs(path):
+        raise _invalid("path must be an absolute path", field="path")
     k = _optional_int(body, "k", 10, LIMITS["k_min"], LIMITS["k_max"])
     per_file = _optional_int(
         body, "per_file", 1, LIMITS["per_file_min"], LIMITS["per_file_max"]
@@ -370,6 +375,8 @@ def _validate_index_paths(body: dict[str, Any]) -> list[str]:
                 f"each path must be at most {LIMITS['root_path_bytes']} bytes",
                 field="paths",
             )
+        if not os.path.isabs(item):
+            raise _invalid("each path must be an absolute path", field="paths")
         paths.append(item)
     return paths
 

@@ -1687,6 +1687,13 @@ class WebService:
                     f"{flag} must be a boolean",
                     {flag: f"{flag} must be a boolean"},
                 )
+        if request.rerank and request.mode == "keyword":
+            raise ApiError(
+                400,
+                "invalid_request",
+                "rerank is not available for keyword mode",
+                {"rerank": "rerank is not available for keyword mode"},
+            )
         cfg = self._load_config()
 
         empty_spread: list[object] | None = [] if request.spread else None
@@ -1759,10 +1766,10 @@ class WebService:
     def similar(self, request: SimilarRequest) -> SearchResult:
         self._reject_if_shutting_down()
         started = time.monotonic()
-        if type(request.path) is not str or not request.path.strip():
+        if type(request.path) is not str or not os.path.isabs(request.path):
             raise ApiError(
-                400, "invalid_request", "path must be a non-empty string",
-                {"path": "path must be a non-empty string"},
+                400, "invalid_request", "path must be an absolute path",
+                {"path": "path must be an absolute path"},
             )
         for name, low, high in (
             ("k", LIMITS["k_min"], LIMITS["k_max"]),
@@ -1926,9 +1933,10 @@ class WebService:
             if type(raw) is not str or not raw.strip():
                 message = "each path must be a non-empty string"
                 raise ApiError(400, "invalid_request", message, {"paths": message})
-            target = Path(raw).expanduser()
-            if not target.is_absolute():
-                target = Path.cwd() / target
+            if not os.path.isabs(raw):
+                message = "each path must be an absolute path"
+                raise ApiError(400, "invalid_request", message, {"paths": message})
+            target = Path(raw)
             if not target.exists():
                 message = f"path does not exist: {raw}"
                 raise ApiError(400, "invalid_request", message, {"paths": message})
