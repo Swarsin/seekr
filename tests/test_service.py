@@ -832,3 +832,106 @@ def test_watcher_roots_failure_is_logged_with_the_error(
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert any("inotify watch limit reached" in r.getMessage() for r in warnings)
+
+
+_LEGACY_REFUSAL = (
+    "a seekr daemon from an older version is still running; stop it first "
+    "(seekr daemon is replaced by seekr service)"
+)
+
+
+def _fake_legacy_daemon(monkeypatch, *, live: bool) -> None:
+    from seekr import daemon
+
+    monkeypatch.setattr(daemon, "legacy_daemon_supported", lambda: True)
+    monkeypatch.setattr(daemon, "socket_path", lambda: Path("/nonexistent/seekr.sock"))
+    monkeypatch.setattr(daemon, "_socket_is_active", lambda _path: live)
+
+
+class _NoServe:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+
+    def start(self) -> int:
+        return 4321
+
+    def serve_forever(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize("argv", [["service", "start"], ["daemon"]])
+def test_start_refuses_while_an_older_daemon_is_live(env, monkeypatch, argv) -> None:
+    from typer.testing import CliRunner
+
+    from seekr import cli_service
+    from seekr.cli import app
+
+    _fake_legacy_daemon(monkeypatch, live=True)
+    monkeypatch.setattr(
+        cli_service, "_create_service", lambda **_k: pytest.fail("service was started")
+    )
+
+    result = CliRunner().invoke(app, argv)
+
+    assert result.exit_code == 1
+    assert f"seekr service: {_LEGACY_REFUSAL}" in result.output
+
+
+@pytest.mark.parametrize("argv", [["service", "start"], ["daemon"]])
+def test_start_proceeds_without_a_live_older_daemon(env, monkeypatch, argv) -> None:
+    from typer.testing import CliRunner
+
+    from seekr import cli_service
+    from seekr.cli import app
+
+    _fake_legacy_daemon(monkeypatch, live=False)
+    monkeypatch.setattr(cli_service, "_create_service", _NoServe)
+
+    result = CliRunner().invoke(app, argv)
+
+    assert result.exit_code == 0, result.output
+    assert "Seekr service: http://127.0.0.1:4321" in result.output
+
+
+def test_start_ignores_the_legacy_probe_where_unsupported(env, monkeypatch) -> None:
+    from typer.testing import CliRunner
+
+    from seekr import cli_service, daemon
+    from seekr.cli import app
+
+    monkeypatch.setattr(daemon, "legacy_daemon_supported", lambda: False)
+    monkeypatch.setattr(
+        daemon, "_socket_is_active", lambda _p: pytest.fail("probed an unsupported socket")
+    )
+    monkeypatch.setattr(cli_service, "_create_service", _NoServe)
+
+    result = CliRunner().invoke(app, ["service", "start"])
+
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.skipif(not hasattr(__import__("socket"), "SO_PEERCRED"), reason="Linux only")
+def test_start_detects_a_real_listening_daemon_socket(env, monkeypatch) -> None:
+    import socket as socket_module
+
+    from typer.testing import CliRunner
+
+    from seekr import cli_service
+    from seekr.cli import app
+
+    runtime = env / "run"
+    runtime.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    monkeypatch.setattr(
+        cli_service, "_create_service", lambda **_k: pytest.fail("service was started")
+    )
+    listener = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
+    try:
+        listener.bind(str(runtime / "seekr.sock"))
+        listener.listen(1)
+        result = CliRunner().invoke(app, ["service", "start"])
+    finally:
+        listener.close()
+
+    assert result.exit_code == 1
+    assert _LEGACY_REFUSAL in result.output

@@ -17,6 +17,26 @@ if TYPE_CHECKING:
 __all__ = ["register"]
 
 _STOP_WAIT_SECONDS = 10.0
+_LEGACY_DAEMON_RUNNING = (
+    "a seekr daemon from an older version is still running; stop it first "
+    "(seekr daemon is replaced by seekr service)"
+)
+
+
+def _legacy_daemon_running() -> bool:
+    """Return whether a pre-0.3 ``seekr daemon`` answers on its Unix socket.
+
+    The service never creates that socket, so the deprecated ``seekr daemon``
+    alias (which runs the service) cannot trip over its own check.
+    """
+    from .daemon import _socket_is_active, legacy_daemon_supported, socket_path
+
+    if not legacy_daemon_supported():
+        return False
+    try:
+        return _socket_is_active(socket_path())
+    except OSError:
+        return False
 
 
 def _create_service(**kwargs: Any) -> Any:
@@ -60,6 +80,10 @@ def _build_start(typer_module: Any) -> Any:
         if not 0 <= port <= 65535:
             typer_module.echo("seekr service: --port must be between 0 and 65535", err=True)
             raise typer_module.Exit(code=2)
+        if _legacy_daemon_running():
+            # It would keep writing the index with old code beside the service.
+            typer_module.echo(f"seekr service: {_LEGACY_DAEMON_RUNNING}", err=True)
+            raise typer_module.Exit(code=1)
         service = _create_service(
             port=port,
             model_dir=model_dir,
