@@ -53,13 +53,14 @@ def _run_server(
 
 _START_WAIT_SECONDS = 10.0
 _POLL_SECONDS = 0.1
+_PROBE_SECONDS = 1.0
 
 
 def _find_service() -> Any:
     """Return the live service's discovery record, or None (patchable)."""
     from .service import find_running_service
 
-    return find_running_service()
+    return find_running_service(timeout=_PROBE_SECONDS)
 
 
 def _spawn_kwargs(platform: str | None = None) -> dict[str, Any]:
@@ -93,8 +94,10 @@ def _wait_for_service(proc: Any, timeout: float = _START_WAIT_SECONDS) -> Any:
         if info is not None:
             return info
         exited = getattr(proc, "poll", lambda: None)() is not None
-        if exited or time.monotonic() >= deadline:
+        if exited:
             return _find_service()
+        if time.monotonic() >= deadline:
+            return None
         time.sleep(_POLL_SECONDS)
 
 
@@ -119,8 +122,8 @@ def _run_background(typer_module: Any, port: int, open_browser: bool) -> None:
         if info is None:
             typer_module.echo(
                 "seekr web: the background service did not start within "
-                f"{int(_START_WAIT_SECONDS)} s; run `seekr service start` "
-                "to see the error.",
+                f"{int(_START_WAIT_SECONDS)} s; run "
+                f"`seekr service start --port {port}` to see the error.",
                 err=True,
             )
             raise typer_module.Exit(code=1)

@@ -114,18 +114,16 @@ def start_prewarm(embedder: Embedder, stop_event: threading.Event) -> threading.
     return thread
 
 
-def _answers(info: ServiceInfo) -> bool:
-    return service_answers(info, timeout=_LIVENESS_TIMEOUT)
-
-
-def find_running_service(path: Path | None = None) -> ServiceInfo | None:
+def find_running_service(
+    path: Path | None = None, *, timeout: float = _LIVENESS_TIMEOUT
+) -> ServiceInfo | None:
     """Return the discovery record of a live service that answers, or None.
 
     A service that has begun shutting down refuses ``/api/status`` and so
     counts as not running.
     """
     info = read_service_info(path or paths.service_file())
-    if info is None or not _answers(info):
+    if info is None or not service_answers(info, timeout=timeout):
         return None
     return info
 

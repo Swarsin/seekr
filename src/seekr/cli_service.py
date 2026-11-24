@@ -126,7 +126,7 @@ def _build_status(typer_module: Any) -> Any:
 
         # Probing the API (not just the pid) rejects stale files whose pid was
         # reused and services that are already stopping.
-        info = find_running_service()
+        info = find_running_service(timeout=1.0)
         if info is None:
             typer_module.echo("seekr service: not running")
             return

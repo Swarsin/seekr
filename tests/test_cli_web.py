@@ -401,7 +401,7 @@ def test_background_failure_exits_nonzero_with_hint(
     result = _invoke(["web"])
 
     assert result.exit_code == 1
-    assert "seekr service start" in result.output
+    assert "seekr service start --port 8000" in result.output
 
 
 def test_background_timeout_exits_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -473,3 +473,14 @@ def test_background_invalid_port_rejected(monkeypatch: pytest.MonkeyPatch) -> No
     result = _invoke(["web", "--port", "70000"])
 
     assert result.exit_code == 2
+
+
+def test_wait_honours_deadline_without_extra_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probes: list[int] = []
+    monkeypatch.setattr(cli_web, "_find_service", lambda: probes.append(1))
+    monkeypatch.setattr(cli_web, "_POLL_SECONDS", 0.0)
+
+    assert cli_web._wait_for_service(FakeProc(), timeout=0.0) is None
+    assert len(probes) == 1

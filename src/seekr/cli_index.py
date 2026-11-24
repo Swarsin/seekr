@@ -307,7 +307,7 @@ def _service_status() -> dict[str, Any]:
     try:
         from .service import find_running_service
 
-        info = find_running_service()
+        info = find_running_service(timeout=1.0)
     except Exception:  # noqa: BLE001 - status must never fail on discovery
         info = None
     if info is None:
@@ -338,16 +338,21 @@ def _resolve_root(root: Path) -> Path:
 
 
 def _polled_watch_info(
-    daemon_running: bool, sock: Path, cfg: Config
+    daemon_running: bool,
+    sock: Path,
+    cfg: Config,
+    service_running: bool = False,
 ) -> tuple[list[Path], int]:
-    if not daemon_running:
+    if not daemon_running and not service_running:
         return [], cfg.poll_interval_seconds
-    from .client import DaemonError, try_daemon_status
+    payload = None
+    if daemon_running:
+        from .client import DaemonError, try_daemon_status
 
-    try:
-        payload = try_daemon_status(sock_path=sock, timeout=0.5)
-    except DaemonError:
-        payload = None
+        try:
+            payload = try_daemon_status(sock_path=sock, timeout=0.5)
+        except DaemonError:
+            payload = None
 
     if payload is not None and "polled_roots" in payload:
         raw_roots = payload["polled_roots"]
@@ -381,7 +386,9 @@ def _echo_daemon_status(
     daemon_running: bool, sock: Path, cfg: Config, service: dict[str, Any]
 ) -> None:
     typer.echo(_format_service_status(service))
-    polled_roots, poll_interval = _polled_watch_info(daemon_running, sock, cfg)
+    polled_roots, poll_interval = _polled_watch_info(
+        daemon_running, sock, cfg, bool(service.get("running"))
+    )
     for root in polled_roots:
         typer.echo(f"watch: {root} (polling every {poll_interval}s)")
 

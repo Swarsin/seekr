@@ -308,6 +308,55 @@ class PolishedStatusTests(unittest.TestCase):
             ],
         )
 
+    def test_status_prints_polled_roots_when_service_running(self) -> None:
+        from typer.testing import CliRunner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fast_root = base / "repo"
+            fast_root.mkdir()
+            slow_root = Path("/mnt/c/Users/alice/notes")
+            cfg = Config(
+                roots=(fast_root, slow_root),
+                db_path=base / "missing.db",
+                embed_model="fake",
+                poll_interval_seconds=25,
+            )
+            mounts = [
+                Mount(source="/dev/sdc", mount_point="/", fstype="ext4"),
+                Mount(source="C:\\", mount_point="/mnt/c", fstype="9p"),
+            ]
+            service = {"running": True, "port": 8000, "pid": 7, "version": "1"}
+            with (
+                mock.patch("seekr.cli_index._load_config", return_value=cfg),
+                mock.patch(
+                    "seekr.cli_index._daemon_status",
+                    return_value=(False, base / "seekr.sock"),
+                ),
+                mock.patch("seekr.cli_index._service_status", return_value=service),
+                mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
+            ):
+                running = CliRunner().invoke(app, ["status"])
+            with (
+                mock.patch("seekr.cli_index._load_config", return_value=cfg),
+                mock.patch(
+                    "seekr.cli_index._daemon_status",
+                    return_value=(False, base / "seekr.sock"),
+                ),
+                mock.patch(
+                    "seekr.cli_index._service_status",
+                    return_value={"running": False},
+                ),
+                mock.patch("seekr.platform_info.read_mounts", return_value=mounts),
+            ):
+                stopped = CliRunner().invoke(app, ["status"])
+
+        self.assertEqual(running.exit_code, 0, running.output)
+        self.assertIn("service: running at 127.0.0.1:8000", running.output)
+        self.assertIn(f"watch: {slow_root} (polling every 25s)", running.output)
+        self.assertNotIn(f"watch: {fast_root}", running.output)
+        self.assertNotIn("watch:", stopped.output)
+
     def test_status_prints_polled_roots_when_daemon_running(self) -> None:
         from typer.testing import CliRunner
 

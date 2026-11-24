@@ -48,9 +48,9 @@ To add a folder:
 3. The page shows the saved path. New paths are canonical absolute paths: `~` is expanded and symbolic links are resolved. Existing entries are shown as stored, so an older `~/notes` entry stays `~/notes`.
 4. Saving only changes your settings. It does not read, change, delete, or index files. Choose **Update index** afterwards.
 
-To remove a folder, open the **Folders** tab and choose **Remove** next to the folder path. Removing a folder updates `config.toml` and purges that folder’s indexed documents from Seekr’s local database without touching any source files on disk. If a `seekr daemon` is running, folder removal is refused until you stop the daemon so they do not race on the database.
+To remove a folder, open the **Folders** tab and choose **Remove** next to the folder path. Removing a folder updates `config.toml` and purges that folder’s indexed documents from Seekr’s local database without touching any source files on disk. Removal runs through the background service, so it does not race with the watcher.
 
-The limits are 50 folders and 4,096 UTF-8 bytes per submitted path. If a `seekr daemon` is running, adding a folder succeeds but warns that the daemon must be restarted before daemon-backed searches see it; see [If a background daemon is running](#if-a-background-daemon-is-running).
+The limits are 50 folders and 4,096 UTF-8 bytes per submitted path. The service picks up added folders automatically; see [The background service](#the-background-service).
 
 ## Make the local model available
 
@@ -144,13 +144,16 @@ When not typing inside a text field or dropdown:
 
 If nothing is indexed, a search returns no hits; **Index status** explains whether the index is missing or empty, so add a folder and choose **Update index**. If the index is ready but nothing matches, the page says **No passages match** and suggests clearing filters and trying different words or a match mode. An incompatible index, an unreadable index, or an invalid settings file shows an error with the next step.
 
-## If a background daemon is running
+## The background service
 
-`seekr daemon` is deprecated and now runs `seekr service start` in the foreground. This section describes the older standalone daemon that a foreground `seekr web --foreground` page may coexist with. `seekr daemon` is optional. It watches configured folders, maintains the index, and keeps a model warm. The page only probes whether the daemon socket is live; it never starts, stops, or reconfigures the daemon. When the daemon is present, **Background service** shows **Running** and **Update index** is disabled with an explanation. The page never claims to detect live daemon indexing activity; socket presence is the only signal.
+The web interface is served by the Seekr service, one background process that also watches your folders, keeps the index current, and keeps the model warm for the CLI and MCP server. `seekr web` reuses a running service or starts one and waits up to 10 seconds for it; the CLI and MCP server find it automatically and fall back to local search when it is stopped.
 
-To update from the page or remove a folder, stop the daemon first: press Ctrl+C in its terminal, or run `systemctl --user stop seekr.service` if you installed the [`contrib/seekr.service`](../contrib/seekr.service) systemd user unit. Then choose **Refresh**; **Update index** and **Remove** become available. Adding a folder while the daemon runs succeeds but warns that the daemon needs a restart; restart `seekr daemon` (or the systemd unit) so it sees the new folder for daemon-backed searches. The page never restarts it. If the daemon is reachable but fails a search, the page shows an error and suggests restarting it or stopping it so the page searches the local index directly. See [What it does](../README.md#what-it-does).
+- `seekr service status` shows the service's pid, port, version, and uptime; `seekr status` also prints a one-line `service:` summary.
+- `seekr service stop` asks it to stop and waits for it to exit. Closing the browser tab does not stop it.
+- `seekr service start` runs it in the terminal (Ctrl+C stops it), which is also how to see start-up errors.
+- To run it at login, install the [`contrib/seekr.service`](../contrib/seekr.service) systemd user unit, which runs `seekr service start`; stop it with `systemctl --user stop seekr.service`.
 
-When a daemon answers searches, the **Local model** indicator still describes this web process; the daemon may use its own warm model.
+Index updates from the page and folder changes go through the service, so they never race with its watcher. `seekr daemon` is a deprecated alias for `seekr service start` and will be removed in 0.4.0. See [What it does](../README.md#what-it-does).
 
 ## Settings file
 
@@ -183,12 +186,12 @@ Removing a folder with **Remove** updates `config.toml` and removes indexed entr
 
 - **Port 8000 is already in use** — use `seekr web --port 8001`, or `seekr web --port 0` and open the actual printed address.
 - **Local model is Unavailable** — choose **Download search model (about 130 MB) — the only time seekr uses the internet** in the setup panel, or run `seekr models pull --grammars` (see [Make the local model available](#make-the-local-model-available)), then choose **Check model** again. Exact-words search still works. `seekr doctor` (and `seekr models status`) checks whether your configured models, code grammars, roots, and SQLite environment are ready locally.
-- **Index says Needs rebuilding** — stop any daemon, make the configured model available, and run `seekr reindex` in a terminal. The page leaves the old index untouched.
-- **Index says Can’t be read** — the page cannot repair it. Run `seekr doctor` to rule out SQLite/FTS5/sqlite-vec problems; if the database file is damaged, stop any daemon and rebuild from a terminal with `seekr reindex`. Search and index updates cannot use the old index until it is fixed.
+- **Index says Needs rebuilding** — stop the service (`seekr service stop`), make the configured model available, and run `seekr reindex` in a terminal. The page leaves the old index untouched.
+- **Index says Can’t be read** — the page cannot repair it. Run `seekr doctor` to rule out SQLite/FTS5/sqlite-vec problems; if the database file is damaged, stop the service and rebuild from a terminal with `seekr reindex`. Search and index updates cannot use the old index until it is fixed.
 - **Settings file says Can’t be read** — open the path shown, fix the TOML by hand, and choose **Refresh**. If the file has table headers but no `roots` key, add a top-level `roots = [...]` above the first table header. For other unsupported layouts, correct the existing `roots` expression by hand.
 - **Seekr is busy** — only one local model/index operation runs at a time; there is no queue. Wait, or use **Exact words**, which keeps working during an index update. Retry if an exact-words search is briefly busy.
 - **Seekr isn’t responding / Reconnect** — check that `seekr web` is still running. Restart it and open the printed address; if the port changed, use the new address. Reloading during an index job recovers it while the server is alive.
-- **Update index or Remove is disabled / rejected because Background service is Running** — stop `seekr daemon` (or its systemd unit), choose **Refresh**, then update or remove. Restart the daemon after adding a folder.
+- **Update index or Remove is disabled** — another index job is running, or a standalone `seekr reindex` holds the index. Wait, choose **Refresh**, then retry.
 - **The browser did not open** — `--open-browser` failed or no browser is available; the server is still running. Open the printed URL manually.
 - **The page or assets return 404** — the installed package may be missing its `web_assets` files, a packaging problem rather than a settings problem. Reinstall a build that includes them, or run `seekr web` from the source checkout’s environment. Unknown paths also return 404 by design.
 - **The address returns 403** — use the exact `127.0.0.1` address printed by `seekr web`; `localhost` and other origins are rejected. For `curl`, send a matching `Origin` or an allowed `Sec-Fetch-Site`.
