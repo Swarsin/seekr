@@ -21,6 +21,7 @@ from seekr.config import Config, ConfigError, load_config
 from seekr.embed import FakeEmbedder
 from seekr.indexer import Indexer
 from seekr.logging_config import LOGGER_NAME, configure_logging, log_event
+from seekr.opener import Argv
 from seekr.search import Searcher
 from seekr.store import Store
 
@@ -198,8 +199,8 @@ class ActionableErrorTests(unittest.TestCase):
 
             with (
                 mock.patch("seekr.cli_open.parse_pick_line", return_value=("/tmp/a.md", "L1")),
-                mock.patch("seekr.cli_open.open_command", return_value=["definitely-missing-bin", "/tmp/a.md"]),
-                mock.patch("seekr.cli_open.subprocess.run", side_effect=FileNotFoundError),
+                mock.patch("seekr.cli_open.open_target", return_value=Argv(["definitely-missing-bin", "/tmp/a.md"])),
+                mock.patch("seekr.opener.subprocess.run", side_effect=FileNotFoundError),
             ):
                 missing_exe = runner.invoke(app, ["open", "/tmp/a.md:L1"])
             self.assertEqual(missing_exe.exit_code, 1)

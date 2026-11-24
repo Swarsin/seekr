@@ -10,19 +10,29 @@ are sanitised and bounded.
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
+import subprocess
+import sys
 import unicodedata
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 from .models import Hit
 
 __all__ = [
     "OPEN_SUCCESS_CODES",
+    "Argv",
+    "OpenAction",
+    "OpenFailed",
+    "StartFile",
     "format_pick_line",
     "open_command",
+    "open_target",
     "parse_pick_line",
+    "run_open",
 ]
 
 OPEN_SUCCESS_CODES: dict[str, frozenset[int]] = {"explorer.exe": frozenset({0, 1})}
@@ -335,3 +345,71 @@ def open_command(
             return [*_editor_argv(env), f"+{line}", safe_path]
 
     return ["xdg-open", safe_path]
+
+
+@dataclass(frozen=True)
+class Argv:
+    """Run *argv* directly (never through a shell)."""
+
+    argv: list[str]
+
+
+@dataclass(frozen=True)
+class StartFile:
+    """Open *path* with the Windows file association."""
+
+    path: str
+
+
+OpenAction = Argv | StartFile
+
+
+class OpenFailed(Exception):
+    """The opener ran but exited with an unsuccessful status."""
+
+    def __init__(self, program: str, returncode: int) -> None:
+        super().__init__(f"opener {program!r} exited with status {returncode}")
+        self.program = program
+        self.returncode = returncode
+
+
+def open_target(
+    path: str,
+    locator: str,
+    kind: str,
+    *,
+    env: Mapping[str, str],
+    which: Callable[[str], str | None],
+    platform: str = sys.platform,
+    wsl: bool = False,
+    to_windows: Callable[[str], str | None] | None = None,
+) -> OpenAction:
+    """Choose how to open *path* on the current platform.
+
+    Windows and macOS use the native opener and ignore *locator* and *kind*;
+    Linux and WSL keep the :func:`open_command` behaviour.
+    """
+    if platform == "win32":
+        return StartFile(path)
+    if platform == "darwin":
+        return Argv(["open", _safe_argv_path(path)])
+    return Argv(
+        open_command(path, locator, kind, env, which, wsl=wsl, to_windows=to_windows)
+    )
+
+
+def run_open(action: OpenAction) -> None:
+    """Execute *action*.
+
+    Raises :class:`OpenFailed` on an unsuccessful exit status; ``OSError`` and
+    ``ValueError`` from launching propagate to the caller.
+    """
+    if isinstance(action, StartFile):
+        getattr(os, "startfile")(action.path)  # noqa: B009 - Windows only
+        return
+    result = subprocess.run(action.argv, check=False)
+    success_codes = OPEN_SUCCESS_CODES.get(
+        Path(action.argv[0]).name.lower(), frozenset({0})
+    )
+    if result.returncode not in success_codes:
+        raise OpenFailed(action.argv[0], result.returncode)

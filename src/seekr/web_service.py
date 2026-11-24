@@ -1395,7 +1395,7 @@ class WebService:
             doc.close()
 
     def open_chunk(self, chunk_id: int) -> None:
-        from .opener import OPEN_SUCCESS_CODES, open_command
+        from .opener import Argv, OpenFailed, open_target, run_open
 
         row = self._fetch_chunk(chunk_id)
         is_wsl = platform_info.is_wsl()
@@ -1407,42 +1407,35 @@ class WebService:
             ) or platform_info.wslpath_windows(path_value)
 
         try:
-            argv = open_command(
+            action = open_target(
                 str(row.path),
                 str(row.locator),
                 str(row.kind),
-                os.environ,
-                shutil.which,
+                env=os.environ,
+                which=shutil.which,
                 wsl=is_wsl,
                 to_windows=to_windows,
             )
         except ValueError as exc:
             raise ApiError(500, "internal_error", _safe_message(exc)) from exc
 
+        name = action.argv[0] if isinstance(action, Argv) else "startfile"
         try:
-            result = subprocess.run(argv, check=False)
+            run_open(action)
         except FileNotFoundError as exc:
             raise ApiError(
                 500,
                 "internal_error",
-                f"cannot run {argv[0]!r}: executable not found",
+                f"cannot run {name!r}: executable not found",
             ) from exc
+        except OpenFailed as exc:
+            raise ApiError(500, "internal_error", str(exc)) from exc
         except (OSError, ValueError) as exc:
             raise ApiError(
                 500,
                 "internal_error",
-                f"cannot run {argv[0]!r}: {_safe_message(exc)}",
+                f"cannot run {name!r}: {_safe_message(exc)}",
             ) from exc
-
-        success_codes = OPEN_SUCCESS_CODES.get(
-            Path(argv[0]).name.lower(), frozenset({0})
-        )
-        if result.returncode not in success_codes:
-            raise ApiError(
-                500,
-                "internal_error",
-                f"opener {argv[0]!r} exited with status {result.returncode}",
-            )
 
     # -- search ------------------------------------------------------------
 

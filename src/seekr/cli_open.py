@@ -3,7 +3,7 @@
 ``pick`` deliberately reuses :func:`seekr.cli_search.get_hits`, the same query
 entry point as ``seekr search``, so the daemon fast path there serves
 both commands without another code path.  ``open`` executes the
-argv from :func:`seekr.opener.open_command` directly, never through a shell.
+action from :func:`seekr.opener.open_target` directly, never through a shell.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
-import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
@@ -20,7 +19,14 @@ from .cli_search import SearchError, get_hits
 from .client import DaemonError
 from .extract import kind_for
 from .lifecycle import LifecycleError
-from .opener import OPEN_SUCCESS_CODES, format_pick_line, open_command, parse_pick_line
+from .opener import (
+    Argv,
+    OpenFailed,
+    format_pick_line,
+    open_target,
+    parse_pick_line,
+    run_open,
+)
 from .store import ModelMismatchError, SchemaVersionError
 
 if TYPE_CHECKING:
@@ -124,7 +130,7 @@ def _build_pick_command(typer_module: Any) -> Any:
 
 
 def _build_open_command(typer_module: Any) -> Any:
-    def open_target(
+    def open_command(
         target: str = typer_module.Argument(
             ..., metavar="TARGET", help="A pick line or an unambiguous path:locator."
         ),
@@ -140,35 +146,33 @@ def _build_open_command(typer_module: Any) -> Any:
             ) or platform_info.wslpath_windows(p)
 
         try:
-            argv = open_command(
+            action = open_target(
                 path,
                 locator,
                 kind,
-                os.environ,
-                shutil.which,
+                env=os.environ,
+                which=shutil.which,
                 wsl=is_wsl,
                 to_windows=to_windows,
             )
         except ValueError as exc:
             _exit_error("open", str(exc), typer_module)
+        name = action.argv[0] if isinstance(action, Argv) else "startfile"
         try:
-            result = subprocess.run(argv, check=False)
+            run_open(action)
         except FileNotFoundError:
             _exit_error(
                 "open",
-                f"cannot run {argv[0]!r}: executable not found; install it or set $EDITOR / $SEEKR_OPENER",
+                f"cannot run {name!r}: executable not found; install it or set $EDITOR / $SEEKR_OPENER",
                 typer_module,
             )
         except (OSError, ValueError) as exc:
-            _exit_error("open", f"cannot run {argv[0]!r}: {exc}", typer_module)
-        success_codes = OPEN_SUCCESS_CODES.get(
-            Path(argv[0]).name.lower(), frozenset({0})
-        )
-        if result.returncode not in success_codes:
-            raise typer_module.Exit(code=result.returncode)
+            _exit_error("open", f"cannot run {name!r}: {exc}", typer_module)
+        except OpenFailed as exc:
+            raise typer_module.Exit(code=exc.returncode) from exc
 
-    open_target.__doc__ = "Open a result at its page, line or Markdown heading."
-    return open_target
+    open_command.__doc__ = "Open a result at its page, line or Markdown heading."
+    return open_command
 
 
 def register(app: typer.Typer) -> None:
