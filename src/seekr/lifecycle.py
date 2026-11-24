@@ -287,6 +287,26 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+# Windows refuses to replace a file another process has open (antivirus,
+# indexers, a non-cooperating reader); such locks are usually brief.
+_REPLACE_RETRIES = 10
+_REPLACE_RETRY_DELAY = 0.1
+_sleep = time.sleep
+
+
+def _replace_with_retry(temp_path: Path, live_path: Path) -> None:
+    for attempt in range(_REPLACE_RETRIES + 1):
+        try:
+            os.replace(str(temp_path), str(live_path))
+            return
+        except PermissionError as exc:
+            if attempt == _REPLACE_RETRIES:
+                raise RebuildError(
+                    "index is in use; close other seekr windows and retry"
+                ) from exc
+            _sleep(_REPLACE_RETRY_DELAY)
+
+
 def _replace_database(temp_path: Path, live_path: Path) -> None:
     _checkpoint_database(temp_path)
     if live_path.exists():
@@ -297,7 +317,7 @@ def _replace_database(temp_path: Path, live_path: Path) -> None:
         _checkpoint_database(live_path, allow_invalid=True)
     _fsync_file(temp_path)
     try:
-        os.replace(str(temp_path), str(live_path))
+        _replace_with_retry(temp_path, live_path)
     except OSError as exc:
         raise RebuildError(
             f"cannot atomically replace live index {live_path}: {_error_text(exc)}"

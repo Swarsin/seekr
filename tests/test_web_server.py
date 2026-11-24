@@ -809,6 +809,56 @@ def test_model_check_and_index_start_return_202() -> None:
         assert index.json() == {"job_id": backend.start_index_job_id}
 
 
+def test_reindex_start_returns_202_with_flags_and_needs_token() -> None:
+    with running_server() as (server, backend):
+        token = fetch_token(server)
+        default = request(
+            server, "POST", "/api/reindex", headers=json_headers(token), body=b"{}"
+        )
+        assert default.status == 202
+        assert default.json() == {"job_id": backend.start_reindex_job_id}
+        assert backend.calls[-1] == ("start_reindex", {"force": False, "allow_empty": False})
+        job = request(
+            server,
+            "GET",
+            f"/api/jobs/{backend.start_reindex_job_id}",
+            headers={"X-Seekr-Token": token},
+        )
+        assert job.json()["operation"] == "index"
+
+        flagged = request(
+            server,
+            "POST",
+            "/api/reindex",
+            headers=json_headers(token),
+            body=json.dumps({"force": True, "allow_empty": True}).encode(),
+        )
+        assert flagged.status == 202
+        assert backend.calls[-1] == ("start_reindex", {"force": True, "allow_empty": True})
+
+        for payload in ({"force": "yes"}, {"extra": 1}):
+            bad = request(
+                server,
+                "POST",
+                "/api/reindex",
+                headers=json_headers(token),
+                body=json.dumps(payload).encode(),
+            )
+            assert bad.status == 400, payload
+            assert bad.json()["error"]["code"] == "invalid_request"
+
+        calls = len(backend.calls)
+        no_token = request(
+            server,
+            "POST",
+            "/api/reindex",
+            headers={"Content-Type": "application/json"},
+            body=b"{}",
+        )
+        assert no_token.status == 403
+        assert len(backend.calls) == calls
+
+
 def test_job_endpoint_and_not_found() -> None:
     jobs = {
         job.job_id: job

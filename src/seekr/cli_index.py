@@ -184,6 +184,25 @@ def _with_path_errors(
     return merged
 
 
+def _wait_for_job(client: ServiceClient, job_id: str, activity: str) -> dict[str, Any]:
+    """Poll a service job until it ends; return its report or raise."""
+    while True:
+        time.sleep(_JOB_POLL_SECONDS)
+        try:
+            job = client.job(job_id)
+        except ServiceUnavailable as exc:
+            raise ServiceError(
+                f"lost contact with the seekr service while {activity}: {exc}"
+            ) from exc
+        state = job.get("state")
+        if state == "running":
+            continue
+        report = job.get("report")
+        if state in ("succeeded", "partial") and isinstance(report, dict):
+            return report
+        raise ServiceError(str(job.get("error") or f"index job ended in state {state!r}"))
+
+
 def _index_via_service(client: ServiceClient, paths: list[Path] | None) -> dict[str, Any]:
     """Run an index job in the service and return its report.
 
@@ -199,21 +218,15 @@ def _index_via_service(client: ServiceClient, paths: list[Path] | None) -> dict[
         job_id = client.index_paths(usable)
     else:
         job_id = client.index_roots()
-    while True:
-        time.sleep(_JOB_POLL_SECONDS)
-        try:
-            job = client.job(job_id)
-        except ServiceUnavailable as exc:
-            raise ServiceError(
-                f"lost contact with the seekr service while indexing: {exc}"
-            ) from exc
-        state = job.get("state")
-        if state == "running":
-            continue
-        report = job.get("report")
-        if state in ("succeeded", "partial") and isinstance(report, dict):
-            return _with_path_errors(report, path_errors)
-        raise ServiceError(str(job.get("error") or f"index job ended in state {state!r}"))
+    return _with_path_errors(_wait_for_job(client, job_id, "indexing"), path_errors)
+
+
+def _reindex_via_service(
+    client: ServiceClient, *, force: bool, allow_empty: bool
+) -> dict[str, Any]:
+    """Run a reindex job in the service (same fallback rules as indexing)."""
+    job_id = client.reindex(force=force, allow_empty=allow_empty)
+    return _wait_for_job(client, job_id, "reindexing")
 
 
 def index(
@@ -275,12 +288,24 @@ def reindex(
     """Rebuild the index in a fresh sibling database and swap it in safely.
 
     Per-file indexing errors and empty rebuilds are refused unless the matching
-    override flag is passed.
+    override flag is passed.  With a running service the rebuild runs there,
+    with the watcher paused and the service's index handles closed.
     """
     force_flag = force if isinstance(force, bool) else False
     allow_empty_flag = allow_empty if isinstance(allow_empty, bool) else False
     try:
         cfg = _load_config()
+        client = ServiceClient.from_discovery()
+        if client is not None:
+            try:
+                service_report = _reindex_via_service(
+                    client, force=force_flag, allow_empty=allow_empty_flag
+                )
+            except ServiceUnavailable:
+                pass
+            else:
+                _print_report_dict(service_report)
+                return
         report = rebuild_index(cfg, force=force_flag, allow_empty=allow_empty_flag)
     except typer.Exit:
         raise

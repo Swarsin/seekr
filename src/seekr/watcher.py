@@ -201,8 +201,18 @@ class Watcher:
                 for observer in old:
                     self._stop_observer(observer, timeout=5.0)
 
+    def pause(self) -> None:
+        """Stop applying events, buffering them until :meth:`resume`.
+
+        An action already handed to ``run_exclusive`` still runs when it gets
+        the engine lane; callers that hold the lane keep it out meanwhile.
+        """
+        with self._condition:
+            self._paused = True
+            self._condition.notify_all()
+
     def resume(self) -> None:
-        """Allow a watcher started with ``paused=True`` to apply events."""
+        """Apply events again after :meth:`pause` or ``start(paused=True)``."""
         with self._condition:
             self._paused = False
             self._condition.notify_all()

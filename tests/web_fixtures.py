@@ -339,7 +339,8 @@ class FakeWebBackend:
     ``"add_root"``, ``"remove_root"``, ``"course"``, ``"preview"``,
     ``"preview_page_png"``, ``"open_chunk"``, ``"search"``,
     ``"similar"``, ``"request_shutdown"``, ``"start_index_paths"``,
-    ``"start_model_check"``, ``"start_index"``, ``"start_download"``,
+    ``"start_model_check"``, ``"start_index"``, ``"start_reindex"``,
+    ``"start_download"``,
     or ``"job"``) to an :class:`ApiError` that method raises instead of
     returning.  Every call is appended to ``calls`` as
     ``(method_name, keyword_arguments)``.
@@ -365,6 +366,7 @@ class FakeWebBackend:
         start_download_job_id: str = "job-download-fixture",
         similar_result: SearchResult | None = None,
         start_index_paths_job_id: str = "job-index-paths-fixture",
+        start_reindex_job_id: str = "job-reindex-fixture",
         errors: dict[str, ApiError] | None = None,
     ) -> None:
         self.status_value = STATUS_READY if status is None else status
@@ -385,6 +387,7 @@ class FakeWebBackend:
         self.start_download_job_id = start_download_job_id
         self.similar_result_value = SEARCH_RESULT if similar_result is None else similar_result
         self.start_index_paths_job_id = start_index_paths_job_id
+        self.start_reindex_job_id = start_reindex_job_id
         self.errors = dict(errors or {})
         self.calls: list[tuple[str, dict[str, object]]] = []
 
@@ -480,6 +483,12 @@ class FakeWebBackend:
         self._raise_configured("start_index")
         self._ensure_running_job(self.start_index_job_id, "index")
         return self.start_index_job_id
+
+    def start_reindex(self, force: bool = False, allow_empty: bool = False) -> str:
+        self._record("start_reindex", force=force, allow_empty=allow_empty)
+        self._raise_configured("start_reindex")
+        self._ensure_running_job(self.start_reindex_job_id, "index")
+        return self.start_reindex_job_id
 
     def start_download(self, rerank: bool = False) -> str:
         self._record("start_download", rerank=rerank)

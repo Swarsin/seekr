@@ -542,3 +542,177 @@ def test_lifetime_lock_is_released_when_teardown_fails(env, request) -> None:
 
     second = _service(request)
     assert second.start() > 0
+
+
+# -- pausing for a rebuild ----------------------------------------------------
+
+
+def _open_watch_store(svc: SeekrService) -> None:
+    svc.backend.run_in_lane("index", svc._watch_indexer)
+    assert svc._watch_store is not None and svc._watch_lock is not None
+
+
+def _exclusive_lock_available(db_path: Path) -> bool:
+    from seekr.lifecycle import LifecycleLock, LifecycleLockError
+
+    lock = LifecycleLock(db_path, shared=False, blocking=False)
+    try:
+        lock.acquire()
+    except LifecycleLockError:
+        return False
+    lock.release()
+    return True
+
+
+def test_paused_closes_watch_store_releases_locks_and_reopens(env, request) -> None:
+    svc = _service(request)
+    svc.start()
+    _wait_idle(svc)
+    _open_watch_store(svc)
+    db_path = env / "index.db"
+    assert not _exclusive_lock_available(db_path)
+
+    with svc.paused():
+        assert svc._watch_store is None and svc._watch_lock is None
+        assert _exclusive_lock_available(db_path)
+        assert svc._watcher._paused is True
+        # The engine lane stays held, so no index job can start meanwhile.
+        assert svc.backend._activity()["lane"] == "index"
+
+    assert svc._watch_store is not None
+    assert svc._watcher._paused is False
+    assert svc.backend._activity()["lane"] == "idle"
+
+
+def test_paused_reopens_and_resumes_when_the_body_fails(env, request) -> None:
+    svc = _service(request)
+    svc.start()
+    _wait_idle(svc)
+    _open_watch_store(svc)
+
+    with pytest.raises(RuntimeError, match="boom"), svc.paused():
+        raise RuntimeError("boom")
+
+    assert svc._watch_store is not None
+    assert svc._watcher._paused is False
+    assert svc.backend._activity()["lane"] == "idle"
+
+
+def test_watcher_events_during_pause_apply_after_it(env, request) -> None:
+    svc = _service(request)
+    svc.start()
+    _wait_idle(svc)
+    note = env / "docs" / "c.md"
+    with svc.paused():
+        note.write_text("gamma notes about drums\n", encoding="utf-8")
+        handler = FakeObserver.created[-1].schedules[0][0]
+        handler.dispatch(_Event("created", str(note)))
+        time.sleep(0.3)
+        assert svc._watch_store is None
+    assert _wait_for(lambda: _documents(svc) == 2)
+
+
+def _reindex_via_api(svc: SeekrService, port: int, body: object = None) -> dict:
+    info = read_service_info(paths.service_file())
+    assert info is not None
+    status, started = _request(port, "POST", "/api/reindex", token=info.token, body=body or {})
+    assert status == 202, started
+    job_id = started["job_id"]
+    job: dict = {}
+
+    def finished() -> bool:
+        nonlocal job
+        _status, job = _request(port, "GET", f"/api/jobs/{job_id}", token=info.token)
+        return job["state"] != "running"
+
+    assert _wait_for(finished, timeout=10)
+    return job
+
+
+def test_reindex_route_rebuilds_through_the_pause(env, request) -> None:
+    svc = _service(request)
+    port = svc.start()
+    _wait_idle(svc)
+    _open_watch_store(svc)
+    entered: list[tuple[object, object, str]] = []
+    original = svc.paused
+
+    def spy(**kwargs):
+        entered.append(
+            (svc._watch_store, svc._watcher._paused, svc.backend._activity()["lane"])
+        )
+        return original(**kwargs)
+
+    svc.paused = spy  # type: ignore[method-assign]
+    (env / "docs" / "b.md").write_text("beta notes about drums\n", encoding="utf-8")
+
+    job = _reindex_via_api(svc, port)
+
+    assert job["operation"] == "index"
+    assert job["state"] == "succeeded", job
+    assert job["report"]["added"] == 2
+    assert len(entered) == 1 and entered[0][2] == "index"
+    assert _documents(svc) == 2
+    assert svc._watch_store is not None  # reopened on the new database
+    assert svc._watcher._paused is False
+    _wait_idle(svc)
+
+
+def test_reindex_failure_still_resumes_watcher(env, request) -> None:
+    svc = _service(request)
+    port = svc.start()
+    _wait_idle(svc)
+    _open_watch_store(svc)
+    (env / "docs" / "a.md").unlink()
+
+    job = _reindex_via_api(svc, port)
+
+    assert job["state"] == "failed"
+    assert "empty rebuild" in job["error"]
+    assert _documents(svc) == 1  # live index left untouched
+    assert svc._watch_store is not None
+    assert svc._watcher._paused is False
+
+
+def test_reindex_refuses_while_another_job_runs(env, request) -> None:
+    svc = _service(request)
+    port = svc.start()
+    _wait_idle(svc)
+    info = read_service_info(paths.service_file())
+    assert info is not None
+    release = threading.Event()
+    holding = threading.Event()
+
+    def hold() -> None:
+        holding.set()
+        release.wait(5)
+
+    blocker = threading.Thread(
+        target=svc.backend.run_in_lane, args=("index", hold), daemon=True
+    )
+    blocker.start()
+    request.addfinalizer(lambda: (release.set(), blocker.join(5)))
+    assert holding.wait(5)
+
+    status, body = _request(port, "POST", "/api/reindex", token=info.token, body={})
+    assert status == 409
+    assert body["error"]["code"] == "busy"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="windows")
+def test_reindex_with_open_reader_succeeds_via_service_pause(env, request) -> None:
+    # On Windows an open SQLite handle makes os.replace fail; the watcher's
+    # long-lived Store is exactly such a reader until the pause closes it.
+    svc = _service(request)
+    port = svc.start()
+    _wait_idle(svc)
+    _open_watch_store(svc)
+    from seekr.web_contract import SearchRequest
+
+    assert svc.backend.search(SearchRequest("xylophones", mode="keyword")).hits
+
+    job = _reindex_via_api(svc, port)
+
+    assert job["state"] == "succeeded", job
+    assert _documents(svc) == 1
+    assert svc.backend.search(SearchRequest("xylophones", mode="keyword")).hits

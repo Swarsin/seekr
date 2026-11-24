@@ -432,6 +432,20 @@ class _FakeObserverTests(unittest.TestCase):
         self.assertTrue(_wait_for(lambda: bool(self.indexer.calls)))
         self.assertEqual(self.indexer.calls, [("index", path.resolve())])
 
+    def test_pause_buffers_events_until_resume(self) -> None:
+        self.watcher.start()
+        self.watcher.pause()
+        path = self.root / "paused.md"
+        path.write_text("paused", encoding="utf-8")
+
+        self._dispatch("created", path)
+        time.sleep(0.3)
+        self.assertEqual(self.indexer.calls, [])
+
+        self.watcher.resume()
+        self.assertTrue(_wait_for(lambda: bool(self.indexer.calls)))
+        self.assertEqual(self.indexer.calls, [("index", path.resolve())])
+
     def test_stop_is_idempotent_and_discards_pending_events(self) -> None:
         watcher = Watcher(
             self.indexer,

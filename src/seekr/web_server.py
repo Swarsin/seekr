@@ -115,6 +115,7 @@ _API_ROUTES: dict[str, tuple[str, frozenset[str]]] = {
     "/api/index/paths": ("index_paths", frozenset({_POST_METHOD})),
     "/api/model/check": ("model_check", frozenset({_POST_METHOD})),
     "/api/index": ("index", frozenset({_POST_METHOD})),
+    "/api/reindex": ("reindex", frozenset({_POST_METHOD})),
     "/api/setup/download": ("setup_download", frozenset({_POST_METHOD})),
 }
 
@@ -397,6 +398,14 @@ def _validate_open(body: dict[str, Any]) -> int:
 def _validate_download(body: dict[str, Any]) -> bool:
     _reject_unknown_fields(body, {"rerank"})
     return _optional_bool(body, "rerank", default=False)
+
+
+def _validate_reindex(body: dict[str, Any]) -> tuple[bool, bool]:
+    _reject_unknown_fields(body, {"force", "allow_empty"})
+    return (
+        _optional_bool(body, "force", default=False),
+        _optional_bool(body, "allow_empty", default=False),
+    )
 
 
 def _validate_empty_body(body: dict[str, Any]) -> None:
@@ -1122,6 +1131,12 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             job_id = backend.start_index()
             self._send_json(202, {"job_id": job_id})
             return route_label, 202
+        if name == "reindex":
+            assert body is not None
+            force, allow_empty = _validate_reindex(body)
+            job_id = backend.start_reindex(force=force, allow_empty=allow_empty)
+            self._send_json(202, {"job_id": job_id})
+            return route_label, 202
         if name == "setup_download":
             assert body is not None
             rerank = _validate_download(body)
@@ -1154,6 +1169,7 @@ def _route_label(name: str) -> str:
         "index_paths": "/api/index/paths",
         "model_check": "/api/model/check",
         "index": "/api/index",
+        "reindex": "/api/reindex",
         "setup_download": "/api/setup/download",
         "job": "/api/jobs/{job_id}",
     }.get(name, "unknown")

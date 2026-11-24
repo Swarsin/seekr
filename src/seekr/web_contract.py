@@ -427,6 +427,10 @@ class WebBackend(Protocol):
         """Start the async index job and return its opaque job ID."""
         ...
 
+    def start_reindex(self, force: bool = False, allow_empty: bool = False) -> str:
+        """Start an ``index`` job that rebuilds and swaps the index; return its job ID."""
+        ...
+
     def start_download(self, rerank: bool = False) -> str:
         """Start the explicit model/grammar download job and return its opaque job ID."""
         ...

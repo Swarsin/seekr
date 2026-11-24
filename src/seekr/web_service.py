@@ -21,8 +21,8 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Sequence
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -64,6 +64,8 @@ __all__ = ["WebService"]
 _LOGGER = logging.getLogger(__name__)
 _LOCK_WAIT_SECONDS = 2.0
 _READ_BUSY_TIMEOUT_SECONDS = 2.0
+# How long a reindex waits for in-flight searches before the exclusive swap.
+_REINDEX_SWAP_WAIT_SECONDS = 10.0
 _STATUS_BUSY_TIMEOUT_SECONDS = 5.0
 _DIAGNOSTIC_LIMIT = LIMITS["errors_retained"]
 _JOBS_RETAINED = LIMITS["jobs_retained"]
@@ -253,7 +255,14 @@ class WebService:
         read_busy_timeout: float = _READ_BUSY_TIMEOUT_SECONDS,
         on_shutdown: Callable[[], None] | None = None,
         on_roots_changed: Callable[[], None] | None = None,
+        reindex_runner: Callable[[Callable[[], Any]], Any] | None = None,
     ) -> None:
+        """Configure the backend; heavy modules load only when used.
+
+        ``reindex_runner`` wraps the rebuild of a reindex job (the job thread
+        already holds the engine lane); the service uses it to pause the
+        watcher and close its Store around the swap.
+        """
         configured = default_config_path() if config_path is None else Path(config_path)
         configured = configured.expanduser()
         if not configured.is_absolute():
@@ -273,6 +282,7 @@ class WebService:
 
         self._on_shutdown = on_shutdown
         self._on_roots_changed = on_roots_changed
+        self._reindex_runner = reindex_runner
         self._shutdown_requested = False
         self._state_lock = threading.RLock()
         # Signalled whenever the lane is released or shutdown begins.
@@ -495,6 +505,14 @@ class WebService:
         Raises ``409 busy`` once shutdown has begun (also for waiters), unless
         ``during_shutdown`` is set for final cleanup by the host.
         """
+        with self.lane(kind, wait=wait, during_shutdown=during_shutdown):
+            return fn()
+
+    @contextmanager
+    def lane(
+        self, kind: str, *, wait: bool = True, during_shutdown: bool = False
+    ) -> Iterator[None]:
+        """Hold the engine lane for the ``with`` body (see :meth:`run_in_lane`)."""
         with self._state_lock:
             while (
                 wait
@@ -507,7 +525,7 @@ class WebService:
             else:
                 self._begin_lane(kind)
         try:
-            return fn()
+            yield
         finally:
             self._end_lane()
 
@@ -2044,6 +2062,72 @@ class WebService:
         return self._start_job(
             "index", lambda job_id: self._run_index_job(job_id, cfg, targets)
         )
+
+    # -- jobs: reindex -----------------------------------------------------
+
+    def start_reindex(self, force: bool = False, allow_empty: bool = False) -> str:
+        """Rebuild the index in a fresh database and swap it in, as a job.
+
+        The job is an ``index`` operation holding the engine lane.  The swap
+        itself runs inside ``reindex_runner`` (the service's pause), so no
+        Store of this process is open on the live database during it.
+        """
+        self._reject_if_shutting_down()
+        cfg = self._load_config()
+        if not cfg.roots:
+            raise ApiError(400, "no_roots", "no roots are configured; add a folder first")
+        if self.daemon_present():
+            raise ApiError(
+                409,
+                "daemon_active",
+                "a seekr daemon is running and maintains the index; stop the running "
+                "`seekr daemon` process before reindexing",
+            )
+        if self._model_state_for(cfg.embed_model) == "unavailable":
+            raise ApiError(
+                503,
+                "model_unavailable",
+                f"embedding model {cfg.embed_model!r} is unavailable; run an explicit model check",
+            )
+        return self._start_job(
+            "index",
+            lambda job_id: self._run_reindex_job(
+                job_id, cfg, force=bool(force), allow_empty=bool(allow_empty)
+            ),
+        )
+
+    def _run_reindex_job(
+        self, job_id: str, cfg: Config, *, force: bool, allow_empty: bool
+    ) -> None:
+        state = "failed"
+        report_payload: dict[str, object] | None = None
+        error: str | None = "reindex job stopped unexpectedly"
+        try:
+            embedder, _dim = self._load_model_for_lane(cfg)
+            from .lifecycle import rebuild_index
+
+            def rebuild() -> object:
+                return rebuild_index(
+                    cfg,
+                    embedder=embedder,
+                    lock_timeout=_REINDEX_SWAP_WAIT_SECONDS,
+                    force=force,
+                    allow_empty=allow_empty,
+                )
+
+            runner = self._reindex_runner
+            report = runner(rebuild) if runner is not None else rebuild()
+            report_payload = self._serialise_report(report)
+            state = "partial" if getattr(report, "errors", []) else "succeeded"
+            error = None
+        except ApiError as exc:
+            error = exc.message
+        except Exception as exc:  # noqa: BLE001 - report a safe job failure
+            error = _safe_message(exc)
+        finally:
+            self._finish_job_and_release_lane(
+                job_id, state, report=report_payload, error=error
+            )
 
     # -- jobs: download ----------------------------------------------------
 

@@ -25,8 +25,8 @@ import signal
 import sqlite3
 import sys
 import threading
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
@@ -289,6 +289,7 @@ class SeekrService:
             embedder_factory=self._embedder_for,
             daemon_probe=lambda _path: False,
             on_roots_changed=self._roots_changed,
+            reindex_runner=self._run_paused,
         )
         token = secrets.token_urlsafe(32)
         self._server = create_server(self._web, port=self._port, token=token)
@@ -399,6 +400,62 @@ class SeekrService:
         watcher = self._watcher
         if watcher is not None:
             watcher.set_roots(list(cfg.roots) if cfg is not None else [])
+
+    # -- pausing for a rebuild ---------------------------------------------
+
+    @contextmanager
+    def paused(self, *, lane_held: bool = False) -> Iterator[None]:
+        """Release every index handle this process holds for the ``with`` body.
+
+        Pauses the watcher (events buffer meanwhile), waits for the engine
+        lane, closes the watcher's Store and releases its shared lifecycle
+        lock.  The lane stays held for the body, so no index job or watcher
+        action can reopen the database.  Afterwards, whether the body
+        succeeds or fails, the watcher Store is reopened and the watcher
+        resumed.
+
+        Searches never take the lane: each opens its own Store under a
+        transient shared lifecycle lock, so ``rebuild_index`` waits for
+        in-flight searches at the swap, and searches arriving during the swap
+        wait on the lock (keyword searches give up with ``409 busy`` after
+        their bounded wait).  None sees a half-swapped index.  ``lane_held`` is for callers already holding the lane (a
+        reindex job).
+        """
+        watcher = self._watcher
+        if watcher is not None:
+            watcher.pause()
+        try:
+            if lane_held:
+                with self._watch_store_released():
+                    yield
+            else:
+                with self.backend.lane("index"), self._watch_store_released():
+                    yield
+        finally:
+            if watcher is not None:
+                watcher.resume()
+
+    @contextmanager
+    def _watch_store_released(self) -> Iterator[None]:
+        # Engine lane held by the caller.
+        self._close_watch_store()
+        try:
+            yield
+        finally:
+            self._reopen_watch_store()
+
+    def _reopen_watch_store(self) -> None:
+        try:
+            self._watch_indexer()
+        except Exception as exc:  # noqa: BLE001 - the next watcher action retries
+            log_event(
+                _LOGGER, logging.WARNING, "service.watch_store_reopen_failed", error=str(exc)
+            )
+
+    def _run_paused(self, fn: Callable[[], Any]) -> Any:
+        """Run ``fn`` (a reindex) from a job that already holds the lane."""
+        with self.paused(lane_held=True):
+            return fn()
 
     # -- watcher Store (engine lane only) ----------------------------------
 

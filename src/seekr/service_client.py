@@ -334,6 +334,18 @@ class ServiceClient:
             )
         )
 
+    def reindex(self, *, force: bool = False, allow_empty: bool = False) -> str:
+        """Start a rebuild-and-swap of the index; return the job id."""
+        return self._job_id(
+            self._call(
+                "POST",
+                "/api/reindex",
+                {"force": bool(force), "allow_empty": bool(allow_empty)},
+                timeout=REQUEST_TIMEOUT,
+                retry_safe=False,
+            )
+        )
+
     def job(self, job_id: str) -> dict[str, Any]:
         payload = self._call("GET", f"/api/jobs/{job_id}", timeout=REQUEST_TIMEOUT)
         if not isinstance(payload, dict):

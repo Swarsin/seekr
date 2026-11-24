@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sqlite3
 import stat
 import tempfile
@@ -376,6 +377,57 @@ class RebuildTests(unittest.TestCase):
 
         self.assertEqual(_document_count(self.db), 2)
         self.assertEqual(list(self.tmp.glob(".*.rebuild-*")), [])
+
+    def test_replace_retries_then_explains(self) -> None:
+        _make_database(self.db, documents=2)
+        sleeps: list[float] = []
+
+        with mock.patch(
+            "seekr.lifecycle.os.replace", side_effect=PermissionError(13, "in use")
+        ) as replace, mock.patch(
+            "seekr.lifecycle._sleep", side_effect=sleeps.append
+        ), self.assertRaises(RebuildError) as raised:
+            self._rebuild(SyncReport(added=1))
+
+        self.assertEqual(
+            str(raised.exception), "index is in use; close other seekr windows and retry"
+        )
+        self.assertEqual(replace.call_count, 11)
+        self.assertEqual(sleeps, [0.1] * 10)
+        self.assertEqual(_document_count(self.db), 2)
+        self.assertEqual(list(self.tmp.glob(".*.rebuild-*")), [])
+
+    def test_replace_succeeds_after_transient_permission_errors(self) -> None:
+        _make_database(self.db, documents=2)
+        real_replace = os.replace
+        attempts: list[int] = []
+
+        def flaky(src: str, dst: str) -> None:
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise PermissionError(13, "sharing violation")
+            real_replace(src, dst)
+
+        with mock.patch("seekr.lifecycle.os.replace", side_effect=flaky), mock.patch(
+            "seekr.lifecycle._sleep"
+        ) as sleep:
+            self._rebuild(SyncReport(added=1))
+
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(_document_count(self.db), 1)
+
+    def test_other_replace_errors_are_not_retried(self) -> None:
+        _make_database(self.db, documents=2)
+        with mock.patch(
+            "seekr.lifecycle.os.replace", side_effect=OSError("disk gone")
+        ) as replace, mock.patch("seekr.lifecycle._sleep") as sleep, self.assertRaises(
+            RebuildError
+        ) as raised:
+            self._rebuild(SyncReport(added=1))
+        self.assertEqual(replace.call_count, 1)
+        sleep.assert_not_called()
+        self.assertIn("cannot atomically replace live index", str(raised.exception))
 
     def test_success_can_replace_a_corrupt_live_database(self) -> None:
         self.db.write_bytes(b"not a sqlite database")

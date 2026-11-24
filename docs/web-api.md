@@ -90,6 +90,7 @@ diagnosable security rule, not a missing-token accident.
 | `POST /api/index/paths` | Token; no query; JSON `{paths: string[]}`; 1-50 absolute path strings of at most 4,096 UTF-8 bytes each; every path must exist | `202 {job_id: string}`; an `index` job that indexes only those files/directories | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 daemon_active`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable`, `503 model_unavailable` |
 | `POST /api/model/check` | Token; no query; JSON exactly `{}` | `202 {job_id: string}`; job result arrives through the job endpoint | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error` |
 | `POST /api/index` | Token; no query; JSON exactly `{}`; targets come only from validated config | `202 {job_id: string}` | `400 invalid_request`, `400 no_roots`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 daemon_active`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable`, `503 model_unavailable` |
+| `POST /api/reindex` | Token; no query; JSON `{}` or `{force?: boolean, allow_empty?: boolean}` (strict booleans, default `false`) | `202 {job_id: string}`; an `index` job that rebuilds the index in a fresh database and swaps it in (see [Reindex semantics](#reindex-semantics)) | `400 invalid_request`, `400 no_roots`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 daemon_active`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 model_unavailable` |
 | `POST /api/setup/download` | Token; no query; JSON `{}` or `{rerank?: boolean}` | `202 {job_id: string}`; runs model/grammar download job | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error` |
 | `GET /api/jobs/{job_id}` | Token; no body; no query; job ID is a server-issued opaque string | `200` job object with state, operation, timestamps, report/error, and truncation flags | `400 invalid_request`, `403 forbidden`, `404 job_not_found`, `405 method_not_allowed`, `500 internal_error` |
 | `GET /`, `/index.html`, `/styles.css`, `/app.js` | No token; no query; exact Host; matching Origin or allowed `Sec-Fetch-Site` required | `200` packaged asset with the correct MIME type | `400 invalid_request` for query string; `404 not_found` for a missing allowlisted asset or unknown path; `405 method_not_allowed` for non-GET; `403 forbidden` for Host/Origin/Sec-Fetch |
@@ -557,6 +558,38 @@ model.
 - Shutdown waits for an active `Indexer.sync`; there is no cancellation hook
   and a browser disconnect is not cancellation.
 
+## Reindex semantics
+
+`POST /api/reindex` is what `seekr reindex` uses when a service is running
+(without one, the CLI rebuilds locally exactly as before).
+
+- The request body is `{}` or `{force?: boolean, allow_empty?: boolean}`.
+  `force` replaces the live index even after per-file indexing errors (the job
+  then ends `partial`); `allow_empty` allows replacing a non-empty index with an
+  empty rebuild. Without them those rebuilds fail and the live index is left
+  untouched.
+- Preflight precedence: config validity → `no_roots` → `daemon_active` →
+  `model_unavailable` → lane `busy`. An incompatible or unreadable existing
+  index is not refused: replacing it is the point of a reindex.
+- The job is an `index` operation and holds the engine lane for its whole run,
+  so it never overlaps an index job, a folder removal or a watcher write. Its
+  completed `report` has the same shape as an index job's.
+- Around the rebuild the service pauses its watcher (events are buffered and
+  applied to the new index afterwards), closes its own long-lived Store and
+  releases the shared lifecycle lock that Store holds. Whether the rebuild
+  succeeds or fails, the service then reopens its Store and resumes the
+  watcher. This matters on Windows, where an open database file cannot be
+  replaced.
+- The swap is atomic under the exclusive lifecycle lock. Searches keep
+  running against the old index during the build. The reindex waits up to 10
+  seconds for in-flight searches before swapping. A search that arrives during
+  the swap waits on the lifecycle lock: hybrid and vector searches until the
+  swap is done, keyword searches for their bounded lock wait and then
+  `409 busy`. No search ever sees a half-swapped index.
+- On Windows a replace refused because another program has the file open is
+  retried for about a second; the job then fails with
+  `index is in use; close other seekr windows and retry`.
+
 ## Remove folder semantics
 
 - `POST /api/roots/remove` accepts `{path, revision}` and runs inside the
@@ -680,23 +713,23 @@ request bodies, document text, tracebacks, or the token.
 | 400 | `invalid_request` | Malformed JSON, unknown fields/types, duplicate sensitive headers, missing content length, invalid or disallowed query strings, invalid search filters/mode/k/per_file/spread, invalid chunk/rerank fields, bootstrap-header failure. All routes. |
 | 400 | `invalid_root` | Submitted root is missing, not a readable directory, contains NUL, is not valid UTF-8, exceeds 4,096 bytes, or is not configured on remove. `POST /api/roots`, `POST /api/roots/remove`. |
 | 400 | `roots_limit` | The 50-root limit would be exceeded. `POST /api/roots`. |
-| 400 | `no_roots` | Index requested with no configured roots. `POST /api/index`. |
+| 400 | `no_roots` | Index requested with no configured roots. `POST /api/index`, `POST /api/reindex`. |
 | 403 | `forbidden` | Bad Host, bad Origin, cross-site/same-site fetch metadata, missing/wrong token. All token-protected routes and static assets for Host/fetch violations. |
 | 404 | `not_found` | Unknown route, unknown path, missing allowlisted asset, or unknown/missing chunk or PDF preview page. Static, unknown, preview, and open routes. |
 | 404 | `job_not_found` | Unknown, expired, or malformed job ID. `GET /api/jobs/{job_id}`. |
 | 405 | `method_not_allowed` | Wrong method, including `OPTIONS`; no CORS/preflight response. Every route. |
-| 409 | `busy` | A second engine operation is active, a root write conflicts with the engine lane, a read/purge cannot obtain its snapshot within the bounded wait, hybrid/vector search or similar is requested during a model download, or the service is shutting down (status, search, similar, root writes and job starts refuse new work once shutdown has begun). `GET /api/status`, `POST /api/search`, `POST /api/similar`, `POST /api/roots`, `POST /api/roots/remove`, `POST /api/model/check`, `POST /api/index`, `POST /api/setup/download`, `GET /api/course`, `GET /api/preview`, `GET /api/preview/page`, `POST /api/open`. |
+| 409 | `busy` | A second engine operation is active, a root write conflicts with the engine lane, a read/purge cannot obtain its snapshot within the bounded wait, hybrid/vector search or similar is requested during a model download, or the service is shutting down (status, search, similar, root writes and job starts refuse new work once shutdown has begun). `GET /api/status`, `POST /api/search`, `POST /api/similar`, `POST /api/roots`, `POST /api/roots/remove`, `POST /api/model/check`, `POST /api/index`, `POST /api/reindex`, `POST /api/setup/download`, `GET /api/course`, `GET /api/preview`, `GET /api/preview/page`, `POST /api/open`. |
 | 409 | `stale_config` | Revision mismatch or an external edit was detected before replace. `POST /api/roots`, `POST /api/roots/remove`. |
-| 409 | `daemon_active` | A seekr daemon socket is live and a web index or folder removal was requested. `POST /api/index`, `POST /api/roots/remove`. |
+| 409 | `daemon_active` | A seekr daemon socket is live and a web index or folder removal was requested. `POST /api/index`, `POST /api/reindex`, `POST /api/roots/remove`. |
 | 409 | `incompatible_index` | Stored model/schema/quantization metadata is incompatible with the config. Local search, `POST /api/index`, `GET /api/course`, `GET /api/preview`, `GET /api/preview/page`, `POST /api/open`. |
 | 409 | `duplicate_root` | The canonical path already exists in roots. `POST /api/roots`. |
-| 409 | `config_invalid` | Config is malformed, unsupported, ambiguous, or unsafe to edit. `GET /api/roots`, `POST /api/roots`, `POST /api/roots/remove`, `GET /api/course`, `GET /api/preview`, `GET /api/preview/page`, `POST /api/open`, `POST /api/search`, `POST /api/model/check`, `POST /api/index`, `POST /api/setup/download`. Status reports invalid config in its `200` body instead. |
+| 409 | `config_invalid` | Config is malformed, unsupported, ambiguous, or unsafe to edit. `GET /api/roots`, `POST /api/roots`, `POST /api/roots/remove`, `GET /api/course`, `GET /api/preview`, `GET /api/preview/page`, `POST /api/open`, `POST /api/search`, `POST /api/model/check`, `POST /api/index`, `POST /api/reindex`, `POST /api/setup/download`. Status reports invalid config in its `200` body instead. |
 | 413 | `payload_too_large` | Body exceeds 64 KiB. Body-taking routes. |
 | 415 | `unsupported_media_type` | Wrong Content-Type, unsupported charset, or chunked transfer encoding. Body-taking routes. |
 | 500 | `internal_error` | Unexpected server failure or opener launch failure with no safe-specific code. Every route. |
 | 500 | `config_write_failed` | Validated config could not be written/replaced. `POST /api/roots`, `POST /api/roots/remove`. |
 | 503 | `index_unavailable` | Index inspection reports `error` (corrupt/unreadable database). Status still returns `200` with `index.state = "error"`. `POST /api/search`, `POST /api/index`, `GET /api/course`, `GET /api/preview`, `GET /api/preview/page`, `POST /api/open`. |
-| 503 | `model_unavailable` | Hybrid/vector search or index requested while the model is known unavailable. `POST /api/search`, `POST /api/index`. |
+| 503 | `model_unavailable` | Hybrid/vector search or index requested while the model is known unavailable. `POST /api/search`, `POST /api/index`, `POST /api/reindex`. |
 | 503 | `daemon_failure` | A reachable daemon failed a search/protocol interaction; do not hide it with a cold local retry. `POST /api/search`. |
 
 Error precedence: Host (403); route existence (404, except `OPTIONS`, which is
@@ -777,6 +810,7 @@ class WebBackend(Protocol):
     def search(self, request: SearchRequest) -> SearchResult: ...
     def start_model_check(self) -> str: ...
     def start_index(self) -> str: ...
+    def start_reindex(self, force: bool = False, allow_empty: bool = False) -> str: ...
     def start_download(self, rerank: bool = False) -> str: ...
     def job(self, job_id: str) -> JobView: ...
 ```

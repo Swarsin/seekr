@@ -677,3 +677,119 @@ def test_index_start_timeout_is_fatal_not_local(stub, monkeypatch) -> None:
 
     assert result.exit_code == 1
     assert "did not confirm POST /api/index" in result.output
+
+
+# -- reindex delegation -------------------------------------------------------
+
+
+def test_reindex_call(stub) -> None:
+    stub.responses.extend([(202, {"job_id": "j1"}), (202, {"job_id": "j2"})])
+    client = ServiceClient.from_discovery()
+    assert client is not None
+    assert client.reindex() == "j1"
+    assert client.reindex(force=True, allow_empty=True) == "j2"
+    assert [(m, p, b) for m, p, b, _ in stub.seen] == [
+        ("POST", "/api/reindex", {"force": False, "allow_empty": False}),
+        ("POST", "/api/reindex", {"force": True, "allow_empty": True}),
+    ]
+
+
+def _local_rebuild(monkeypatch) -> list[dict[str, object]]:
+    calls: list[dict[str, object]] = []
+    real = cli_index.rebuild_index
+
+    def local(cfg, **kwargs):
+        calls.append(kwargs)
+        return real(cfg, embedder=FakeEmbedder(), **kwargs)
+
+    monkeypatch.setattr(cli_index, "rebuild_index", local)
+    return calls
+
+
+def test_reindex_delegates_to_service_with_local_output(
+    env: Path, request, monkeypatch
+) -> None:
+    runner = CliRunner()
+    calls = _local_rebuild(monkeypatch)
+    local = runner.invoke(app, ["reindex"])
+    assert local.exit_code == 0, local.output
+    assert len(calls) == 1
+
+    svc = _started_service(request)
+    monkeypatch.setattr(cli_index, "_JOB_POLL_SECONDS", 0.05)
+    # The watcher's long-lived Store is open, as in normal service use.
+    svc.backend.run_in_lane("index", svc._watch_indexer)
+
+    delegated = runner.invoke(app, ["reindex"])
+
+    assert delegated.exit_code == 0, delegated.output
+    assert len(calls) == 1, "reindex ran locally despite a live service"
+    assert delegated.output == local.output
+    assert delegated.output.splitlines()[0] == "added: 2"
+    assert int(svc.backend.status().index["documents"] or 0) == 2
+
+
+def test_reindex_passes_flags_to_service(stub, monkeypatch) -> None:
+    monkeypatch.setattr(cli_index, "_JOB_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(cli_index, "rebuild_index", lambda *a, **k: pytest.fail("local"))
+    report = WebService._serialise_report(SyncReport(added=3))
+    stub.responses.extend(
+        [
+            (202, {"job_id": "j1"}),
+            (200, {"job_id": "j1", "state": "succeeded", "report": report, "error": None}),
+        ]
+    )
+    result = CliRunner().invoke(app, ["reindex", "--force", "--allow-empty"])
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[0] == "added: 3"
+    assert stub.seen[0][2] == {"force": True, "allow_empty": True}
+
+
+def test_reindex_reports_failed_job(stub, monkeypatch) -> None:
+    monkeypatch.setattr(cli_index, "_JOB_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(cli_index, "rebuild_index", lambda *a, **k: pytest.fail("local"))
+    stub.responses.extend(
+        [
+            (202, {"job_id": "j1"}),
+            (200, {"job_id": "j1", "state": "running", "report": None, "error": None}),
+            (
+                200,
+                {"job_id": "j1", "state": "failed", "report": None,
+                 "error": "index is in use; close other seekr windows and retry"},
+            ),
+        ]
+    )
+    result = CliRunner().invoke(app, ["reindex"])
+    assert result.exit_code == 1
+    assert "seekr: index is in use; close other seekr windows and retry" in result.output
+    assert [p for _, p, _, _ in stub.seen] == [
+        "/api/reindex", "/api/jobs/j1", "/api/jobs/j1"
+    ]
+
+
+def test_reindex_surfaces_service_refusal(stub, monkeypatch) -> None:
+    monkeypatch.setattr(cli_index, "rebuild_index", lambda *a, **k: pytest.fail("local"))
+    stub.responses.append((409, _error("busy", "another engine operation is already running")))
+    result = CliRunner().invoke(app, ["reindex"])
+    assert result.exit_code == 1
+    assert "another engine operation is already running" in result.output
+
+
+def test_reindex_falls_back_when_service_unreachable(env: Path, monkeypatch) -> None:
+    _write_discovery(_closed_port())
+    calls = _local_rebuild(monkeypatch)
+    result = CliRunner().invoke(app, ["reindex"])
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[0] == "added: 2"
+    assert calls == [{"force": False, "allow_empty": False}]
+
+
+def test_reindex_start_timeout_is_fatal_not_local(stub, monkeypatch) -> None:
+    monkeypatch.setattr(service_client, "REQUEST_TIMEOUT", 0.2)
+    monkeypatch.setattr(cli_index, "rebuild_index", lambda *a, **k: pytest.fail("local"))
+    stub.responses.append((202, "hang"))
+
+    result = CliRunner().invoke(app, ["reindex"])
+
+    assert result.exit_code == 1
+    assert "did not confirm POST /api/reindex" in result.output

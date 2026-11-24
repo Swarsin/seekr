@@ -83,7 +83,7 @@ If the completed scan reports any per-file errors, the job is **partial**: the p
 
 If you reload the page during a job, it recovers the current job from server status. If the server itself restarted, the old job record is gone; the page reports that the task is no longer available and shows the current index state. The web index is incremental and shared with the CLI: a compatible database already built by `seekr index` appears as **Ready** here, and **Update index** does not replace it with a fresh one. Seekr never rebuilds an incompatible index automatically.
 
-Don’t start a separate `seekr index`, `seekr reindex`, or another web index job while a scan is already running. The lifecycle lock protects database replacement, not all concurrent writers, so overlapping manual scans should be avoided.
+While the service runs, `seekr index` and `seekr reindex` hand their work to it. If a scan is already running they fail with “another engine operation is already running” and you can retry when it finishes. A reindex pauses the folder watcher and closes the service’s own index handles while it swaps in the rebuilt database, then resumes.
 
 | Panel label | API state | Meaning |
 | --- | --- | --- |
@@ -186,8 +186,8 @@ Removing a folder with **Remove** updates `config.toml` and removes indexed entr
 
 - **Port 8000 is already in use** — use `seekr web --port 8001`, or `seekr web --port 0` and open the actual printed address.
 - **Local model is Unavailable** — choose **Download search model (about 130 MB) — the only time seekr uses the internet** in the setup panel, or run `seekr models pull --grammars` (see [Make the local model available](#make-the-local-model-available)), then choose **Check model** again. Exact-words search still works. `seekr doctor` (and `seekr models status`) checks whether your configured models, code grammars, roots, and SQLite environment are ready locally.
-- **Index says Needs rebuilding** — stop the service (`seekr service stop`), make the configured model available, and run `seekr reindex` in a terminal. The page leaves the old index untouched.
-- **Index says Can’t be read** — the page cannot repair it. Run `seekr doctor` to rule out SQLite/FTS5/sqlite-vec problems; if the database file is damaged, stop the service and rebuild from a terminal with `seekr reindex`. Search and index updates cannot use the old index until it is fixed.
+- **Index says Needs rebuilding** — make the configured model available and run `seekr reindex` in a terminal (with the service running, the rebuild runs inside it). The page leaves the old index untouched.
+- **Index says Can’t be read** — the page cannot repair it. Run `seekr doctor` to rule out SQLite/FTS5/sqlite-vec problems; if the database file is damaged, rebuild it from a terminal with `seekr reindex`. Search and index updates cannot use the old index until it is fixed.
 - **Settings file says Can’t be read** — open the path shown, fix the TOML by hand, and choose **Refresh**. If the file has table headers but no `roots` key, add a top-level `roots = [...]` above the first table header. For other unsupported layouts, correct the existing `roots` expression by hand.
 - **Seekr is busy** — only one local model/index operation runs at a time; there is no queue. Wait, or use **Exact words**, which keeps working during an index update. Retry if an exact-words search is briefly busy.
 - **Seekr isn’t responding / Reconnect** — check that `seekr web` is still running. Restart it and open the printed address; if the port changed, use the new address. Reloading during an index job recovers it while the server is alive.
