@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-24
+
+### Added
+- Native Windows and macOS support alongside Linux. See [`docs/install-windows-macos.md`](docs/install-windows-macos.md) for installing, registering the MCP server and starting the service at login (Task Scheduler script `contrib/seekr-task.ps1` and launchd agent `contrib/com.seekr.service.plist`; the systemd unit is unchanged).
+- One background service, controlled with `seekr service start`, `seekr service stop` and `seekr service status`. It keeps the model warm, serves the web UI, watches the configured folders, and runs index updates and folder changes so they never race with the watcher.
+- `seekr web` starts the service (or reuses a running one), prints its address and returns; `--foreground` keeps the old serve-in-the-terminal behaviour.
+- CLI searches, `seekr similar`, indexing and `seekr mcp` route through the service when it is running and fall back to local work when it is not. The service API gained `/api/reindex`, `/api/similar`, `/api/shutdown`, path indexing and rerank/explain options, documented in `docs/web-api.md`.
+- `seekr status` reports the service state.
+
+### Changed
+- Config, data and state directories follow the platform conventions through `platformdirs`: `~/Library/Application Support/seekr` on macOS and `%LOCALAPPDATA%\seekr` on Windows. Linux paths (`$XDG_CONFIG_HOME/seekr`, `$XDG_DATA_HOME/seekr`) are unchanged.
+- On macOS, seekr needs a Python whose `sqlite3` can load extensions (the python.org build cannot); use Homebrew Python or a uv-managed CPython and check with `seekr doctor`.
+- Lifecycle locking uses portable shared/exclusive file locks, and the index swap in a reindex is Windows-safe.
+
+### Deprecated
+- `seekr daemon` is a deprecated alias for `seekr service start` and will be removed in 0.4.0. The old Unix-socket query fast path remains Linux-only and is disabled on Windows and macOS.
+
 ### Fixed
 - Adding or removing folders from the web UI or service no longer fails on Windows with Python before 3.13 (`os.fchmod` is missing there).
 - `seekr web` reports a busy port as "already in use" on Windows instead of an access-permission error; the local server no longer sets `SO_REUSEADDR` there, where it lets a second socket bind a port in use.

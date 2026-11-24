@@ -477,7 +477,7 @@ class ModelsCliTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "seekr 0.2.0")
+        self.assertEqual(proc.stdout.strip(), "seekr 0.3.0")
 
         doctor_proc = subprocess.run(
             [sys.executable, "-m", "seekr", "doctor", "--env-only"],
