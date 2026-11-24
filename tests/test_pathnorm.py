@@ -60,8 +60,10 @@ class HasPrefixTests(unittest.TestCase):
 class CanonicalPathTests(unittest.TestCase):
     def test_nfc_on_darwin(self) -> None:
         nfd = "Mo\u0301dulo"
+        # Against the host's own resolution (Windows adds a drive letter).
         self.assertEqual(
-            canonical_path(Path("/x") / nfd, platform="darwin"), "/x/M\u00f3dulo"
+            canonical_path(Path("/x") / nfd, platform="darwin"),
+            str((Path("/x") / "M\u00f3dulo").resolve()),
         )
 
     def test_linux_keeps_bytes_and_equals_resolve(self) -> None:

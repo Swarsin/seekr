@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -22,6 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from seekr import pathnorm
 from seekr.config import Config
 from seekr.embed import FakeEmbedder
 from seekr.indexer import Indexer
@@ -204,12 +206,8 @@ class _MemoryStore:
         paths = sorted(self.documents)
         if prefix is None:
             return paths
-        value = str(prefix).rstrip("/")
-        return [
-            path
-            for path in paths
-            if path == value or path.startswith(value + "/")
-        ]
+        # Component-aware, with the host's separator and case rules, like Store.
+        return [path for path in paths if pathnorm.has_prefix(path, str(prefix))]
 
     def set_last_error_count(self, n: int) -> None:
         return None
@@ -670,6 +668,24 @@ class _RealIndexerRenameTests(unittest.TestCase):
             self.assertEqual(embedder.document_calls, 1)
 
 
+def _network_mounts(test: unittest.TestCase, root: Path, fstype: str) -> list[Mount]:
+    """Return mounts that put *root* on a network filesystem of *fstype*.
+
+    Windows has no mount table (seekr asks for the drive type there), so on
+    Windows *root* is reported as a network drive instead.
+    """
+    if sys.platform != "win32":
+        return [Mount(source="C:\\", mount_point=str(root), fstype=fstype)]
+    slow = str(root.resolve())
+    patcher = mock.patch(
+        "seekr.platform_info._is_slow_windows_path",
+        lambda path: pathnorm.has_prefix(str(path), slow),
+    )
+    patcher.start()
+    test.addCleanup(patcher.stop)
+    return []
+
+
 @unittest.skipUnless(_HAS_WATCHDOG, "watchdog is not installed")
 class _RealWatchdogIntegrationTests(unittest.TestCase):
     """Real recursive observer, real Indexer, stdlib store and embedder."""
@@ -726,7 +742,7 @@ class _RealWatchdogIntegrationTests(unittest.TestCase):
         self.assertEqual(self.embedder.document_calls, calls_after_index)
 
     def test_polling_observer_detects_create_and_delete(self) -> None:
-        mounts = [Mount(source="C:\\", mount_point=str(self.root), fstype="9p")]
+        mounts = _network_mounts(self, self.root, "9p")
         self.watcher = Watcher(
             self.indexer,
             [self.root],
@@ -769,7 +785,7 @@ class _PollingObserverTests(unittest.TestCase):
         poll_intervals: list[float] = []
         mounts = [
             Mount(source="/dev/sdc", mount_point="/", fstype="ext4"),
-            Mount(source="C:\\", mount_point=str(self.slow_root), fstype="9p"),
+            *_network_mounts(self, self.slow_root, "9p"),
         ]
 
         def poll_factory(interval: float) -> _FakeObserver:
@@ -844,7 +860,7 @@ class _PollingObserverTests(unittest.TestCase):
         poll_obs = _FakeObserver()
         mounts = [
             Mount(source="/dev/sdc", mount_point="/", fstype="ext4"),
-            Mount(source="C:\\", mount_point=str(self.slow_root), fstype="drvfs"),
+            *_network_mounts(self, self.slow_root, "drvfs"),
         ]
 
         def native_factory() -> _FakeObserver:
@@ -894,7 +910,7 @@ class _PollingObserverTests(unittest.TestCase):
         poll_obs.start = fail_start  # type: ignore[method-assign]
         mounts = [
             Mount(source="/dev/sdc", mount_point="/", fstype="ext4"),
-            Mount(source="C:\\", mount_point=str(self.slow_root), fstype="cifs"),
+            *_network_mounts(self, self.slow_root, "cifs"),
         ]
 
         watcher = Watcher(
@@ -980,6 +996,10 @@ if __name__ == "__main__":
     unittest.main()
 
 
+@unittest.skipUnless(
+    os.name == "posix",
+    "macOS and Linux path rules use / boundaries, which never apply to Windows paths",
+)
 class CanonicalContainmentTests(unittest.TestCase):
     NFC = "M\u00f3dulo"
     NFD = "Mo\u0301dulo"
