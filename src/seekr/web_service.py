@@ -1450,7 +1450,7 @@ class WebService:
             doc.close()
 
     def open_chunk(self, chunk_id: int) -> None:
-        from .opener import Argv, OpenFailed, open_target, run_open
+        from .opener import Argv, open_target, run_open
 
         row = self._fetch_chunk(chunk_id)
         is_wsl = platform_info.is_wsl()
@@ -1483,8 +1483,6 @@ class WebService:
                 "internal_error",
                 f"cannot run {name!r}: executable not found",
             ) from exc
-        except OpenFailed as exc:
-            raise ApiError(500, "internal_error", str(exc)) from exc
         except (OSError, ValueError) as exc:
             raise ApiError(
                 500,

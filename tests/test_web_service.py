@@ -2072,38 +2072,36 @@ def test_open_chunk_runs_opener_without_shell_and_maps_errors(
 def test_open_chunk_returns_while_opener_still_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import os
-    import signal
-
-    pid_file = tmp_path / "opener.pid"
-    code = (
-        "import os,time;"
-        f"open({str(pid_file)!r},'w').write(str(os.getpid()));"
-        "time.sleep(5)"
-    )
+    code = "import time; time.sleep(5)"
     monkeypatch.setenv("SEEKR_OPENER", subprocess.list2cmdline([sys.executable, "-c", code]))
 
     docs = _root(tmp_path, "open-slow")
     _write_docs(docs, {"notes.md": "# Title\n\nsome body text\n"})
     db_path = tmp_path / "slow.db"
     config_path = _write_config(tmp_path, roots=[docs], db_path=db_path)
+    real_popen = subprocess.Popen
+    children: list[subprocess.Popen[bytes]] = []
+
+    def spy(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        child = real_popen(*args, **kwargs)  # type: ignore[call-overload]
+        children.append(child)
+        return child
+
     try:
         with _service(config_path, tmp_path) as service:
             assert _wait_job(service, service.start_index()).state == "succeeded"
             chunk = _chunk_id_for_path(db_path, str(docs / "notes.md"))
-            started = time.monotonic()
-            service.open_chunk(chunk)
-            elapsed = time.monotonic() - started
+            with mock.patch("subprocess.Popen", side_effect=spy):
+                started = time.monotonic()
+                service.open_chunk(chunk)
+                elapsed = time.monotonic() - started
             assert elapsed < 3
-            deadline = time.monotonic() + 5
-            while not pid_file.exists() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            assert pid_file.exists(), "opener never started"
-            os.kill(int(pid_file.read_text()), 0)  # still running after return
+            assert len(children) == 1
+            assert children[0].poll() is None  # still running after return
     finally:
-        if pid_file.exists():
-            with contextlib.suppress(OSError, ValueError):
-                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+        for child in children:
+            child.kill()
+            child.wait(timeout=10)
 
 
 def test_remove_root_purges_config_and_db_respects_prefix_lane_and_daemon(
