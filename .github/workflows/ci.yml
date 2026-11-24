@@ -18,9 +18,25 @@ jobs:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # The macOS python.org build that actions/setup-python installs lacks
+      # sqlite3 extension loading, which sqlite-vec needs; uv's managed CPython
+      # has it. Linux and Windows keep setup-python.
+      - if: runner.os != 'macOS'
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - if: runner.os == 'macOS'
+        uses: astral-sh/setup-uv@v6
+      - if: runner.os == 'macOS'
+        shell: bash
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
+        run: |
+          uv python install ${{ matrix.python-version }}
+          uv venv --seed --python ${{ matrix.python-version }} "$RUNNER_TEMP/py"
+          echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
+      - shell: bash
+        run: python -c "import sqlite3, sys; print(sys.version); sqlite3.connect(':memory:').enable_load_extension(False)"
       - run: pip install -e ".[dev]"
       # PyTorch is large and slow to install; the default backend is ONNX. The
       # torch-dependent tests skip themselves when sentence-transformers is
@@ -47,9 +63,25 @@ jobs:
       - run: |
           echo "VENV=$RUNNER_TEMP/m" >> "$GITHUB_ENV"
           if [ "$RUNNER_OS" = Windows ]; then echo "BIN=Scripts" >> "$GITHUB_ENV"; else echo "BIN=bin" >> "$GITHUB_ENV"; fi
-      - uses: actions/setup-python@v5
+      # The macOS python.org build that actions/setup-python installs lacks
+      # sqlite3 extension loading, which sqlite-vec needs; uv's managed CPython
+      # has it. Linux and Windows keep setup-python.
+      - if: runner.os != 'macOS'
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - if: runner.os == 'macOS'
+        uses: astral-sh/setup-uv@v6
+      - if: runner.os == 'macOS'
+        shell: bash
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
+        run: |
+          uv python install "3.12"
+          uv venv --seed --python "3.12" "$RUNNER_TEMP/py"
+          echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
+      - shell: bash
+        run: python -c "import sqlite3, sys; print(sys.version); sqlite3.connect(':memory:').enable_load_extension(False)"
       - run: pip install build
       - run: python -m build --wheel
       - run: |
@@ -72,9 +104,25 @@ jobs:
       - run: |
           echo "VENV=$RUNNER_TEMP/v" >> "$GITHUB_ENV"
           if [ "$RUNNER_OS" = Windows ]; then echo "BIN=Scripts" >> "$GITHUB_ENV"; else echo "BIN=bin" >> "$GITHUB_ENV"; fi
-      - uses: actions/setup-python@v5
+      # The macOS python.org build that actions/setup-python installs lacks
+      # sqlite3 extension loading, which sqlite-vec needs; uv's managed CPython
+      # has it. Linux and Windows keep setup-python.
+      - if: runner.os != 'macOS'
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - if: runner.os == 'macOS'
+        uses: astral-sh/setup-uv@v6
+      - if: runner.os == 'macOS'
+        shell: bash
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
+        run: |
+          uv python install "3.12"
+          uv venv --seed --python "3.12" "$RUNNER_TEMP/py"
+          echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
+      - shell: bash
+        run: python -c "import sqlite3, sys; print(sys.version); sqlite3.connect(':memory:').enable_load_extension(False)"
       - run: pip install build
       - run: python -m build
       - run: |
@@ -95,9 +143,25 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # The macOS python.org build that actions/setup-python installs lacks
+      # sqlite3 extension loading, which sqlite-vec needs; uv's managed CPython
+      # has it. Linux and Windows keep setup-python.
+      - if: runner.os != 'macOS'
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - if: runner.os == 'macOS'
+        uses: astral-sh/setup-uv@v6
+      - if: runner.os == 'macOS'
+        shell: bash
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
+        run: |
+          uv python install "3.12"
+          uv venv --seed --python "3.12" "$RUNNER_TEMP/py"
+          echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
+      - shell: bash
+        run: python -c "import sqlite3, sys; print(sys.version); sqlite3.connect(':memory:').enable_load_extension(False)"
       - run: pip install -e ".[dev]"
       - if: runner.os == 'Linux'
         run: pip install -e ".[dev,torch]"
