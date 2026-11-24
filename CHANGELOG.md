@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Service routes treat only drive and UNC paths as absolute on Windows, the same on every Python version (Python 3.13 already did; 3.11 and 3.12 accepted a drive-less `\x`).
 - An edit that keeps a file's size and lands within one filesystem timestamp tick of indexing it is now caught when the file is checked again soon after, before the index records other writes more than 2 s later (for example, a quick re-save picked up by the next sync or watcher event). Files modified within 2 s of the latest index write are hashed instead of trusting an unchanged mtime and size. Before, such an edit was always missed.
 - Renaming a just-written file on macOS no longer re-embeds it.
+- The watcher indexes a file created where another was just moved away (A→B, new A, B→C) instead of leaving it for the next full sync.
 
 ## [0.2.0] - 2026-11-23
 
