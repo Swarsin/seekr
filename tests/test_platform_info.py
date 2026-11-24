@@ -16,6 +16,7 @@ from seekr.platform_info import (
     mount_for,
     parse_mounts,
     read_mounts,
+    split_roots,
     windows_path,
     wslpath_windows,
 )
@@ -243,3 +244,15 @@ class PlatformInfoTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SplitRootsTests(unittest.TestCase):
+    def test_split_roots_separates_native_and_polled_in_order(self) -> None:
+        mounts = parse_mounts(MOUNTS)
+
+        native, polled = split_roots(
+            [Path("/home/a/notes"), Path("/mnt/c/Users/b"), Path("/srv/x")], mounts
+        )
+
+        self.assertEqual(polled, [Path("/mnt/c/Users/b")])
+        self.assertEqual(native, [Path("/home/a/notes"), Path("/srv/x")])

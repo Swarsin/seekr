@@ -329,14 +329,6 @@ def _format_service_status(service: dict[str, Any]) -> str:
     return "service: not running"
 
 
-def _resolve_root(root: Path) -> Path:
-    expanded = Path(root).expanduser()
-    try:
-        return expanded.resolve(strict=False)
-    except (OSError, RuntimeError):
-        return expanded
-
-
 def _polled_watch_info(
     daemon_running: bool,
     sock: Path,
@@ -372,13 +364,7 @@ def _polled_watch_info(
             return [Path(item) for item in raw_roots], interval
 
     mounts = platform_info.read_mounts()
-    polled: list[Path] = []
-    for root in cfg.roots:
-        resolved = _resolve_root(root)
-        if platform_info.is_slow_path(resolved, mounts) or (
-            platform_info.is_slow_path(Path(root).expanduser(), mounts)
-        ):
-            polled.append(resolved)
+    _, polled = platform_info.split_roots(cfg.roots, mounts)
     return polled, cfg.poll_interval_seconds
 
 

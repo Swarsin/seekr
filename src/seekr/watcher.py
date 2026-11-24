@@ -257,15 +257,9 @@ class Watcher:
         active_mounts = (
             tuple(platform_info.read_mounts()) if self._mounts is None else self._mounts
         )
-        native_roots: list[Path] = []
-        polled_roots: list[Path] = []
-        for root, resolved in zip(self._roots, self._resolved_roots, strict=True):
-            if platform_info.is_slow_path(resolved, active_mounts) or (
-                platform_info.is_slow_path(root, active_mounts)
-            ):
-                polled_roots.append(resolved)
-            else:
-                native_roots.append(resolved)
+        native_roots, polled_roots = platform_info.split_roots(
+            self._roots, active_mounts
+        )
         self._native_roots = tuple(native_roots)
         self._polled_roots = tuple(polled_roots)
 
@@ -612,10 +606,7 @@ class Watcher:
 
     @staticmethod
     def _resolve(path: Path) -> Path:
-        try:
-            return Path(path).expanduser().resolve(strict=False)
-        except (OSError, RuntimeError):
-            return Path(path).expanduser()
+        return platform_info.resolve_root(path)
 
     def _record_error(self, message: str, exc: BaseException | None) -> None:
         detail = message

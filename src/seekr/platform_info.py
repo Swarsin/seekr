@@ -132,6 +132,34 @@ def is_slow_path(path: Path, mounts: Sequence[Mount]) -> bool:
     return mount is not None and mount.fstype in SLOW_FSTYPES
 
 
+def resolve_root(path: Path | str) -> Path:
+    """Expand and resolve a watch root without requiring it to exist."""
+    expanded = Path(path).expanduser()
+    try:
+        return expanded.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return expanded
+
+
+def is_polled_root(root: Path | str, mounts: Sequence[Mount]) -> bool:
+    """Return ``True`` if the watcher polls *root* instead of using inotify."""
+    expanded = Path(root).expanduser()
+    return is_slow_path(resolve_root(expanded), mounts) or is_slow_path(
+        expanded, mounts
+    )
+
+
+def split_roots(
+    roots: Sequence[Path | str], mounts: Sequence[Mount]
+) -> tuple[list[Path], list[Path]]:
+    """Return resolved ``(native, polled)`` watch roots, in configured order."""
+    native: list[Path] = []
+    polled: list[Path] = []
+    for root in roots:
+        (polled if is_polled_root(root, mounts) else native).append(resolve_root(root))
+    return native, polled
+
+
 def windows_path(path: str, mounts: Sequence[Mount]) -> str | None:
     """Convert a POSIX *path* on a Windows drive mount to ``X:\\...`` form."""
     mount = mount_for(Path(path), mounts)
