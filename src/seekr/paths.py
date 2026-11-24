@@ -9,8 +9,15 @@ from pathlib import Path
 from platformdirs import PlatformDirs
 
 
-def _dirs() -> PlatformDirs:
-    return PlatformDirs("seekr", appauthor=False, roaming=False)
+def _dirs(platform: str) -> PlatformDirs:
+    """Return the platformdirs implementation for ``platform`` (not the host)."""
+    if platform == "win32":
+        from platformdirs.windows import Windows as impl
+    elif platform == "darwin":
+        from platformdirs.macos import MacOS as impl
+    else:
+        from platformdirs.unix import Unix as impl
+    return impl("seekr", appauthor=False, roaming=False)
 
 
 def _xdg(env_var: str, fallback: Path) -> Path:
@@ -20,30 +27,30 @@ def _xdg(env_var: str, fallback: Path) -> Path:
     return Path.home() / fallback / "seekr"
 
 
-def config_dir() -> Path:
+def config_dir(*, platform: str = sys.platform) -> Path:
     """Return the directory holding config.toml."""
-    if sys.platform.startswith("linux"):
+    if platform.startswith("linux"):
         return _xdg("XDG_CONFIG_HOME", Path(".config"))
-    return Path(_dirs().user_config_dir)
+    return Path(_dirs(platform).user_config_dir)
 
 
-def data_dir() -> Path:
+def data_dir(*, platform: str = sys.platform) -> Path:
     """Return the directory holding the index database."""
-    if sys.platform.startswith("linux"):
+    if platform.startswith("linux"):
         return _xdg("XDG_DATA_HOME", Path(".local") / "share")
-    return Path(_dirs().user_data_dir)
+    return Path(_dirs(platform).user_data_dir)
 
 
-def state_dir() -> Path:
+def state_dir(*, platform: str = sys.platform) -> Path:
     """Return the directory for runtime state such as the service file."""
-    return Path(_dirs().user_state_dir)
+    return Path(_dirs(platform).user_state_dir)
 
 
-def cache_dir() -> Path:
+def cache_dir(*, platform: str = sys.platform) -> Path:
     """Return the cache directory."""
-    return Path(_dirs().user_cache_dir)
+    return Path(_dirs(platform).user_cache_dir)
 
 
-def service_file() -> Path:
+def service_file(*, platform: str = sys.platform) -> Path:
     """Return the path of the background service's state file."""
-    return state_dir() / "service.json"
+    return state_dir(platform=platform) / "service.json"

@@ -34,8 +34,46 @@ class PathsTests(unittest.TestCase):
         self.assertIn("AppData\\Local", str(paths.data_dir()))
 
     def test_service_file_in_state_dir(self) -> None:
-        self.assertEqual(paths.service_file().name, "service.json")
-        self.assertEqual(paths.service_file().parent, paths.state_dir())
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": "/x/state"}):
+            self.assertEqual(
+                paths.service_file(platform="linux"), Path("/x/state/seekr/service.json")
+            )
+            self.assertEqual(paths.state_dir(platform="linux"), Path("/x/state/seekr"))
+
+    def test_windows_dirs_are_local_not_roaming(self) -> None:
+        def fake_folder(csidl: str) -> str:
+            return {
+                "CSIDL_LOCAL_APPDATA": "C:\\Users\\u\\AppData\\Local",
+                "CSIDL_APPDATA": "C:\\Users\\u\\AppData\\Roaming",
+            }[csidl]
+
+        with mock.patch("platformdirs.windows.get_win_folder", fake_folder):
+            for result in (
+                paths.config_dir(platform="win32"),
+                paths.data_dir(platform="win32"),
+                paths.state_dir(platform="win32"),
+                paths.cache_dir(platform="win32"),
+                paths.service_file(platform="win32"),
+            ):
+                text = str(result).replace("/", "\\")
+                self.assertIn("AppData\\Local\\seekr", text)
+                self.assertNotIn("Roaming", text)
+            self.assertEqual(paths.service_file(platform="win32").name, "service.json")
+
+    def test_darwin_dirs_under_library(self) -> None:
+        with (
+            mock.patch("pathlib.Path.home", return_value=Path("/Users/u")),
+            mock.patch("os.path.expanduser", lambda p: p.replace("~", "/Users/u", 1)),
+        ):
+            self.assertEqual(
+                paths.data_dir(platform="darwin"),
+                Path("/Users/u/Library/Application Support/seekr"),
+            )
+            self.assertEqual(
+                paths.service_file(platform="darwin").parent,
+                paths.state_dir(platform="darwin"),
+            )
+            self.assertIn("Library", str(paths.state_dir(platform="darwin")))
 
 
 if __name__ == "__main__":
