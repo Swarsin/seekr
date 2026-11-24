@@ -20,16 +20,21 @@ diagnosable security rule, not a missing-token accident.
 
 ## Authentication and request rules
 
+**Shared machines.** The service binds to loopback (`127.0.0.1`) only, and its token and browser-origin checks protect it from websites, not from other accounts on the same computer: any local user can connect to the port and obtain the token from `/api/session`, because the `Host`, `Origin` and `Sec-Fetch-Site` headers it checks are easy to forge outside a browser (for example with `curl`). That user could then search your index, read indexed passages and change your folders. Don't run the service or `seekr web` on a multi-user machine where you don't trust the other users.
+
 - `GET /api/session` is the only `/api/*` exemption from the token. It requires
   `X-Seekr-Client: 1` and returns `{token, limits}`. It returns no config
   contents.
 - Every other `/api/*` call requires `X-Seekr-Token` with the ephemeral token
   from session. Compare it with `hmac.compare_digest`, never `==`. A missing,
   duplicate, or wrong token is `403 forbidden`.
-- The token is memory-only, never in URLs, logs, HTML interpolation, or
-  persistent browser storage. It is one process-lifetime value returned by
-  every successful session bootstrap; it is not rotated per request, so a
-  refresh and multiple tabs can reuse it. Restarting the server invalidates it.
+- The token is never in URLs, logs, HTML interpolation, or persistent browser
+  storage. The background `seekr service` also writes it to its discovery file
+  `service.json` (mode `0600`, in a user-only state directory) so the CLI and
+  MCP server can call the service; `seekr web --foreground` keeps it in memory
+  only. It is one process-lifetime value returned by every successful session
+  bootstrap; it is not rotated per request, so a refresh and multiple tabs can
+  reuse it. Restarting the server invalidates it.
 - Host must be exactly `127.0.0.1:<actual bound port>`. Do not accept
   `localhost`, a different port, a missing Host, or a forwarded-host alias.
   `--port 0` records the actual bound port before any request is validated.

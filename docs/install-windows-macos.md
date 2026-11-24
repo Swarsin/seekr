@@ -106,6 +106,8 @@ Stop the service with `seekr service stop`. To remove the agent so it no longer 
 
 **Linux.** See [`contrib/seekr.service`](https://github.com/Swarsin/seekr/blob/main/contrib/seekr.service) for a systemd user unit.
 
+**Shared machines.** The service binds to loopback (`127.0.0.1`) only, and its token and browser-origin checks protect it from websites, not from other accounts on the same computer: any local user can connect to the port and obtain the token from `/api/session`, because the `Host`, `Origin` and `Sec-Fetch-Site` headers it checks are easy to forge outside a browser (for example with `curl`). That user could then search your index, read indexed passages and change your folders. Don't run the service or `seekr web` on a multi-user machine where you don't trust the other users. See [Privacy and local-only security](web.md#privacy-and-local-only-security).
+
 ## Limits on Windows and macOS
 
 - The old Unix-socket `seekr daemon` fast path is Linux-only and disabled on Windows and macOS. `seekr daemon` is a deprecated alias for `seekr service start` and will be removed in 0.4.0; use `seekr service start` instead.
