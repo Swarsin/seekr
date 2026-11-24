@@ -49,8 +49,59 @@ _SCRIPT = textwrap.dedent(
     assert cli_search.get_hits("alpha", mode="keyword", cfg=cfg) == []
     assert cli_search.try_daemon_hits("alpha", cfg=cfg) is None
     assert client.try_daemon_status() is None
-    assert cli_index._daemon_status()[0] is False
-    assert cli_index._polled_watch_info(True, cli_index._daemon_status()[1], cfg)
+    assert cli_index._daemon_status() == (False, None)
+    assert cli_index._polled_watch_info(True, None, cfg) == (
+        [],
+        cfg.poll_interval_seconds,
+    )
+
+    from pathlib import Path
+
+    from seekr import doctor, web_service
+
+    assert web_service._socket_is_live(Path("x")) is False
+    service = web_service.WebService(Path(os.environ["XDG_CONFIG_HOME"]) / "c.toml")
+    assert service._daemon_socket() is None
+    assert service._daemon_status() == (False, None)
+    assert service.daemon_present() is False
+    assert service.status().to_dict()["daemon"] == {"present": False, "socket": None}
+    state = doctor._default_daemon_state()
+    assert state.startswith("unavailable"), state
+
+    from seekr import cli_daemon
+
+    try:
+        cli_daemon.run_daemon(cfg=cfg)
+    except daemon.DaemonError:
+        pass
+    else:
+        raise AssertionError("run_daemon must refuse")
+    try:
+        daemon.serve(object(), Path("x.sock"), None)
+    except daemon.DaemonError:
+        pass
+    else:
+        raise AssertionError("serve must refuse")
+
+    import contextlib
+    import io
+
+    for argv in (["status"], ["status", "--json"]):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            try:
+                cli.app(argv, standalone_mode=False)
+            except SystemExit as exc:
+                assert exc.code in (0, None), (argv, exc.code)
+        text = out.getvalue()
+        assert text.strip(), argv
+        assert "unavailable" not in text, text
+        assert "seekr.sock" not in text, text
+        if "--json" in argv:
+            import json
+
+            payload = json.loads(text)
+            assert payload["daemon"] == {"running": False, "socket": None}, payload
     print("ok")
     """
 )

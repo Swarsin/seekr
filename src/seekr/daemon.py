@@ -568,6 +568,8 @@ def serve(
     file is removed on clean shutdown and is never removed if it no longer
     belongs to this server.
     """
+    if not legacy_daemon_supported():
+        raise DaemonError("the legacy daemon is not supported on this platform")
     if stop_event is None:  # pragma: no branch - defensive for direct callers
         stop_event = threading.Event()
     path = Path(sock_path)

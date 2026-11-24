@@ -317,11 +317,11 @@ def reindex(
     _print_report(report)
 
 
-def _daemon_status() -> tuple[bool, Path]:
+def _daemon_status() -> tuple[bool, Path | None]:
     from .daemon import _socket_is_active, legacy_daemon_supported, socket_path
 
     if not legacy_daemon_supported():
-        return False, Path("/unavailable")
+        return False, None
     sock = socket_path()
     try:
         return _socket_is_active(sock), sock
@@ -358,7 +358,7 @@ def _format_service_status(service: dict[str, Any]) -> str:
 
 def _polled_watch_info(
     daemon_running: bool,
-    sock: Path,
+    sock: Path | None,
     cfg: Config,
     service_running: bool = False,
 ) -> tuple[list[Path], int]:
@@ -399,7 +399,7 @@ def _polled_watch_info(
 
 
 def _echo_daemon_status(
-    daemon_running: bool, sock: Path, cfg: Config, service: dict[str, Any]
+    daemon_running: bool, sock: Path | None, cfg: Config, service: dict[str, Any]
 ) -> None:
     typer.echo(_format_service_status(service))
     polled_roots, poll_interval = _polled_watch_info(
@@ -481,7 +481,7 @@ def status(
                                     "schema_version": None,
                                     "daemon": {
                                         "running": daemon_running,
-                                        "socket": str(sock),
+                                        "socket": None if sock is None else str(sock),
                                     },
                                     "service": service,
                                 },
@@ -545,7 +545,7 @@ def status(
                     "embed_backend": cfg.embed_backend,
                     "daemon": {
                         "running": daemon_running,
-                        "socket": str(sock),
+                        "socket": None if sock is None else str(sock),
                     },
                     "service": service,
                 },

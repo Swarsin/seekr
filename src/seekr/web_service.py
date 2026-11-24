@@ -537,27 +537,27 @@ class WebService:
 
     # -- daemon ------------------------------------------------------------
 
-    def _daemon_socket(self) -> Path:
+    def _daemon_socket(self) -> Path | None:
+        from .daemon import legacy_daemon_supported
+
+        if not legacy_daemon_supported():
+            return None
         configured = self._daemon_socket_path
         if configured is None:
-            from .daemon import legacy_daemon_supported, socket_path
+            from .daemon import socket_path
 
-            if not legacy_daemon_supported():
-                return Path("/unavailable")
             return socket_path()
         if callable(configured):
             return Path(configured())
         return Path(configured)
 
-    def _daemon_status(self) -> tuple[bool, Path]:
+    def _daemon_status(self) -> tuple[bool, Path | None]:
         try:
             path = self._daemon_socket()
         except Exception:  # noqa: BLE001 - status must stay usable
-            return False, Path("/unavailable")
-        from .daemon import legacy_daemon_supported
-
-        if not legacy_daemon_supported():
-            return False, path
+            return False, None
+        if path is None:
+            return False, None
         probe = self._daemon_probe or _socket_is_live
         try:
             return bool(probe(path)), path
@@ -747,7 +747,10 @@ class WebService:
         return StatusView(
             index=index.as_dict(),
             model=self._model_snapshot(model_name),
-            daemon={"present": present, "socket": str(socket_path)},
+            daemon={
+                "present": present,
+                "socket": None if socket_path is None else str(socket_path),
+            },
             config={
                 "state": config_state,
                 "path": str(inspection.path),
