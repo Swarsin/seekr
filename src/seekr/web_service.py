@@ -278,6 +278,8 @@ class WebService:
         # Signalled whenever the lane is released or shutdown begins.
         self._lane_free = threading.Condition(self._state_lock)
         self._config_write_lock = threading.Lock()
+        # Serialises model construction; searches never wait on the lane.
+        self._model_load_lock = threading.Lock()
         self._lane_kind: str | None = None
         self._lane_job_id: str | None = None
         self._root_writers = 0
@@ -434,6 +436,10 @@ class WebService:
         return build_embedder(cfg)
 
     def _load_model_for_lane(self, cfg: Config) -> tuple[Embedder, int]:
+        with self._model_load_lock:
+            return self._load_model_locked(cfg)
+
+    def _load_model_locked(self, cfg: Config) -> tuple[Embedder, int]:
         cached = self._cached_embedder(cfg.embed_model)
         if cached is not None:
             dim = int(cached.dim)
@@ -476,17 +482,30 @@ class WebService:
             self._lane_job_id = None
             self._lane_free.notify_all()
 
-    def run_in_lane(self, kind: str, fn: Callable[[], Any], *, wait: bool = True) -> Any:
+    def run_in_lane(
+        self,
+        kind: str,
+        fn: Callable[[], Any],
+        *,
+        wait: bool = True,
+        during_shutdown: bool = False,
+    ) -> Any:
         """Run ``fn`` holding the engine lane, waiting for it when ``wait``.
 
-        Raises ``409 busy`` once shutdown has begun (also for waiters).
+        Raises ``409 busy`` once shutdown has begun (also for waiters), unless
+        ``during_shutdown`` is set for final cleanup by the host.
         """
         with self._state_lock:
-            while wait and not self._shutting_down and (
-                self._lane_kind is not None or self._root_writers
+            while (
+                wait
+                and (during_shutdown or not self._shutting_down)
+                and (self._lane_kind is not None or self._root_writers)
             ):
                 self._lane_free.wait()
-            self._begin_lane(kind)
+            if during_shutdown and self._lane_kind is None and not self._root_writers:
+                self._lane_kind = kind
+            else:
+                self._begin_lane(kind)
         try:
             return fn()
         finally:
@@ -655,6 +674,8 @@ class WebService:
     # -- status ------------------------------------------------------------
 
     def status(self) -> StatusView:
+        # A stopping service must not look live to a new service instance.
+        self._reject_if_shutting_down()
         inspection = inspect_config(self._config_path)
         cfg: Config | None = None
         if inspection.state == "ok":
@@ -1627,23 +1648,45 @@ class WebService:
 
         return self._with_read_only_store(cfg, snapshot, run_with_store)
 
+    def _reject_if_downloading(self) -> None:
+        with self._state_lock:
+            if self._lane_kind == "download":
+                raise ApiError(409, "busy", "a model download is running")
+
+    def _search_embedder(self, cfg: Config) -> Embedder:
+        """Return the embedder for a search without waiting on index writes.
+
+        Searches read the index concurrently with index jobs and watcher
+        writes (SQLite WAL readers).  Only the first model load is exclusive:
+        it shows as the ``search`` lane when the lane is free, and otherwise
+        waits only for the model-load lock.
+        """
+        self._reject_if_downloading()
+        took_lane = False
+        if self._cached_embedder(cfg.embed_model) is None:
+            with self._state_lock:
+                if self._lane_kind is None and not self._root_writers:
+                    self._lane_kind = "search"
+                    took_lane = True
+        try:
+            return self._load_model_for_lane(cfg)[0]
+        finally:
+            if took_lane:
+                self._end_lane()
+
     def _hybrid_local_search(
         self, cfg: Config, request: SearchRequest
     ) -> tuple[list[object], list[object] | None]:
-        self._begin_lane("search")
-        try:
-            embedder = self._load_model_for_lane(cfg)[0]
-            hits = self._call_local_search(cfg, request, embedder)
-            spread_hits: list[object] | None = None
-            if request.spread:
-                spread_hits = (
-                    self._call_local_search(cfg, self._spread_request(request), embedder)
-                    if hits
-                    else []
-                )
-            return hits, spread_hits
-        finally:
-            self._end_lane()
+        embedder = self._search_embedder(cfg)
+        hits = self._call_local_search(cfg, request, embedder)
+        spread_hits: list[object] | None = None
+        if request.spread:
+            spread_hits = (
+                self._call_local_search(cfg, self._spread_request(request), embedder)
+                if hits
+                else []
+            )
+        return hits, spread_hits
 
     @staticmethod
     def _validate_search_filters(request: SearchRequest) -> None:
@@ -1819,7 +1862,7 @@ class WebService:
 
         from .cli_search import get_similar_hits
 
-        self._begin_lane("search")
+        self._reject_if_downloading()
         try:
             hits = list(
                 get_similar_hits(
@@ -1836,8 +1879,6 @@ class WebService:
             )
         except Exception as exc:
             raise self._map_search_error(exc) from exc
-        finally:
-            self._end_lane()
         return self._search_result(hits, started)
 
     # -- jobs: model check -------------------------------------------------

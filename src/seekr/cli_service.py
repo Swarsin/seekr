@@ -122,10 +122,11 @@ def _build_stop(typer_module: Any) -> Any:
 def _build_status(typer_module: Any) -> Any:
     def status() -> None:
         """Show the running seekr service's pid, port, version and uptime."""
-        from . import paths
-        from .service_discovery import read_service_info
+        from .service import find_running_service
 
-        info = read_service_info(paths.service_file())
+        # Probing the API (not just the pid) rejects stale files whose pid was
+        # reused and services that are already stopping.
+        info = find_running_service()
         if info is None:
             typer_module.echo("seekr service: not running")
             return

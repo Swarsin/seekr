@@ -781,9 +781,9 @@ def test_engine_lane_busy_keyword_bypass_and_status_real_first_index(
         with pytest.raises(ApiError) as raised:
             service.start_model_check()
         assert _error_code(raised.value) == "busy"
-        with pytest.raises(ApiError) as raised:
-            service.search(SearchRequest("xylophone", mode="hybrid"))
-        assert _error_code(raised.value) == "busy"
+        # Searches read concurrently with the index write.
+        hybrid = service.search(SearchRequest("xylophone", mode="hybrid"))
+        assert hybrid.hits
 
         keyword = service.search(SearchRequest("xylophone", mode="keyword"))
         assert keyword.hits
@@ -2464,19 +2464,49 @@ def test_similar_validation_and_error_mapping(tmp_path: Path) -> None:
             service.similar(SimilarRequest(path="/a"))
 
 
-def test_similar_is_refused_while_another_lane_is_busy(tmp_path: Path) -> None:
+def test_similar_runs_during_index_but_not_during_download(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, roots=[_root(tmp_path)])
-    with _service(config_path, tmp_path) as service:
+    with (
+        _service(config_path, tmp_path) as service,
+        mock.patch("seekr.cli_search.get_similar_hits", lambda *a, **k: []),
+    ):
         service._begin_lane("index")
         try:
-            with (
-                mock.patch("seekr.cli_search.get_similar_hits", lambda *a, **k: []),
-                pytest.raises(ApiError) as raised,
-            ):
+            assert service.similar(SimilarRequest(path="/a")).hits == ()
+        finally:
+            service._end_lane()
+        service._begin_lane("download")
+        try:
+            with pytest.raises(ApiError) as raised:
                 service.similar(SimilarRequest(path="/a"))
             assert _error_code(raised.value) == "busy"
         finally:
             service._end_lane()
+
+
+def test_search_is_refused_during_model_download(tmp_path: Path) -> None:
+    docs = _root(tmp_path)
+    _write_docs(docs, {"a.txt": "alpha xylophone notes\n"})
+    config_path = _write_config(tmp_path, roots=[docs])
+    with _service(config_path, tmp_path) as service:
+        assert _wait_job(service, service.start_index()).state == "succeeded"
+        service._begin_lane("download")
+        try:
+            with pytest.raises(ApiError) as raised:
+                service.search(SearchRequest("xylophone", mode="hybrid"))
+            assert _error_code(raised.value) == "busy"
+            assert service.search(SearchRequest("xylophone", mode="keyword")).hits
+        finally:
+            service._end_lane()
+
+
+def test_status_is_refused_once_shutdown_begins(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, roots=[_root(tmp_path)])
+    with _service(config_path, tmp_path) as service:
+        service.begin_shutdown()
+        with pytest.raises(ApiError) as raised:
+            service.status()
+        assert _error_code(raised.value) == "busy"
 
 
 def test_request_shutdown_invokes_callback_once_and_is_noop_without_one(

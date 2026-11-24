@@ -10,6 +10,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -21,7 +23,7 @@ import pytest
 
 from seekr import __version__, paths
 from seekr.embed import FakeEmbedder
-from seekr.service import SeekrService, ServiceAlreadyRunning
+from seekr.service import SeekrService, ServiceAlreadyRunning, ServiceStopping
 from seekr.service_discovery import read_service_info
 
 
@@ -308,6 +310,11 @@ def test_watcher_indexing_runs_in_engine_lane(env, request) -> None:
     handler.dispatch(_Event("created", str(note)))
     time.sleep(0.3)
     assert _documents(svc) == 1
+    # Searches are never refused because the write lane is held.
+    from seekr.web_contract import SearchRequest
+
+    for mode in ("hybrid", "vector", "keyword"):
+        assert svc.backend.search(SearchRequest("xylophones", mode=mode)).hits
 
     release.set()
     assert _wait_for(lambda: _documents(svc) == 2)
@@ -389,3 +396,130 @@ def test_stdin_stream_default_is_not_read_without_watch_stdin(env, request) -> N
     svc.start()
     time.sleep(0.1)
     assert read_service_info(paths.service_file()) is not None
+
+
+def test_search_succeeds_while_watcher_action_holds_lane(env, request) -> None:
+    from seekr.web_contract import SearchRequest
+
+    svc = _service(request)
+    svc.start()
+    _wait_idle(svc)
+    release = threading.Event()
+    holding = threading.Event()
+    original = svc._watch_indexer
+
+    def slow_indexer():
+        holding.set()
+        release.wait(5)
+        return original()
+
+    svc._watch_indexer = slow_indexer  # type: ignore[method-assign]
+    request.addfinalizer(release.set)
+    note = env / "docs" / "d.md"
+    note.write_text("delta notes\n", encoding="utf-8")
+    FakeObserver.created[-1].schedules[0][0].dispatch(_Event("created", str(note)))
+    assert holding.wait(5)
+    assert svc.backend.status().activity["lane"] == "index"
+
+    result = svc.backend.search(SearchRequest("xylophones", mode="hybrid"))
+
+    assert result.hits
+    release.set()
+
+
+def test_second_start_in_another_process_is_refused(env, request) -> None:
+    first = _service(request)
+    port = first.start()
+    before = read_service_info(paths.service_file())
+    code = (
+        "from seekr.embed import FakeEmbedder\n"
+        "from seekr.service import SeekrService, ServiceAlreadyRunning\n"
+        "svc = SeekrService(port=0, handshake_stdout=True,"
+        " embedder_factory=lambda cfg: FakeEmbedder())\n"
+        "try:\n"
+        "    svc.start()\n"
+        "    print('started')\n"
+        "except ServiceAlreadyRunning as exc:\n"
+        "    print('refused', exc.port)\n"
+        "finally:\n"
+        "    svc.stop()\n"
+    )
+    child_env = dict(os.environ)
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    child_env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [src, child_env.get("PYTHONPATH")])
+    )
+
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stderr
+    lines = done.stdout.splitlines()
+    assert json.loads(lines[0])["event"] == "existing"
+    assert lines[-1] == f"refused {port}"
+    assert read_service_info(paths.service_file()) == before
+
+
+def test_lock_holder_that_is_stopping_is_not_attached_to(env, request, capsys) -> None:
+    first = _service(request)
+    first.start()
+    before = read_service_info(paths.service_file())
+    first.backend.begin_shutdown()  # /api/status now refuses
+
+    with pytest.raises(ServiceStopping):
+        _service(request, handshake_stdout=True).start()
+
+    assert capsys.readouterr().out == ""
+    assert read_service_info(paths.service_file()) == before
+
+
+def test_restart_after_stop_reacquires_lifetime_lock(env, request) -> None:
+    first = _service(request)
+    first.start()
+    first.stop()
+
+    second = _service(request)
+    port = second.start()
+
+    info = read_service_info(paths.service_file())
+    assert info is not None and info.port == port
+
+
+def test_watch_store_is_closed_inside_engine_lane(env, request) -> None:
+    svc = _service(request)
+    svc.start()
+    _wait_idle(svc)
+    lanes: list[object] = []
+    original = svc._close_watch_store
+
+    def record() -> None:
+        lanes.append(svc.backend._activity()["lane"])
+        original()
+
+    svc._close_watch_store = record  # type: ignore[method-assign]
+    svc.stop()
+
+    assert lanes == ["index"]
+
+
+def test_cli_status_ignores_stale_file_with_live_pid(env) -> None:
+    from typer.testing import CliRunner
+
+    from seekr.cli import app
+    from seekr.service_discovery import ServiceInfo, write_service_info
+
+    write_service_info(
+        ServiceInfo(pid=os.getpid(), port=1, token="old", version="0", started_at="x"),
+        paths.service_file(),
+    )
+
+    result = CliRunner().invoke(app, ["service", "status"])
+
+    assert result.exit_code == 0
+    assert "not running" in result.output

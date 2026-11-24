@@ -937,11 +937,21 @@ def test_model_loading_lane_and_busy_second_engine_operation_over_http(
         assert snapshot["index"]["state"] == "ready"  # a read-only inspection
         assert snapshot["activity"] == {"lane": "search", "job_id": None}
 
-        # -- a second engine operation gets an immediate 409 busy
+        # -- concurrent searches wait for the one model load, never 409
+        waiting: list[threading.Thread] = []
         for mode in ("hybrid", "vector"):
-            response = _search(server, token, query="xylophone", mode=mode)
-            assert response.status == 409, (mode, response.text)
-            assert response.error_code() == "busy"
+
+            def concurrent(mode: str = mode) -> None:
+                try:
+                    results.append(_search(server, token, query="xylophone", mode=mode))
+                except BaseException as exc:  # noqa: BLE001 - collected below
+                    with lock:
+                        errors.append(exc)
+
+            waiting.append(threading.Thread(target=concurrent, daemon=False))
+            waiting[-1].start()
+
+        # -- other engine operations get an immediate 409 busy
         response = _empty_index(server, token)
         assert response.status == 409
         assert response.error_code() == "busy"
@@ -968,12 +978,14 @@ def test_model_loading_lane_and_busy_second_engine_operation_over_http(
         assert response.json()["hits"]
 
         gate.set()
-        client.join(timeout=20.0)
-        assert not client.is_alive()
+        for thread in (client, *waiting):
+            thread.join(timeout=20.0)
+            assert not thread.is_alive()
 
-        # -- the released search returned hits and the model is ready + cached
+        # -- the released searches returned hits and the model is ready + cached
         assert errors == []
-        assert results and results[0] is not None and results[0].status == 200
+        assert len(results) == 3
+        assert all(item is not None and item.status == 200 for item in results)
         response = _request(server, "GET", "/api/status", headers=_token(token))
         snapshot = response.json()
         assert snapshot["model"]["state"] == "ready"
@@ -1267,11 +1279,11 @@ def test_keyword_and_lane_conflicts_during_real_paused_index_over_http(
         assert response.status == 409, response.text
         assert response.error_code() == "busy"
 
-        # -- hybrid/vector are busy while keyword bypasses the lane
+        # -- every search mode reads concurrently with the index write
         for mode in ("hybrid", "vector"):
             response = _search(server, token, query=BATCH_WORD, mode=mode)
-            assert response.status == 409, (mode, response.text)
-            assert response.error_code() == "busy"
+            assert response.status == 200, (mode, response.text)
+            assert response.json()["hits"]
         started = time.monotonic()
         response = _search(
             server, token, query=BATCH_WORD, mode="keyword", k=5

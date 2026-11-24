@@ -49,13 +49,16 @@ if TYPE_CHECKING:
 __all__ = [
     "SeekrService",
     "ServiceAlreadyRunning",
+    "ServiceStopping",
+    "find_running_service",
     "service_request",
     "start_prewarm",
     "stored_dim",
 ]
 
 _LOGGER = logging.getLogger(__name__)
-_LIVENESS_TIMEOUT = 1.0
+# Generous: /api/status may wait on a busy index for its own bounded timeout.
+_LIVENESS_TIMEOUT = 6.0
 
 
 class ServiceAlreadyRunning(RuntimeError):
@@ -65,6 +68,10 @@ class ServiceAlreadyRunning(RuntimeError):
         super().__init__(f"seekr service is already running on port {port}")
         self.port = port
         self.info = info
+
+
+class ServiceStopping(RuntimeError):
+    """Another service holds the lifetime lock but is stopping or unresponsive."""
 
 
 # -- shared helpers (also used by ``seekr daemon``) --------------------------
@@ -152,7 +159,11 @@ def _answers(info: ServiceInfo) -> bool:
 
 
 def find_running_service(path: Path | None = None) -> ServiceInfo | None:
-    """Return the live service's discovery record, or None."""
+    """Return the discovery record of a live service that answers, or None.
+
+    A service that has begun shutting down refuses ``/api/status`` and so
+    counts as not running.
+    """
     info = read_service_info(path or paths.service_file())
     if info is None or not _answers(info):
         return None
@@ -210,6 +221,7 @@ class SeekrService:
         self._stop_thread: threading.Thread | None = None
 
         self._service_file: Path | None = None
+        self._lifetime_lock: Any | None = None
         self._web: WebService | None = None
         self._server: SeekrHTTPServer | None = None
         self._serve_thread: threading.Thread | None = None
@@ -247,23 +259,27 @@ class SeekrService:
 
         service_file = paths.service_file()
         service_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        # Held across check → bind → write so two services starting at once
-        # cannot both claim the discovery file.
-        start_lock = FileLock(service_file.with_name("service.lock"))
-        start_lock.acquire(shared=False)
-        try:
+        # Held exclusively for the whole service lifetime and released only
+        # after the discovery file is removed: whoever holds it owns
+        # service.json.  The discovery file and HTTP probe only describe the
+        # holder for the error message and the ``existing`` handshake.
+        lifetime_lock = FileLock(service_file.with_name("service.lock"))
+        if not lifetime_lock.acquire(shared=False, blocking=False):
             existing = find_running_service(service_file)
-            if existing is not None:
-                if self._handshake_stdout:
-                    self._emit("existing", existing)
-                raise ServiceAlreadyRunning(existing.port, existing)
-            try:
-                info = self._bind_and_publish(service_file)
-            except BaseException:
-                self.stop()
-                raise
-        finally:
-            start_lock.release()
+            if existing is None:
+                raise ServiceStopping(
+                    "another seekr service is still stopping or not responding; "
+                    "try again shortly"
+                )
+            if self._handshake_stdout:
+                self._emit("existing", existing)
+            raise ServiceAlreadyRunning(existing.port, existing)
+        self._lifetime_lock = lifetime_lock
+        try:
+            info = self._bind_and_publish(service_file)
+        except BaseException:
+            self.stop()
+            raise
 
         try:
             self._start_background(info)
@@ -498,15 +514,18 @@ class SeekrService:
             watcher.stop()
         if web is not None:
             web.shutdown()  # waits for the active job
+            # The watcher Store belongs to the engine lane, even at shutdown.
+            web.run_in_lane("index", self._close_watch_store, during_shutdown=True)
         if server is not None:
             # BaseServer.shutdown() blocks forever unless serve_forever runs.
             if self._serve_thread is not None:
                 server.shutdown()
                 self._serve_thread.join()
             server.server_close()
-        self._close_watch_store()
         if self._service_file is not None:
             remove_service_info(self._service_file, os.getpid())
+        if self._lifetime_lock is not None:
+            self._lifetime_lock.release()
         log_event(_LOGGER, logging.INFO, "service.stop")
 
 
