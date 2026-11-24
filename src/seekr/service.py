@@ -507,6 +507,17 @@ class SeekrService:
 
     def _teardown(self) -> None:
         self._stop_requested.set()
+        try:
+            self._stop_components()
+            if self._service_file is not None:
+                remove_service_info(self._service_file, os.getpid())
+        finally:
+            # Never leak ownership: release even if a step above raised.
+            if self._lifetime_lock is not None:
+                self._lifetime_lock.release()
+        log_event(_LOGGER, logging.INFO, "service.stop")
+
+    def _stop_components(self) -> None:
         web, watcher, server = self._web, self._watcher, self._server
         if web is not None:
             web.begin_shutdown()  # wakes watcher actions waiting for the lane
@@ -522,12 +533,6 @@ class SeekrService:
                 server.shutdown()
                 self._serve_thread.join()
             server.server_close()
-        if self._service_file is not None:
-            remove_service_info(self._service_file, os.getpid())
-        if self._lifetime_lock is not None:
-            self._lifetime_lock.release()
-        log_event(_LOGGER, logging.INFO, "service.stop")
-
 
 def _install_stop_signals(stop: threading.Event) -> Callable[[], None]:
     if threading.current_thread() is not threading.main_thread():

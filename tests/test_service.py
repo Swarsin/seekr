@@ -523,3 +523,22 @@ def test_cli_status_ignores_stale_file_with_live_pid(env) -> None:
 
     assert result.exit_code == 0
     assert "not running" in result.output
+
+
+def test_lifetime_lock_is_released_when_teardown_fails(env, request) -> None:
+    first = _service(request)
+    first.start()
+    assert first._server is not None
+
+    real_close = first._server.server_close
+    request.addfinalizer(real_close)
+
+    def broken_close() -> None:
+        raise OSError("close failed")
+
+    first._server.server_close = broken_close  # type: ignore[method-assign]
+    with pytest.raises(OSError):
+        first.stop()
+
+    second = _service(request)
+    assert second.start() > 0

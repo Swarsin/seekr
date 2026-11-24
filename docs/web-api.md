@@ -76,7 +76,7 @@ diagnosable security rule, not a missing-token accident.
 | Method and route | Request | Successful response | Error codes |
 | --- | --- | --- | --- |
 | `GET /api/session` | No body; no query; `X-Seekr-Client: 1`; exact Host; valid Origin/Sec-Fetch as above | `200 {token: string, limits: object}`; no config contents | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `500 internal_error` |
-| `GET /api/status` | Token; no body; no query | `200` status object; never loads a model or takes the lifecycle lock | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `500 internal_error` |
+| `GET /api/status` | Token; no body; no query | `200` status object; never loads a model or takes the lifecycle lock | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy` (shutdown has begun), `500 internal_error` |
 | `GET /api/roots` | Token; no body; no query | `200 {roots: string[], config_path: string, revision: string}`; roots in stored order and form | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 config_invalid`, `500 internal_error` |
 | `POST /api/roots` | Token; no query; JSON `{path: string, revision: string}` | `200 {roots, config_path, revision, daemon_restart_required: false (deprecated), warning: null}` | `400 invalid_request`, `400 invalid_root`, `400 roots_limit`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 stale_config`, `409 duplicate_root`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `500 config_write_failed` |
 | `POST /api/roots/remove` | Token; no query; JSON `{path: string, revision: string}` | `200 {roots, config_path, revision, daemon_restart_required: false (deprecated), warning: null}` | `400 invalid_request`, `400 invalid_root`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 stale_config`, `409 daemon_active`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `500 config_write_failed` |
@@ -84,8 +84,8 @@ diagnosable security rule, not a missing-token accident.
 | `GET /api/preview?chunk=<id>` | Token; no body; exact query `chunk=<^[1-9]\d{0,18}$>` | `200 {chunk, kind, path, locator, location, text, page_image}` | `400 invalid_request`, `403 forbidden`, `404 not_found`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `409 incompatible_index`, `500 internal_error`, `503 index_unavailable` |
 | `GET /api/preview/page?chunk=<id>` | Token; no body; exact query `chunk=<^[1-9]\d{0,18}$>` | `200` raw `image/png` bytes (`Content-Type: image/png`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, no CORS) | `400 invalid_request`, `403 forbidden`, `404 not_found`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `409 incompatible_index`, `500 internal_error`, `503 index_unavailable` |
 | `POST /api/open` | Token; no query; JSON `{chunk: int}` (`> 0`, strict integer, no unknown keys) | `200 {opened: true}` | `400 invalid_request`, `403 forbidden`, `404 not_found`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `409 incompatible_index`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable` |
-| `POST /api/search` | Token; no query; JSON `{query, mode?, k?, per_file?, path?, kind?, since?, module?, week?, spread?, rerank?, explain?}`; `rerank` and `explain` are strict booleans (default `false`); `rerank: true` with `mode: "keyword"` is `400 invalid_request` | `200 {hits: Hit[], took_ms: number, spread?: SpreadGroup[]}`; each hit carries an `explain` object only when `explain` was requested | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable`, `503 model_unavailable`, `503 daemon_failure` |
-| `POST /api/similar` | Token; no query; JSON `{path: string (absolute), k?, per_file?, path_prefix?, kind?, since?, module?, week?}`; `k` 1-50 (default 10), `per_file` 1-10 (default 1), filters as for search | `200 {hits: Hit[], took_ms: number}`; hits similar to the file at `path` (the file itself is excluded) | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable` |
+| `POST /api/search` | Token; no query; JSON `{query, mode?, k?, per_file?, path?, kind?, since?, module?, week?, spread?, rerank?, explain?}`; `rerank` and `explain` are strict booleans (default `false`); `rerank: true` with `mode: "keyword"` is `400 invalid_request` | `200 {hits: Hit[], took_ms: number, spread?: SpreadGroup[]}`; each hit carries an `explain` object only when `explain` was requested; runs concurrently with index jobs and watcher writes | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy` (shutting down; hybrid/vector during a model download; keyword lock/busy wait), `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable`, `503 model_unavailable`, `503 daemon_failure` |
+| `POST /api/similar` | Token; no query; JSON `{path: string (absolute), k?, per_file?, path_prefix?, kind?, since?, module?, week?}`; `k` 1-50 (default 10), `per_file` 1-10 (default 1), filters as for search | `200 {hits: Hit[], took_ms: number}`; hits similar to the file at `path` (the file itself is excluded); runs concurrently with index jobs and watcher writes | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy` (shutting down or during a model download), `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable` |
 | `POST /api/shutdown` | Token; no query; JSON exactly `{}` | `202 {stopping: true}`; the process stops after the response is sent | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error` |
 | `POST /api/index/paths` | Token; no query; JSON `{paths: string[]}`; 1-50 absolute path strings of at most 4,096 UTF-8 bytes each; every path must exist | `202 {job_id: string}`; an `index` job that indexes only those files/directories | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 daemon_active`, `409 incompatible_index`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error`, `503 index_unavailable`, `503 model_unavailable` |
 | `POST /api/model/check` | Token; no query; JSON exactly `{}` | `202 {job_id: string}`; job result arrives through the job endpoint | `400 invalid_request`, `403 forbidden`, `405 method_not_allowed`, `409 busy`, `409 config_invalid`, `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_error` |
@@ -333,25 +333,34 @@ Config-write safety details are part of the contract:
   a writable `Store`. For a local search (after the daemon attempt), a missing
   or empty index returns `200` with empty hits. An incompatible index returns
   `409 incompatible_index`; an index inspection error returns
-  `503 index_unavailable`. Hybrid/vector local search uses the lane; a second
-  engine operation is `409 busy`. If a hybrid/vector model is known
-  unavailable, return `503 model_unavailable`; keyword never needs the model.
+  `503 index_unavailable`. Hybrid/vector local search and `similar` do not
+  take the engine lane: they read the index as SQLite WAL readers,
+  concurrently with index jobs and watcher writes, and are never refused
+  because an index operation holds the lane. They are refused with `409 busy`
+  only while a `download` job holds the lane (model files are being replaced)
+  or once shutdown has begun; keyword search is unaffected by downloads. The
+  first model load is serialised: when the lane is idle it is shown as the
+  `search` lane (other engine operations are then `409 busy`), and concurrent
+  searches wait for that one load instead of being refused. If a hybrid/vector
+  model is known unavailable, return `503 model_unavailable`; keyword never
+  needs the model.
 - After the daemon attempt, a missing or empty local index short-circuits to
   `200` with empty hits for every search mode, without loading the model or
   acquiring the lane. Search preflight precedence after
   authentication/body validation is: config validity →
   `409 incompatible_index` → `503 index_unavailable` →
-  `503 model_unavailable` (hybrid/vector only) → lane `409 busy`. After config
-  validity, the daemon attempt happens before this local index/model/lane
+  `503 model_unavailable` (hybrid/vector only) → `409 busy` while a `download`
+  job holds the lane (hybrid/vector only). After config
+  validity, the daemon attempt happens before this local index/model/download
   preflight; a reachable broken daemon is `503 daemon_failure` and is not
   cold-retried.
 - If a daemon socket is live, the service calls `try_daemon_hits` outside the
   lane. A returned list, including `[]`, is the response and bypasses the local
   embedder and lane. On `None` (no listener or daemon mismatch), keyword uses
-  the read-only path and hybrid/vector acquire the lane and call
-  `get_hits(..., use_daemon=False)`. If no daemon socket is live, keyword uses
-  the read-only path and hybrid/vector acquire the lane and call
-  `get_hits(..., use_daemon=False)`.
+  the read-only path and hybrid/vector call `get_hits(..., use_daemon=False)`
+  without taking the lane. If no daemon socket is live, keyword uses the
+  read-only path and hybrid/vector call `get_hits(..., use_daemon=False)`
+  without taking the lane.
 - Keyword lock/busy handling uses a 2-second deadline for shared
   lifecycle-lock acquisition and a 2-second SQLite busy timeout. A wait that
   cannot be resolved within its bound returns `409 busy`. Other read-only
@@ -410,7 +419,8 @@ Config-write safety details are part of the contract:
   within its 2-second bound maps to `409 busy`. These bounds cover waiting to
   start, not the duration of a successful read.
 - Status bypasses the shared lifecycle lock and never waits behind the engine
-  lane.
+  lane. Once shutdown has begun it returns `409 busy`, so a stopping process
+  never looks live (this applies to plain `seekr web` too).
 
 ### Daemon-first resolution and local-only fallback
 
@@ -470,7 +480,7 @@ def _build_searcher(
 - Web flow: if a daemon socket is live, call `try_daemon_hits` outside the
   lane. A returned list is the response and does not touch the lane. On `None`
   (no listener or daemon mismatch), keyword uses the read-only path;
-  hybrid/vector acquire the lane and call `get_hits(..., use_daemon=False)`. A
+  hybrid/vector call `get_hits(..., use_daemon=False)` without the lane. A
   reachable broken daemon raises `DaemonError` and maps to
   `503 daemon_failure`; do not cold-retry.
 - Vector and hybrid modes may access `.dim` to validate the stored dimension.
@@ -497,12 +507,14 @@ After authentication and body/field validation:
 | Other `SearchError`, `sqlite3.Error`, read-only inspection failure | `503 index_unavailable` |
 | Hybrid/vector with model state `unavailable` | `503 model_unavailable`; do not retry |
 | Local keyword lifecycle lock or SQLite busy beyond 2 seconds | `409 busy` |
-| Second engine operation while the lane is active | `409 busy` |
+| Hybrid/vector while a `download` job holds the lane | `409 busy` |
+| Search after shutdown has begun | `409 busy` |
 | Unexpected unclassified failure | `500 internal_error` |
 
-The local missing/empty short-circuit happens before model loading and lane
-acquisition for all modes. Hybrid/vector may build once inside the lane when
-the model state is `unchecked`, transitioning through `loading` to
+The local missing/empty short-circuit happens before model loading for all
+modes. Hybrid/vector may build the model once (under a model-load lock, shown
+as the `search` lane when the lane is idle) when the model state is
+`unchecked`, transitioning through `loading` to
 `ready`/`unavailable`; a successful load is cached. Keyword never loads the
 model.
 
@@ -673,7 +685,7 @@ request bodies, document text, tracebacks, or the token.
 | 404 | `not_found` | Unknown route, unknown path, missing allowlisted asset, or unknown/missing chunk or PDF preview page. Static, unknown, preview, and open routes. |
 | 404 | `job_not_found` | Unknown, expired, or malformed job ID. `GET /api/jobs/{job_id}`. |
 | 405 | `method_not_allowed` | Wrong method, including `OPTIONS`; no CORS/preflight response. Every route. |
-| 409 | `busy` | A second engine operation is active, a root write conflicts with the engine lane, or a read/purge cannot obtain its snapshot within the bounded wait. `POST /api/search`, `POST /api/roots`, `POST /api/roots/remove`, `POST /api/model/check`, `POST /api/index`, `POST /api/setup/download`, `GET /api/course`, `GET /api/preview`, `GET /api/preview/page`, `POST /api/open`. |
+| 409 | `busy` | A second engine operation is active, a root write conflicts with the engine lane, a read/purge cannot obtain its snapshot within the bounded wait, hybrid/vector search or similar is requested during a model download, or the service is shutting down (status, search, similar, root writes and job starts refuse new work once shutdown has begun). `GET /api/status`, `POST /api/search`, `POST /api/similar`, `POST /api/roots`, `POST /api/roots/remove`, `POST /api/model/check`, `POST /api/index`, `POST /api/setup/download`, `GET /api/course`, `GET /api/preview`, `GET /api/preview/page`, `POST /api/open`. |
 | 409 | `stale_config` | Revision mismatch or an external edit was detected before replace. `POST /api/roots`, `POST /api/roots/remove`. |
 | 409 | `daemon_active` | A seekr daemon socket is live and a web index or folder removal was requested. `POST /api/index`, `POST /api/roots/remove`. |
 | 409 | `incompatible_index` | Stored model/schema/quantization metadata is incompatible with the config. Local search, `POST /api/index`, `GET /api/course`, `GET /api/preview`, `GET /api/preview/page`, `POST /api/open`. |
@@ -830,4 +842,5 @@ same value that `GET /api/session` returns.
 
 `POST /api/shutdown` only requests a stop. The `202` is sent first, then the
 process shuts down on a separate thread; clients should poll or reconnect to
-confirm the service has exited.
+confirm the service has exited. From the moment shutdown begins, `GET
+/api/status` returns `409 busy`.
