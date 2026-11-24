@@ -127,8 +127,10 @@ def _is_busy_error(exc: BaseException) -> bool:
 
 
 def _socket_is_live(path: Path) -> bool:
-    from .daemon import socket_path_problem
+    from .daemon import legacy_daemon_supported, socket_path_problem
 
+    if not legacy_daemon_supported():
+        return False
     if socket_path_problem(path) is not None:
         return False
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -538,8 +540,10 @@ class WebService:
     def _daemon_socket(self) -> Path:
         configured = self._daemon_socket_path
         if configured is None:
-            from .daemon import socket_path
+            from .daemon import legacy_daemon_supported, socket_path
 
+            if not legacy_daemon_supported():
+                return Path("/unavailable")
             return socket_path()
         if callable(configured):
             return Path(configured())
@@ -550,6 +554,10 @@ class WebService:
             path = self._daemon_socket()
         except Exception:  # noqa: BLE001 - status must stay usable
             return False, Path("/unavailable")
+        from .daemon import legacy_daemon_supported
+
+        if not legacy_daemon_supported():
+            return False, path
         probe = self._daemon_probe or _socket_is_live
         try:
             return bool(probe(path)), path

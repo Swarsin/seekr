@@ -318,8 +318,10 @@ def reindex(
 
 
 def _daemon_status() -> tuple[bool, Path]:
-    from .daemon import _socket_is_active, socket_path
+    from .daemon import _socket_is_active, legacy_daemon_supported, socket_path
 
+    if not legacy_daemon_supported():
+        return False, Path("/unavailable")
     sock = socket_path()
     try:
         return _socket_is_active(sock), sock
@@ -360,6 +362,9 @@ def _polled_watch_info(
     cfg: Config,
     service_running: bool = False,
 ) -> tuple[list[Path], int]:
+    from .daemon import legacy_daemon_supported
+
+    daemon_running = daemon_running and legacy_daemon_supported()
     if not daemon_running and not service_running:
         return [], cfg.poll_interval_seconds
     payload = None

@@ -69,8 +69,15 @@ class DoctorReport:
 
 
 def _default_daemon_state() -> str:
-    from .daemon import _socket_is_active, socket_path, socket_path_problem
+    from .daemon import (
+        _socket_is_active,
+        legacy_daemon_supported,
+        socket_path,
+        socket_path_problem,
+    )
 
+    if not legacy_daemon_supported():
+        return "unavailable (not supported on this platform)"
     sock = socket_path()
     problem = socket_path_problem(sock)
     if problem is not None:

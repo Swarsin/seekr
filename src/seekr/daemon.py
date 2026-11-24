@@ -35,6 +35,7 @@ __all__ = [
     "MAX_REQUEST_BYTES",
     "MAX_RESPONSE_BYTES",
     "DaemonError",
+    "legacy_daemon_supported",
     "serve",
     "socket_path",
     "socket_path_problem",
@@ -56,8 +57,16 @@ class DaemonError(RuntimeError):
     """A daemon socket could not be created or safely served."""
 
 
+def legacy_daemon_supported() -> bool:
+    """Return whether the deprecated Unix-socket daemon can exist here."""
+    return hasattr(socket, "AF_UNIX") and os.name == "posix"
+
+
 def socket_path() -> Path:
-    """Return the daemon socket path, honouring ``XDG_RUNTIME_DIR``."""
+    """Return the daemon socket path, honouring ``XDG_RUNTIME_DIR``.
+
+    Only call this when :func:`legacy_daemon_supported` is true.
+    """
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
     if runtime_dir:
         return Path(runtime_dir).expanduser() / "seekr.sock"
@@ -424,6 +433,8 @@ def _serve_connection(
 
 
 def _socket_is_active(path: Path) -> bool:
+    if not legacy_daemon_supported():
+        return False
     if socket_path_problem(path) is not None:
         return False
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

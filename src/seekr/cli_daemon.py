@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .config import Config, load_config
-from .daemon import serve, socket_path
+from .daemon import DaemonError, legacy_daemon_supported, serve, socket_path
 from .embed import Embedder, build_embedder
 from .indexer import Indexer
 from .lifecycle import lifecycle_lock
@@ -92,6 +92,8 @@ def run_daemon(
 ) -> None:
     """Run the watcher and query daemon until *stop_event* is set."""
     selected_cfg = cfg if cfg is not None else load_config()
+    if not legacy_daemon_supported():
+        raise DaemonError("the legacy daemon is not supported on this platform")
     selected_socket = Path(sock_path) if sock_path is not None else socket_path()
     event = stop_event if stop_event is not None else threading.Event()
     restore_signals = (

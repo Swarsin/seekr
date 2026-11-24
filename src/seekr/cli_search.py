@@ -277,6 +277,10 @@ def _daemon_search(
     falls back to the local configured index; timeouts and other server errors
     propagate so a broken daemon is never silently ignored.
     """
+    from .daemon import legacy_daemon_supported
+
+    if not legacy_daemon_supported():
+        return None
     expected = {
         "db_path": str(
             Path(cfg.db_path).expanduser().resolve(strict=False)
