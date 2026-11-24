@@ -28,6 +28,7 @@ _IS_WINDOWS = os.name == "nt"
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _STILL_ACTIVE = 259
 _ERROR_ACCESS_DENIED = 5
+_PID_LIMIT = 2**31
 
 
 @dataclass(frozen=True)
@@ -61,11 +62,15 @@ class ServiceInfo:
             if not isinstance(value, kind) or isinstance(value, bool):
                 raise ValueError(f"service file field {name!r} must be {kind.__name__}")  # noqa: TRY004
             values[name] = value
+        if not 0 < values["pid"] < _PID_LIMIT:  # type: ignore[operator]
+            raise ValueError("service file field 'pid' is out of range")
+        if not 0 < values["port"] < 65536:  # type: ignore[operator]
+            raise ValueError("service file field 'port' is out of range")
         return cls(**values)  # type: ignore[arg-type]
 
 
 def pid_alive(pid: int) -> bool:
-    if pid <= 0:
+    if not 0 < pid < _PID_LIMIT:
         return False
     if _IS_WINDOWS:  # pragma: no cover - exercised only on Windows
         return _pid_alive_windows(pid)
@@ -75,7 +80,7 @@ def pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    except OSError:
+    except (OSError, OverflowError):
         return False
     return True
 

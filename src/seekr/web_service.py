@@ -1875,6 +1875,7 @@ class WebService:
                     module=request.module,
                     week=request.week,
                     cfg=cfg,
+                    use_service=False,
                 )
             )
         except Exception as exc:
@@ -1967,6 +1968,10 @@ class WebService:
             )
             indexer = indexer_factory(store, embedder, cfg)
             report = indexer.sync(list(cfg.roots if targets is None else targets))
+            # Keep ``seekr status`` in step with CLI-run indexing.
+            record_errors = getattr(store, "set_last_error_count", None)
+            if callable(record_errors):
+                record_errors(len(getattr(report, "errors", [])))
             report_payload = self._serialise_report(report)
             state = "partial" if getattr(report, "errors", []) else "succeeded"
             error = None

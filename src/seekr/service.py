@@ -17,6 +17,7 @@ loaded only by :meth:`SeekrService.start`.
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ from typing import TYPE_CHECKING, Any, TextIO
 from . import __version__, paths
 from .config import Config, ConfigError, default_config_path, load_config
 from .logging_config import log_event
+from .service_client import service_request
 from .service_discovery import (
     ServiceInfo,
     read_service_info,
@@ -113,42 +115,7 @@ def start_prewarm(embedder: Embedder, stop_event: threading.Event) -> threading.
     return thread
 
 
-def service_request(
-    port: int,
-    method: str,
-    path: str,
-    *,
-    token: str,
-    body: object = None,
-    timeout: float = 2.0,
-) -> tuple[int, Any]:
-    """Make one authenticated loopback API call; return (status, JSON body)."""
-    import urllib.error
-    import urllib.request
-
-    data = None if body is None else json.dumps(body).encode("utf-8")
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{int(port)}{path}", data=data, method=method
-    )
-    request.add_header("X-Seekr-Token", token)
-    if data is not None:
-        request.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            status, raw = response.status, response.read()
-    except urllib.error.HTTPError as exc:
-        with exc:
-            status, raw = exc.code, exc.read()
-    try:
-        payload = json.loads(raw) if raw else None
-    except ValueError:
-        payload = None
-    return status, payload
-
-
 def _answers(info: ServiceInfo) -> bool:
-    import http.client
-
     try:
         status, _ = service_request(
             info.port, "GET", "/api/status", token=info.token, timeout=_LIVENESS_TIMEOUT

@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,7 @@ from .course import display_module
 from .embed import Embedder, build_embedder
 from .indexer import Indexer, SyncReport
 from .lifecycle import LifecycleError, lifecycle_lock, rebuild_index
+from .service_client import ServiceClient, ServiceError, ServiceUnavailable
 from .store import Store
 
 __all__ = ["register"]
@@ -88,18 +91,88 @@ def _fatal(message: str) -> None:
     raise typer.Exit(code=1)
 
 
+_JOB_POLL_SECONDS = 0.5
+
+
+def _echo_report(
+    counts: Sequence[tuple[str, object]],
+    errors: Sequence[tuple[object, object]],
+    warnings: Sequence[tuple[object, object]],
+    error_total: int,
+    warning_total: int,
+) -> None:
+    for name, value in counts:
+        typer.echo(f"{name}: {value}")
+    typer.echo(f"errors: {error_total}")
+    typer.echo(f"warnings: {warning_total}")
+    for label, items, total in (
+        ("error", errors, error_total),
+        ("warning", warnings, warning_total),
+    ):
+        for path, message in items:
+            typer.echo(f"{label}: {path}: {message}")
+        if total > len(items):
+            typer.echo(f"{label}: ... {total - len(items)} more not shown")
+
+
+_COUNT_NAMES = ("added", "updated", "unchanged", "removed", "skipped")
+
+
 def _print_report(report: SyncReport) -> None:
-    typer.echo(f"added: {report.added}")
-    typer.echo(f"updated: {report.updated}")
-    typer.echo(f"unchanged: {report.unchanged}")
-    typer.echo(f"removed: {report.removed}")
-    typer.echo(f"skipped: {report.skipped}")
-    typer.echo(f"errors: {len(report.errors)}")
-    typer.echo(f"warnings: {len(report.warnings)}")
-    for path, message in report.errors:
-        typer.echo(f"error: {path}: {message}")
-    for path, message in report.warnings:
-        typer.echo(f"warning: {path}: {message}")
+    _echo_report(
+        [(name, getattr(report, name)) for name in _COUNT_NAMES],
+        report.errors,
+        report.warnings,
+        len(report.errors),
+        len(report.warnings),
+    )
+
+
+def _print_report_dict(report: dict[str, Any]) -> None:
+    """Print a service index-job report exactly like :func:`_print_report`."""
+
+    def diagnostics(key: str) -> list[tuple[object, object]]:
+        items = report.get(key) or []
+        return [(item.get("path"), item.get("message")) for item in items]
+
+    errors = diagnostics("errors")
+    warnings = diagnostics("warnings")
+    _echo_report(
+        [(name, report.get(name, 0)) for name in _COUNT_NAMES],
+        errors,
+        warnings,
+        int(report.get("error_total", len(errors))),
+        int(report.get("warning_total", len(warnings))),
+    )
+
+
+def _index_via_service(client: ServiceClient, paths: list[Path] | None) -> dict[str, Any]:
+    """Run an index job in the service and return its report.
+
+    :class:`ServiceUnavailable` before the job starts means "index locally";
+    once the job is running, losing the service is an error.
+    """
+    if paths:
+        job_id = client.index_paths(
+            [str(Path(item).expanduser().resolve()) for item in paths]
+        )
+    else:
+        job_id = client.index_roots()
+    while True:
+        time.sleep(_JOB_POLL_SECONDS)
+        try:
+            job = client.job(job_id)
+        except ServiceUnavailable as exc:
+            raise ServiceError(
+                f"lost contact with the seekr service while indexing: {exc}"
+            ) from exc
+        state = job.get("state")
+        if state == "running":
+            continue
+        report = job.get("report")
+        if state in ("succeeded", "partial") and isinstance(report, dict):
+            return report
+        raise ServiceError(str(job.get("error") or f"index job ended in state {state!r}"))
 
 
 def index(
@@ -119,6 +192,16 @@ def index(
                 "no index roots configured; add `roots = [...]` to config.toml "
                 "or pass PATH to `seekr index PATH`"
             )
+
+        client = ServiceClient.from_discovery()
+        if client is not None:
+            try:
+                service_report = _index_via_service(client, list(raw_paths or []))
+            except ServiceUnavailable:
+                pass
+            else:
+                _print_report_dict(service_report)
+                return
 
         embedder = _build_embedder(cfg)
         with lifecycle_lock(cfg.db_path, shared=True):

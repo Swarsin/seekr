@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -137,3 +138,22 @@ def test_failure_cleans_temp_file(p: Path, monkeypatch: pytest.MonkeyPatch) -> N
     with pytest.raises(OSError):
         write_service_info(INFO, p)
     assert list(p.parent.iterdir()) == []
+
+
+def test_pid_alive_absurd_pid_is_false() -> None:
+    assert pid_alive(2**70) is False
+    assert pid_alive(-(2**70)) is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("pid", 2**70), ("pid", 0), ("pid", 2**31), ("port", 0), ("port", 65536)],
+)
+def test_out_of_range_numbers_are_ignored(p: Path, field: str, value: int) -> None:
+    data = json.loads(INFO.to_json())
+    data[field] = value
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError):
+        ServiceInfo.from_json(p.read_text(encoding="utf-8"))
+    assert read_service_info(p) is None
